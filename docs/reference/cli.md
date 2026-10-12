@@ -726,7 +726,9 @@ the CLI found a `host` but no PAT. Add `"pat": "..."` to `config.json` or set
 If no legacy config or complete direct connection is present, the CLI falls
 back to the Snowflake Connector's configured default. If your profile is not
 named `default`, pass `--connection NAME` or set
-`SNOWFLAKE_DEFAULT_CONNECTION_NAME`.
+`CORTEX_TRAINING_CONNECTION=NAME`. If there is no default profile either, the
+error says nothing is configured, shows the easiest way to set a connection up,
+and links to [Authentication](../getting-started/authentication.md).
 
 If Snowflake rejects your PAT, the CLI keeps the original error and adds next
 steps: `394400 (08001) ... Programmatic access token is invalid` from a

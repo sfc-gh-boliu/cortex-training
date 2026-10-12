@@ -139,8 +139,9 @@ cortex-training --job JOB_ID load CHECKPOINT_ID --no-poll
 ### [Logs And Metrics](#job-tui)
 
 ```bash
-cortex-training tui                          # Open job picker
-cortex-training tui JOB_ID                   # Open the job dashboard
+cortex-training tui                          # Open job list
+cortex-training tui JOB_ID                   # Open job logs
+cortex-training tui --demo                   # Preview with synthetic jobs
 cortex-training download-log JOB_ID --output-dir ./logs
 cortex-training download-log JOB_ID --log-type stdout --output-dir ./logs
 cortex-training download-metrics JOB_ID --output-dir ./metrics
@@ -642,13 +643,15 @@ unsupported.
 
 ### Job TUI
 
-`cortex-training tui` is a read-only terminal dashboard for job logs and GPU
-resources. It uses the same connection handling and fallback order as the CLI,
-including named and configured-default Snowflake profiles:
+`cortex-training tui` is a read-only terminal UI for finding a job and
+inspecting its metrics, logs, GPU usage, and checkpoints. It uses the same
+connection handling and fallback order as the CLI, including named and
+configured-default Snowflake profiles:
 
 ```bash
-cortex-training tui                 # opens a job picker
-cortex-training tui JOB_ID          # opens that job's dashboard directly
+cortex-training tui                 # opens the job list
+cortex-training tui JOB_ID          # opens that job's Logs tab directly
+cortex-training tui --demo          # synthetic jobs, no connection needed
 ```
 
 Without login state, pass connection details the same way as the CLI:
@@ -662,7 +665,7 @@ cortex-training tui JOB_ID --base-url http://localhost:8084   # local/mock
 ```
 
 Keep the PAT out of your shell history by exporting it instead (omit `JOB_ID`
-to open the job picker):
+to open the job list):
 
 ```bash
 export CORTEX_TRAINING_PAT='YOUR_PROGRAMMATIC_ACCESS_TOKEN'
@@ -671,16 +674,133 @@ cortex-training tui \
   --database CORTEX_TRAINING_DB --schema PUBLIC
 ```
 
-Pass `--sub-job-id JOB_ID:training:0` to scope Logs and Resource to one matching
+Pass `--sub-job-id JOB_ID:training:0` to scope the job details to one matching
 sub-job. An unmatched id is shown as an error rather than falling back to a
-different sub-job.
+different sub-job. `--demo` runs against generated jobs, metrics, telemetry and
+checkpoints, and keeps its names and caches in a temporary directory.
 
-The **Logs** tab's left panel lists the job's sub-jobs; select one to tail its
-logs (the zone-manager pod is the Ray head, so a sub-job's worker output is
-included).
+#### Job list
+
+The job list shows the jobs `list_jobs` returns for the configured database and
+schema that were created in the last six months (183 days, filtered
+client-side). Older jobs are counted in the header but hidden. Live jobs
+(`pending`, `placing`, `initializing`, `running`) are grouped first with a
+green `●`. Every other status, such as `failed`, `cancelled`, `terminated`, or
+`unknown` (the service could not read the job's live state), is listed under
+history with `○`. Each row shows display name, short job id, type, status,
+model, GPUs, created, last updated, and owner. Live jobs expand into their
+sub-jobs by default.
+
+Display names are local. Press `n` on a job to name it. Names persist in
+`aliases.json` in the TUI cache directory, are shared by every TUI session on
+that machine, and are not visible to anyone else. A job without a local name
+shows its server `comment`, if it has one.
+
+Search with `/`. Plain words match display name, job id (partial),
+status, owner, GPU type, job type and model, case-insensitively, and all words
+must match. `field<op>value` filters narrow further:
+
+| Field | Meaning |
+|-------|---------|
+| `name`, `id`, `status`, `owner`, `type` | display name, job id, status, user or role, training/sampling |
+| `model`, `method`, `dtype` | model name, `full` or `lora`, dtype |
+| `gpu`, `gpus` | GPU type (`H200`, `B200`, `B300`), total GPU count |
+| `optimizer`, `lr`, `batch`, `seq` | optimizer name, learning rate, train batch size, max sequence length |
+| `lora_r`, `lora_alpha` | LoRA rank and alpha |
+
+Operators are `:` (contains, or equals for numbers), `=`, `!=`, `>`, `>=`,
+`<`, and `<=`. A dotted field reads any member of a sub-job's config, for
+example `training_config.optimizer.lr<1e-4` or `inference_config.n_gpus=2`.
+Examples:
+
+```text
+sweep
+model:qwen3-8b method:lora lr<=1e-4
+gpu:b200 gpus>=8 lora_r=32
+training_config.optimizer.name=adamw status:cancelled
+```
+
+A search with no results says how many jobs were searched and how the words
+and filters are applied. An unknown field matches nothing and lists the
+valid fields.
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Open the job preview (or, on a sub-job row, that sub-job's details) |
+| `/` / `esc` | Search / clear the search |
+| `s` / `o` | Sort by created, updated, or status / reverse the order |
+| `space` / `e` | Expand or collapse a job's sub-jobs / all jobs |
+| `n` | Name the highlighted job |
+| `r` | Refresh (the list also refreshes every 60 seconds while it is showing) |
+
+#### Job preview
+
+Opening a job shows its name, id, status (live or historical), model, type,
+owner, GPU allocation, creation time, elapsed time, and last update. A failed
+job shows its failure `reason`. Below that are the job's sub-jobs with their
+status, model, GPUs and key config, plus the latest loss and checkpoint.
+`Enter` on the "entire job" row or a sub-job row opens the details for that
+scope. `m`, `l`, `g`, and `c` open the Metrics, Logs, Resources, and
+Checkpoints tabs directly.
+
+#### Job details
+
+Switch tabs with `1` to `4`, or `t` for the next tab.
+
+- **Metrics** lists every numeric metric the client logged for the job on this
+  machine. Common SFT and RL names are recognized and labeled, for example
+  `train_loss` / `train_nll`, `val_loss`, `learning_rate`, `grad_norm`,
+  `step_time`, `tokens_per_second`, `policy_loss`, `reward`, `kl`, `entropy`,
+  `clip_frac`, `completion_length`, and `eval_success_rate`. The header shows
+  the latest and minimum training (or policy) loss. Pick a metric with the
+  arrow keys to chart it. `w` cycles the window through the last 1 hour
+  (default), 6 hours, 24 hours, and the whole job. `W` takes a custom window
+  such as `30m`, `2h`, `all`, or `steps:100-500`. `x` switches the x-axis
+  between training step and wall-clock time.
+- **Logs** is the live and historical log view described below. Each line is
+  tagged with the sub-job being tailed, for example `training:0 │ …`. Saved
+  logs (`s`) and whole-log copies (`y`) stay untagged.
+- **Resources** shows GPU telemetry (`download_metrics`) for the sub-job
+  selected on the Logs tab: a utilization chart, each GPU's current and
+  window-average utilization and framebuffer use, and the age of the latest
+  sample. `w` cycles the window through 5 minutes, 15 minutes (the default for
+  a live job), 1 hour, 6 hours, and all history (the default for a finished
+  job). Telemetry downloads when the tab is first shown; `r` refreshes it, and
+  a live job's telemetry refreshes every 30 seconds while the tab is showing.
+  Telemetry is cached under `jobs/<job>/metrics/` in the TUI cache directory.
+- **Checkpoints** lists the job's checkpoints with id, type, and created time.
+  Resumable checkpoints (`◆`, weights plus optimizer state) are marked
+  separately from weights-only ones (`○`, Hugging Face weights for serving and
+  export). `o` sorts by time or type. The list loads when the tab is first
+  shown, and a live job's list refreshes every 30 seconds while the tab is
+  showing. `Enter` opens the checkpoint view: every field, the originating job
+  and sub-job, the training sub-job's config, commands to export and download
+  the weights, and how to use the checkpoint. For a weights-only checkpoint
+  that means batch inference (`recipes.inference.generate`) and a streaming
+  endpoint (`recipes.inference.serve`). For a resumable one it means resuming
+  training. `y` copies those commands.
+
+The service does not keep per-step training metrics, so the Metrics tab reads
+a local store: `jobs/<job>/metrics.jsonl` in the TUI cache directory. The SFT
+and RL recipes write to it automatically. From your own training loop:
+
+```python
+from cortex_training.tui.stores import MetricsStore
+
+MetricsStore().append(job_id, {"train_loss": loss, "grad_norm": norm}, step=step)
+```
+
+Only finite numeric values are kept. Metrics logged on another machine do not
+appear.
+
+#### Logs
+
+The Logs tab lists the job's sub-jobs; select one to tail its logs (the
+zone-manager pod is the Ray head, so a sub-job's worker output is included).
 Logs are cached locally so reopening a job replays instantly without
 re-fetching from the server — under `~/.cache/cortex-training/` (or
-`$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`.
+`$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`. The same
+directory holds display names, client-logged metrics, and GPU telemetry.
 
 A finished job loads its saved console once. A stream error while the job is
 still running stays an error. The level key filters structured live lines and
@@ -691,38 +811,28 @@ key (`~/cortex-training-<job8>-<source>.log`, where `<job8>` is the first eight
 characters of the job id) and its own error log
 (`~/.cortex-training-errors.log`).
 
-Use `t` to switch between Logs and Resource. The **Resource** tab plots GPU
-utilization and lists each GPU. Use `1`–`5` for 5 minutes, 15 minutes, 1 hour,
-6 hours, or all history; use `r` to refresh.
-
-Keys in Logs:
+Keys in the job details view:
 
 | Key | Action |
 |-----|--------|
-| `/` | Filter the current source |
-| `L` | Cycle minimum log level (INFO / WARNING / ERROR) |
-| `p` | Pause / resume auto-scroll |
-| `s` | Save the current source to `~/cortex-training-<job8>-<source>.log` |
-| `y` | Copy the whole log to the clipboard |
-| `c` | Copy the current selection |
-| `r` | Refresh the sub-job list |
-| `t` | Switch to Resource |
-| `[` / `]` | Narrow / widen the sources panel |
-| `b` / `esc` | Back (`esc` clears an active log filter first) |
+| `1` `2` `3` `4` | Metrics / Logs / Resources / Checkpoints tab |
+| `t` | Next tab |
+| `w` | Cycle the window (Metrics, Resources) |
+| `W` | Enter a custom window (Metrics) |
+| `x` | Step or time x-axis (Metrics) |
+| `o` | Sort checkpoints by time or type (Checkpoints) |
+| `/` | Filter the current source (Logs) |
+| `L` | Cycle minimum log level (INFO / WARNING / ERROR) (Logs) |
+| `p` | Pause / resume auto-scroll; scroll back freely while paused (Logs) |
+| `s` | Save the current source to `~/cortex-training-<job8>-<source>.log` (Logs) |
+| `y` | Copy the whole log to the clipboard (Logs) |
+| `c` | Copy the current selection (Logs) |
+| `[` / `]` | Narrow / widen the sources panel (Logs) |
+| `r` | Refresh the visible tab (on Logs, the sub-job list and its tail) |
+| `b` / `esc` | Back (on Logs, `esc` clears an active filter first) |
 | `q` | Quit |
 
-Keys in Resource:
-
-| Key | Action |
-|-----|--------|
-| `1` / `2` / `3` / `4` / `5` | Show 5m / 15m / 1h / 6h / all history |
-| `r` | Refresh |
-| `t` | Return to Logs |
-| `b` / `esc` | Back |
-| `q` | Quit |
-
-In the job picker, `/` filters by id/status/type and `r` refreshes. The
-`--poll-interval` flag (default `1.0s`) is the minimum interval between log
+The `--poll-interval` flag (default `1.0s`) is the minimum interval between log
 polls per source, biasing toward server reliability over freshness.
 
 ### JSON Output And Help

@@ -628,7 +628,7 @@ def build_parser(
     if include_tui:
         subparsers.add_parser(
             "tui",
-            help="Open the read-only Cortex Training logs and resources TUI.",
+            help="Open the read-only Cortex Training job TUI.",
         )
 
     return parser

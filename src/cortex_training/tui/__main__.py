@@ -30,10 +30,10 @@ import sys
 def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=prog,
-        description="Read-only TUI for Cortex Training logs and GPU resources.",
+        description="Read-only TUI for Cortex Training jobs: metrics, logs, GPU usage, and checkpoints.",
     )
     p.add_argument(
-        "job_id", nargs="?", help="Job (session) id to open directly. If omitted, the TUI shows a job picker."
+        "job_id", nargs="?", help="Job (session) id whose Logs tab to open directly. If omitted, the TUI shows the job list."
     )
     p.add_argument(
         "--sub-job-id",
@@ -70,6 +70,11 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
     )
     p.add_argument("--poll-timeout", type=float, default=1800.0)
     p.add_argument("--no-verify-ssl", action="store_true")
+    p.add_argument(
+        "--demo",
+        action="store_true",
+        help="Preview the TUI with synthetic jobs, metrics, GPU telemetry and checkpoints (no connection).",
+    )
     return p
 
 
@@ -85,6 +90,9 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
             file=sys.stderr,
         )
         return 2
+
+    if args.demo:
+        return _run_demo(args, CortexTrainingLogTUI)
 
     import cortex_training._cli as cli
 
@@ -112,6 +120,23 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     # job_id is optional: given, open that job's dashboard; omitted, open the
     # job picker (list_jobs) so the user can choose one.
     CortexTrainingLogTUI(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=args.poll_interval).run()
+    return 0
+
+
+def _run_demo(args, app_class) -> int:
+    """Run against :class:`~cortex_training.tui.demo.DemoClient` with throwaway local stores."""
+    import tempfile
+
+    from cortex_training.tui.demo import DemoClient
+    from cortex_training.tui.stores import AliasStore
+    from cortex_training.tui.stores import MetricsStore
+
+    with tempfile.TemporaryDirectory(prefix="cortex-training-demo-") as cache:
+        # Demo names, metrics and caches must never land in the real cache dir.
+        os.environ["CORTEX_TRAINING_TUI_CACHE_DIR"] = cache
+        client = DemoClient()
+        client.seed_local(aliases=AliasStore(), metrics=MetricsStore())
+        app_class(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=args.poll_interval).run()
     return 0
 
 

@@ -187,7 +187,10 @@ The target list above is for dense Qwen models. For
 
 Training logs reward, correctness, format, rollout counts, and loss. Held-out
 MATH-500 generate eval runs every `eval_every` batches (`test/env/all/correct`;
-`eval_every=0` skips it). To mirror local metrics to Weights & Biases:
+`eval_every=0` skips it). The metrics are also kept in the TUI's local store
+(`jobs/<job>/metrics.jsonl` under `~/.cache/cortex-training/`), so
+`cortex-training tui` can chart them on this machine. To mirror local metrics
+to Weights & Biases:
 
 ```bash
 uv pip install wandb

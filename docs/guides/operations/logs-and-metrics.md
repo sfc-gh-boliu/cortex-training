@@ -31,12 +31,17 @@ Open a job dashboard in the terminal:
 cortex-training tui JOB_ID
 ```
 
-The **Logs** tab tails a running job or loads its saved console after it
-finishes. The **Resource** tab plots GPU utilization and lists each GPU. Use
-`1`–`5` for 5 minutes, 15 minutes, 1 hour, 6 hours, or all history; use `r` to
-refresh.
+It opens on the **Logs** tab, which tails a running job or loads its saved
+console after it finishes. The **Resources** tab plots the selected sub-job's
+GPU utilization and lists each GPU; `w` cycles 5 minutes, 15 minutes, 1 hour,
+6 hours, or all history, and `r` refreshes. The **Checkpoints** tab lists the
+job's checkpoints, and **Metrics** plots the training metrics a recipe logged
+from this machine. Run `cortex-training tui` without a job id to browse and
+search your jobs first. See [Job TUI](../../reference/cli.md#job-tui).
 
-Recipe-level metrics are also written under each recipe's `log_path`.
+Recipe-level metrics are also written under each recipe's `log_path`, and
+to the TUI's local store (`jobs/<job>/metrics.jsonl` under
+`~/.cache/cortex-training/`).
 
 Snowflake profile and PAT clients also emit best-effort client-side operation
 metrics over Snowflake's OTLP endpoint. Failures of essential SDK methods are

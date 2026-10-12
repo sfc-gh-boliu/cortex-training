@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import io
 import json
+import time
+from datetime import date
 from unittest.mock import MagicMock
 
 import pytest
@@ -55,6 +57,9 @@ class FakeClient:
         self.capacity_hardware_requests = []
         self.checkpoints_job_id = None
         self.jobs = None
+        self.account_jobs = []
+        self.account_jobs_pulled = 0
+        self.iter_jobs_filters = None
         self.stdout_log_job_id = None
         self.stdout_log_output_dir = None
         self.metrics_job_id = None
@@ -76,6 +81,12 @@ class FakeClient:
         if self.jobs is not None:
             return self.jobs
         return [{"job_id": "j1", "status": status or "running"}]
+
+    def iter_jobs(self, **filters):
+        self.iter_jobs_filters = filters
+        for job in self.account_jobs:
+            self.account_jobs_pulled += 1
+            yield job
 
     def list_checkpoints(self, job_id):
         self.checkpoints_job_id = job_id
@@ -191,9 +202,10 @@ class FakeClient:
             },
         ]
 
-    def download_stdout_logs(self, job_id, output_dir):
+    def download_stdout_logs(self, job_id, output_dir, *, resume=False):
         self.stdout_log_job_id = job_id
         self.stdout_log_output_dir = output_dir
+        self.stdout_resume = resume
         path = output_dir / f"{job_id}:training:0" / "stdout.log"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("console\n", encoding="utf-8")
@@ -208,9 +220,10 @@ class FakeClient:
             }
         ]
 
-    def download_metrics(self, job_id, output_dir):
+    def download_metrics(self, job_id, output_dir, *, resume=False):
         self.metrics_job_id = job_id
         self.metrics_output_dir = output_dir
+        self.metrics_resume = resume
         path = output_dir / f"{job_id}:training:0" / "gpu.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('{"gpu_utilization":0.5}\n', encoding="utf-8")
@@ -367,6 +380,127 @@ def test_submit_dry_run_rejects_two_training_sub_jobs(tmp_path):
     assert "at most one training sub-job is supported per job" in stderr.getvalue()
 
 
+def _write_lora_job(tmp_path, peft_config):
+    path = tmp_path / "lora.json"
+    sub_job = {
+        "job_type": "training",
+        "model_name": "gpt2",
+        "training_config": {
+            "max_seq_len": 128,
+            "train_batch_size": 1,
+            "n_gpus": 2,
+            "peft_config": peft_config,
+        },
+    }
+    path.write_text(json.dumps({"sub_job_configs": [sub_job]}), encoding="utf-8")
+    return path
+
+
+def test_submit_dry_run_rejects_invalid_peft_config(tmp_path):
+    stderr = io.StringIO()
+    path = _write_lora_job(tmp_path, {"peft_type": "LORA", "target_modules": ["q_proj"]})
+
+    rc = cli.main(["submit", str(path), "--dry-run"], stderr=stderr)
+
+    assert rc == 1
+    assert "peft_config.peft_type" in stderr.getvalue()
+
+
+def test_submit_dry_run_prints_the_normalized_peft_config(tmp_path):
+    stdout = io.StringIO()
+    path = _write_lora_job(tmp_path, {"peft_type": "Lora", "r": 16, "target_modules": ["q_proj"]})
+
+    rc = cli.main(["submit", str(path), "--dry-run"], stdout=stdout)
+
+    assert rc == 0
+    peft = json.loads(stdout.getvalue())["sub_job_configs"][0]["training_config"]["peft_config"]
+    assert peft["task_type"] == "CAUSAL_LM"
+    assert peft["target_parameters"] == []
+
+
+# Spellings a caller could plausibly put in job JSON for the unsupported
+# log-probability type.
+LOG_PROBABILITY_JOB_TYPES = [
+    "log_probability",
+    "LOG_PROBABILITY",
+    "JOB_TYPE_LOG_PROBABILITY",
+    "log_prob",
+    " log_probability ",
+]
+
+
+def _write_log_probability_job(tmp_path, job_type):
+    path = tmp_path / "log-probability.json"
+    path.write_text(
+        json.dumps(
+            {
+                "sub_job_configs": [
+                    {
+                        "job_type": "sampling",
+                        "model_name": "gpt2",
+                        "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                    },
+                    {
+                        "job_type": job_type,
+                        "model_name": "gpt2",
+                        "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.parametrize("job_type", LOG_PROBABILITY_JOB_TYPES)
+def test_submit_dry_run_rejects_log_probability_sub_jobs(tmp_path, job_type):
+    stderr = io.StringIO()
+    path = _write_log_probability_job(tmp_path, job_type)
+
+    rc = cli.main(["submit", str(path), "--dry-run"], stderr=stderr)
+
+    assert rc == 1
+    assert (
+        "sub_job_configs[1].job_type: log_probability sub-jobs are not currently supported"
+        in stderr.getvalue()
+    )
+
+
+def test_submit_rejects_log_probability_sub_jobs(tmp_path):
+    instances = []
+    stderr = io.StringIO()
+    path = _write_log_probability_job(tmp_path, "log_probability")
+
+    rc = cli.main(
+        _base_args() + ["submit", str(path)],
+        client_factory=_factory(instances),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert (
+        "sub_job_configs[1].job_type: log_probability sub-jobs are not currently supported"
+        in stderr.getvalue()
+    )
+    assert instances[0].submitted_body is None
+
+
+# The CLI duplicates these so `submit --dry-run` never imports the client; keep
+# the two copies from drifting apart.
+def test_cli_log_probability_rejection_matches_client():
+    from cortex_training import client
+
+    assert (
+        cli._LOG_PROBABILITY_JOB_TYPE_ALIASES
+        == client._LOG_PROBABILITY_JOB_TYPE_ALIASES
+    )
+    assert (
+        cli._UNSUPPORTED_LOG_PROBABILITY_MESSAGE
+        == client._UNSUPPORTED_LOG_PROBABILITY_MESSAGE
+    )
+
+
 def test_list_prints_jobs_with_status_filter():
     instances = []
     stdout = io.StringIO()
@@ -378,10 +512,401 @@ def test_list_prints_jobs_with_status_filter():
     )
 
     assert rc == 0
-    assert instances[0].status_filter == "running"
+    # The schema route mishandles comma lists and groups, so the CLI asks it for
+    # every job and filters the rows itself.
+    assert instances[0].status_filter is None
     assert json.loads(stdout.getvalue()) == {
         "jobs": [{"job_id": "j1", "status": "running"}],
     }
+
+
+_STATUS_ROWS = [
+    {"job_id": status.lower(), "status": status}
+    for status in (
+        "PENDING",
+        "PLACING",
+        "INITIALIZING",
+        "RUNNING",
+        "FAILED",
+        "CANCELLED",
+        "TERMINATED",
+        "UNKNOWN",
+    )
+]
+
+_SUBMITTED_ROWS = [
+    {"job_id": "upper", "submitted_by": "JDOE"},
+    {"job_id": "lower", "submitted_by": "jdoe"},
+    {"job_id": "quoted", "submitted_by": 'J"DOE'},
+    {"job_id": "other", "submitted_by": "ASMITH"},
+    {"job_id": "anonymous"},
+]
+
+_DATED_ROWS = [
+    {"job_id": "before", "created_at": "2026-09-30T23:59:59Z"},
+    {"job_id": "midnight", "created_at": "2026-10-01T00:00:00Z"},
+    {"job_id": "noon", "created_at": "2026-10-01T12:00:00.250Z"},
+    {"job_id": "next-day", "created_at": "2026-10-02T00:00:00+00:00"},
+]
+
+
+def _list_ids(argv, *, jobs=None, account_jobs=()):
+    """Run `list ARGV` on one FakeClient; return it and the printed job ids."""
+    client = FakeClient()
+    client.jobs = jobs
+    client.account_jobs = list(account_jobs)
+    stdout = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["list", *argv],
+        client_factory=lambda _args: client,
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    return client, [job["job_id"] for job in json.loads(stdout.getvalue())["jobs"]]
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("pending", {"pending"}),
+        ("placing", {"placing"}),
+        ("active", {"pending", "placing", "initializing", "running"}),
+        ("done", {"cancelled", "terminated"}),
+        (" Running , FAILED ", {"running", "failed"}),
+        ("done,terminated", {"cancelled", "terminated"}),
+        (
+            "active,failed,done",
+            {
+                "pending",
+                "placing",
+                "initializing",
+                "running",
+                "failed",
+                "cancelled",
+                "terminated",
+            },
+        ),
+    ],
+)
+def test_list_status_accepts_words_groups_and_comma_lists(status, expected):
+    client, ids = _list_ids(["--status", status], jobs=_STATUS_ROWS)
+
+    assert client.status_filter is None
+    assert set(ids) == expected
+
+
+@pytest.mark.parametrize("scope", [[], ["--all"]])
+@pytest.mark.parametrize(
+    "status", ["unknown", "completed", "running,", "job_state_running"]
+)
+def test_list_rejects_unknown_status_before_building_a_client(capsys, scope, status):
+    instances = []
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            _base_args() + ["list", *scope, "--status", status],
+            client_factory=_factory(instances),
+        )
+
+    assert exc.value.code == 2
+    assert "unknown status" in capsys.readouterr().err
+    # Building a client can open a Snowflake login.
+    assert instances == []
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        # Enum names and aliases a server can answer with, not only the words
+        # --status takes.
+        ("running", {"enum", "plain"}),
+        ("active", {"enum", "plain", "queued", "creating"}),
+        ("done", {"canceled", "completed", "succeeded"}),
+        ("failed", {"error"}),
+        # UNKNOWN is deliberately matched by no word.
+        ("active,done,failed", {"enum", "plain", "queued", "creating",
+                                "canceled", "completed", "succeeded", "error"}),
+    ],
+)
+def test_list_status_matches_enum_names_and_aliases(status, expected):
+    rows = [
+        {"job_id": "enum", "status": "JOB_STATE_RUNNING"},
+        {"job_id": "plain", "status": "running"},
+        {"job_id": "queued", "status": "queued"},
+        {"job_id": "creating", "status": "creating"},
+        {"job_id": "canceled", "status": "canceled"},
+        {"job_id": "completed", "status": "completed"},
+        {"job_id": "succeeded", "status": "succeeded"},
+        {"job_id": "error", "status": "error"},
+        {"job_id": "unknown", "status": "UNKNOWN"},
+    ]
+
+    _, ids = _list_ids(["--status", status], jobs=rows)
+
+    assert set(ids) == expected
+
+
+def test_list_status_done_includes_legacy_done_rows():
+    _, ids = _list_ids(
+        ["--status", "done"],
+        jobs=[
+            {"job_id": "legacy", "status": "DONE"},
+            {"job_id": "cancelled", "status": "CANCELLED"},
+            {"job_id": "failed", "status": "FAILED"},
+        ],
+    )
+
+    assert set(ids) == {"legacy", "cancelled"}
+
+
+@pytest.mark.parametrize(
+    ("user", "expected"),
+    [
+        # As on the server: unquoted means uppercase, quoted means exact.
+        ("jdoe", {"upper"}),
+        ("JDoe", {"upper"}),
+        ('"jdoe"', {"lower"}),
+        ('"J""DOE"', {"quoted"}),
+        ("asmith", {"other"}),
+    ],
+)
+def test_list_user_follows_sql_identifier_rules(user, expected):
+    _, ids = _list_ids(["--user", user], jobs=_SUBMITTED_ROWS)
+
+    assert set(ids) == expected
+
+
+@pytest.mark.parametrize("scope", [[], ["--all"]])
+@pytest.mark.parametrize("user", ["", "  "])
+def test_list_rejects_an_empty_user(capsys, scope, user):
+    instances = []
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            _base_args() + ["list", *scope, "--user", user],
+            client_factory=_factory(instances),
+        )
+
+    assert exc.value.code == 2
+    assert "--user must not be empty" in capsys.readouterr().err
+    assert instances == []
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["--since", "2026-10-01"], ["midnight", "noon", "next-day"]),
+        (["--until", "2026-09-30"], ["before"]),
+        # --until keeps the whole day it names.
+        (["--until", "2026-10-01"], ["before", "midnight", "noon"]),
+        (["--since", "2026-10-01", "--until", "2026-10-01"], ["midnight", "noon"]),
+    ],
+)
+def test_list_since_and_until_keep_whole_utc_days(argv, expected):
+    _, ids = _list_ids(argv, jobs=_DATED_ROWS + [{"job_id": "undated"}])
+
+    assert ids == expected
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="needs time.tzset")
+@pytest.mark.parametrize("zone", ["America/Los_Angeles", "Asia/Tokyo"])
+def test_list_dates_are_utc_days_in_any_local_zone(monkeypatch, zone):
+    monkeypatch.setenv("TZ", zone)
+    time.tzset()
+    try:
+        _, ids = _list_ids(
+            ["--since", "2026-10-01", "--until", "2026-10-01"], jobs=_DATED_ROWS
+        )
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+    assert ids == ["midnight", "noon"]
+
+
+def test_list_dates_read_created_at_with_any_fraction_precision():
+    jobs = [
+        {"job_id": "five", "created_at": "2026-10-01T01:00:00.12345Z"},
+        {"job_id": "nine", "created_at": "2026-10-01T02:00:00.123456789Z"},
+    ]
+
+    _, ids = _list_ids(["--since", "2026-10-01", "--until", "2026-10-01"], jobs=jobs)
+
+    assert ids == ["five", "nine"]
+
+
+@pytest.mark.parametrize("scope", [[], ["--all"]])
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--since", "yesterday"], "expected a YYYY-MM-DD date, got 'yesterday'"),
+        (["--until", "10/01/2026"], "expected a YYYY-MM-DD date"),
+        # Dates only: a time of day, or a compact date, is refused.
+        (["--since", "2026-10-01T12:00:00Z"], "expected a YYYY-MM-DD date"),
+        (["--since", "20261001"], "expected a YYYY-MM-DD date"),
+        (["--until", "2026-02-30"], "expected a YYYY-MM-DD date"),
+        (
+            ["--since", "2026-10-02", "--until", "2026-10-01"],
+            "--since must not be later than --until",
+        ),
+        (["--until", "9999-12-31"], "--until must be earlier than 9999-12-31"),
+    ],
+)
+def test_list_rejects_bad_dates_before_building_a_client(capsys, scope, argv, message):
+    instances = []
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            _base_args() + ["list", *scope, *argv],
+            client_factory=_factory(instances),
+        )
+
+    assert exc.value.code == 2
+    assert message in capsys.readouterr().err
+    assert instances == []
+
+
+def test_list_limit_keeps_the_newest_matching_jobs_printed_last():
+    jobs = [
+        {**row, "status": status}
+        for row, status in zip(_DATED_ROWS, ("RUNNING", "RUNNING", "FAILED", "RUNNING"))
+    ]
+
+    _, ids = _list_ids(["--limit", "2"], jobs=jobs)
+    assert ids == ["noon", "next-day"]
+
+    _, ids = _list_ids(["--status", "running", "--limit", "2"], jobs=jobs)
+    assert ids == ["midnight", "next-day"]
+
+
+def test_list_limit_drops_undated_jobs_before_newer_dated_ones():
+    # A row whose live status could not be read carries no created_at.
+    jobs = [{"job_id": "undated-a"}, {"job_id": "undated-b"}] + _DATED_ROWS
+
+    _, ids = _list_ids(["--limit", "2"], jobs=jobs)
+    assert ids == ["noon", "next-day"]
+
+    # Every dated job outranks both undated rows, however old it is.
+    _, ids = _list_ids(["--limit", "4"], jobs=jobs)
+    assert ids == ["before", "midnight", "noon", "next-day"]
+
+    # Undated rows fill what the dated ones leave, newest first, and still
+    # print after them.
+    _, ids = _list_ids(["--limit", "5"], jobs=jobs)
+    assert ids == ["before", "midnight", "noon", "next-day", "undated-a"]
+
+
+def test_list_limit_keeps_the_first_undated_jobs_when_none_are_dated():
+    # Nothing is dated, so the server's newest-first order is all there is.
+    jobs = [{"job_id": name} for name in ("newest", "middle", "oldest")]
+
+    _, ids = _list_ids(["--limit", "2"], jobs=jobs)
+
+    assert ids == ["middle", "newest"]
+
+
+@pytest.mark.parametrize("limit", ["0", "-1", "two"])
+def test_list_rejects_a_limit_below_one(limit):
+    with pytest.raises(SystemExit):
+        cli.parse_args(_base_args() + ["list", "--limit", limit])
+
+
+def test_list_all_reads_the_account_and_prints_it_oldest_first():
+    newest_first = list(reversed(_DATED_ROWS))
+
+    client, ids = _list_ids(
+        ["--all"], jobs=[{"job_id": "schema-row"}], account_jobs=newest_first
+    )
+
+    assert ids == ["before", "midnight", "noon", "next-day"]
+    assert client.iter_jobs_filters == {
+        "status": None,
+        "submitted_by": None,
+        "created_after": None,
+        "created_before": None,
+        "page_size": 100,
+    }
+
+
+def test_list_all_sends_every_filter_to_the_server():
+    rows = [
+        {"job_id": "b", "status": "FAILED", "created_at": "2026-10-01T02:00:00Z"},
+        {"job_id": "a", "status": "RUNNING", "created_at": "2026-10-01T01:00:00Z"},
+    ]
+
+    client, ids = _list_ids(
+        [
+            "--all",
+            "--status",
+            "active, FAILED",
+            "--user",
+            "jdoe",
+            "--since",
+            "2026-10-01",
+            "--until",
+            "2026-10-02",
+        ],
+        account_jobs=rows,
+    )
+
+    assert client.iter_jobs_filters == {
+        "status": "active,failed",
+        "submitted_by": "jdoe",
+        "created_after": date(2026, 10, 1),
+        # The server's bound is exclusive, so --until sends the day after.
+        "created_before": date(2026, 10, 3),
+        "page_size": 100,
+    }
+    assert ids == ["a", "b"]
+
+
+def test_list_all_limit_stops_reading_after_the_newest_jobs():
+    client, ids = _list_ids(
+        ["--all", "--limit", "2"], account_jobs=list(reversed(_DATED_ROWS))
+    )
+
+    assert ids == ["noon", "next-day"]
+    assert client.account_jobs_pulled == 2
+    assert client.iter_jobs_filters["page_size"] == 2
+
+
+def test_list_all_caps_the_page_size_at_the_server_maximum():
+    client, _ = _list_ids(["--all", "--limit", "5000"])
+
+    assert client.iter_jobs_filters["page_size"] == 1000
+
+
+def test_list_all_reports_listing_that_is_not_enabled():
+    import requests
+
+    class NotEnabledClient(FakeClient):
+        def iter_jobs(self, **filters):
+            response = requests.Response()
+            response.status_code = 404
+            raise requests.HTTPError(
+                "account-level job listing is not enabled for this account",
+                response=response,
+            )
+            yield
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["list", "--all"],
+        client_factory=lambda _args: NotEnabledClient(),
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert (
+        "error: account-level job listing is not enabled for this account"
+        in stderr.getvalue()
+    )
+    assert stdout.getvalue() == ""
 
 
 def test_list_prints_latest_jobs_last():
@@ -933,6 +1458,58 @@ def test_generate_can_skip_poll(tmp_path):
     }
 
 
+def test_generate_counts_flat_token_list_as_one_prompt(tmp_path):
+    instances = []
+    stdout = io.StringIO()
+    path = tmp_path / "generate.json"
+    path.write_text(json.dumps({"poll": False, "prompts": [1, 2, 3]}), encoding="utf-8")
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert instances[0].generate_prompts == [1, 2, 3]
+    assert json.loads(stdout.getvalue())["prompt_count"] == 1
+
+
+def test_generate_rejects_sampling_params_list_longer_than_one_flat_prompt(tmp_path):
+    path = tmp_path / "generate.json"
+    path.write_text(
+        json.dumps({"prompts": [1, 2, 3], "sampling_params": [{"max_tokens": 4}, None, None]}),
+        encoding="utf-8",
+    )
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory([]),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "sampling_params list length must match prompts length" in stderr.getvalue()
+
+
+def test_generate_counts_nested_token_lists_as_a_batch(tmp_path):
+    instances = []
+    stdout = io.StringIO()
+    path = tmp_path / "generate.json"
+    path.write_text(json.dumps({"poll": False, "prompts": [[1, 2], [3, 4]]}), encoding="utf-8")
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert json.loads(stdout.getvalue())["prompt_count"] == 2
+
+
 def test_weight_sync_defaults_to_training_and_sampling_subjobs():
     instances = []
     stdout = io.StringIO()
@@ -1100,6 +1677,51 @@ def test_download_log_stdout_routes_to_reconstruction(tmp_path):
     assert client.stdout_log_output_dir == tmp_path
     assert (tmp_path / "job-1:training:0" / "stdout.log").read_text() == "console\n"
     assert json.loads(stdout.getvalue())["logs"][0]["filename"] == "stdout.log"
+
+
+def test_download_log_resume_reaches_stdout_download(tmp_path):
+    stdout = io.StringIO()
+    client = FakeClient()
+
+    rc = cli.main(
+        _base_args()
+        + ["download-log", "job-1", "--log-type", "stdout", "--resume", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert client.stdout_resume is True
+
+
+def test_download_log_resume_rejects_execution_logs(tmp_path):
+    stderr = io.StringIO()
+
+    def client_factory(_args):
+        raise AssertionError("client constructed before the --resume check")
+
+    rc = cli.main(
+        _base_args() + ["download-log", "job-1", "--resume", "--output-dir", str(tmp_path)],
+        client_factory=client_factory,
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "--resume applies to --log-type stdout" in stderr.getvalue()
+
+
+def test_download_metrics_resume_reaches_client(tmp_path):
+    client = FakeClient()
+
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--resume", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+    )
+
+    assert rc == 0
+    assert client.metrics_resume is True
 
 
 def test_download_metrics_defaults_to_cwd(tmp_path, monkeypatch):

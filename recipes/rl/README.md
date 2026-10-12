@@ -4,6 +4,8 @@ Train a model with grouped policy optimization on Hendrycks MATH and evaluate
 against MATH-500. The recipe creates colocated training and sampling sub-jobs,
 generates rollouts, scores them, trains, and synchronizes weights. After the
 final save it logs a `python -m recipes.inference.evaluate` command.
+MATH-specific prompting, scoring, and evaluation live in `tasks/math.py`; the
+task entrypoint calls the shared GRPO engine in `train.py`.
 
 ## Hardware
 
@@ -21,7 +23,7 @@ cortex-training capacity
 # Qwen3-8B LoRA (default)
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json
-  
+
 # Qwen3-8B full-parameter
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
@@ -30,12 +32,14 @@ python -m recipes.rl.math_grpo.train \
 # Qwen3.6-35B-A3B LoRA
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/qwen36_35b_a3b_lora.json
+  job_config=configs/qwen36_35b_a3b_lora.json \
+  max_tokens=2048
 
 # Qwen3.6-35B-A3B full-parameter
 python -m recipes.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/qwen36_35b_a3b_full.json
+  job_config=configs/qwen36_35b_a3b_full.json \
+  max_tokens=2048
 
 # Qwen3.8-27B full-parameter
 python -m recipes.rl.math_grpo.train \
@@ -45,9 +49,10 @@ python -m recipes.rl.math_grpo.train \
   max_tokens=2048
 ```
 
-`config=` is the Snowflake connection file. Adapt from `examples/config/connection.json.template`.
+`config=` is the Snowflake connection file. Adapt from
+`examples/config/connection.json.template`.
 
-The default job body is `configs/qwen3_8b_lora.json`.
+The default job body is `configs/qwen3_8b_lora.json`. The default run will be finished within 1h.
 
 ## Customizability
 
@@ -162,7 +167,9 @@ sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
         },
         "ep_size": EP_SIZE,
 
-        // Optional router replay for MoE training.
+        // Optional router replay for MoE training. Add "mode": "best_effort" to
+        // route rows the sampler no longer holds (e.g. after a sampler restart)
+        // with the trainer's own gate instead of failing the step.
         "router_replay": {"enabled": true, "max_cache_bytes": 2147483648}
       }
     }

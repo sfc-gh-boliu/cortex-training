@@ -88,7 +88,8 @@ constructing the emitter.
 Tracked operations:
 
 - Job lifecycle: `create_job`, `wait_for_job`, `get_job`, `list_jobs`,
-  `cancel_job`, `get_capacity`, `get_experiment_run`
+  `iter_jobs` (one event per page), `cancel_job`, `get_capacity`,
+  `get_experiment_run`
 - Compute: `forward_backward`, `forward`, `generate`, `generate_stream`, `step`
 - Checkpoints and logs: `save`, `load`, `list_checkpoints`,
   `export_checkpoint`, `delete_checkpoint`, `fetch_execution_logs`
@@ -126,13 +127,25 @@ operation.
 
 | Method | Returns | Notes |
 |---|---|---|
-| `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None)` | `job_id` | Validates each `SubJobConfig` client-side first. A job takes zero or one `training` sub-job and any number of `sampling` / `log_probability` sub-jobs. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200` |
-| `create_job_from_body(body)` | response dict | For callers that already hold the REST JSON. Enforces the same one-training-sub-job rule before sending |
+| `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None)` | `job_id` | Validates each `SubJobConfig` client-side first. Only `training` and `sampling` sub-jobs can be submitted: a job takes zero or one `training` sub-job and any number of `sampling` sub-jobs. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200` |
+| `create_job_from_body(body)` | response dict | For callers that already hold the REST JSON. Enforces the same one-training-sub-job and no-`log_probability` rules before sending |
 | `get_job(job_id)` | job dict | Includes `sub_jobs` with their configs |
 | `list_jobs(status=None)` | list of jobs | Returns the inner list, not the envelope |
+| `iter_jobs(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100)` | iterator of jobs | Jobs across the account that the caller can see, newest first, following page tokens; each also carries `database_name` and `schema_name`. The server applies every filter. Arguments are checked on the call: `page_size` is 1 to 1000, and `schema` needs `database` with it. A 404 means account-level listing is not enabled for the account. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2endpoint) |
+| `for_job(job)` | `CortexTrainingClient` | Bound to a job from `iter_jobs` for per-job calls. Borrows this client's session, auth, and telemetry, so keep this one open; closing the returned client is a no-op. Never creates the job's database |
 | `wait_for_job(job_id)` | job dict | Polls until `running`; raises on `failed`/`done`/`cancelled` or timeout. Does not treat `terminated` as terminal |
 | `cancel_job(job_id)` | `None` | Idempotent while cancelling/cancelled |
 | `get_capacity(hardware=None)` | capacity dict | `has_reservation`, `max_total_gpus`, `reserved_gpus`, `in_use_gpus`, `pending_gpus`, `available_gpus`, scoped to `hardware` (omitted means the server default, H200). The CLI `capacity` command queries every type unless `--hardware` is set. `max_total_gpus` is the canonical ceiling (`-1` uncapped); `reserved_gpus` is deprecated |
+
+`JobType.LOG_PROBABILITY` stays a schema type: a `SubJobConfig` carrying it
+still constructs, validates, and serializes to `"log_probability"`. Submission
+is what is blocked. `create_job()`, `create_job_from_body()`,
+`SubJobConfig.sampling_job()`, and `cortex-training submit` (including
+`--dry-run`) all raise before sending, with the message
+`log_probability sub-jobs are not currently supported` prefixed by the offending
+location — for example
+`sub_job_configs[1].job_type: log_probability sub-jobs are not currently
+supported`. The short alias `log_prob` is rejected the same way.
 
 ## Training and sampling
 
@@ -141,12 +154,28 @@ operation.
 | `forward_backward(job_id, data)` | `request_id` | `data` is a DSSST1 frame; always chunk-wrapped |
 | `step(job_id, learning_rate=None)` | `request_id` | Omitting the rate uses the job's optimizer setting |
 | `generate(job_id, prompts, sampling_params=None, routing_key=None, strict=None)` | `request_id` | Pre-tokenized prompts are length-checked client-side |
-| `generate_stream(...)` | response dict | UTF-8 JSON body; read progress with `get_request_status` |
+| `generate_stream(...)` | response dict | Same DSSST1 body encoding as `generate`, sent in one POST; read progress with `get_request_status` |
 | `weight_sync(job_id, source_sub_job_id, target_sub_job_ids, weight_format=None)` | `request_id` | `weight_format="lora"` syncs adapters only |
 | `forward(job_id, payload, ...)` | response dict | See the known limitation in [rest-api.md section 14](rest-api.md#14-known-limitations) |
-| `poll_request(job_id, request_id)` | result dict | Handles backoff, DSSST1 decoding and chunked results |
+| `poll_request(job_id, request_id)` | result dict | Handles backoff, DSSST1 decoding, chunked results, and envelope `metrics` merge (envelope wins on key collision) |
 | `get_request_status(job_id, request_id, max_events=None, cursor=None)` | status dict | |
 | `cancel_request(job_id, request_id, ...)` | response dict | |
+
+A training sub-job with router replay picks how forward/backward treats rows
+whose routing no sampling worker holds with `router_replay["mode"]` in the
+`extra_training` argument of `SubJobConfig.training_job(...)`, together with
+`"enabled": true`:
+
+- `"strict"` (default) fails the request.
+- `"best_effort"` routes those rows with the trainer's own MoE gate and adds
+  `router_replay/rows_*` and `router_replay/tokens_*` keys to the polled
+  result's `metrics`. With whole-block activation checkpointing it also needs
+  `ac_config.router_replay_recompute` left at its default `true`.
+
+The server rejects `"best_effort"` without `"enabled": true`, and any mode
+other than `"strict"` on a sampling sub-job. See
+[rest-api.md section 8.2](rest-api.md#82-trainingconfig) and
+[section 6.1](rest-api.md#61-forwardbackward---post-job_idforward-backward).
 
 ## Checkpoints
 
@@ -162,10 +191,11 @@ operation.
 `stream_logs(job_id, follow=True, ...)` yields entries and keeps polling.
 `fetch_execution_logs(job_id)` downloads every log file for the job's experiment
 run and returns `{sub_job_id, filename, artifact_uri, content}` dicts.
-`download_stdout_logs(job_id, output_dir)` reconstructs persisted console chunks
-as `<output_dir>/<sub_job_id>/stdout.log`.
-`download_metrics(job_id, output_dir)` reconstructs GPU metric chunks as
-`<output_dir>/<sub_job_id>/gpu.jsonl`.
+`download_stdout_logs(job_id, output_dir, *, resume=False)` reconstructs persisted
+console chunks as `<output_dir>/<sub_job_id>/stdout.log`.
+`download_metrics(job_id, output_dir, *, resume=False)` reconstructs GPU metric
+chunks as `<output_dir>/<sub_job_id>/gpu.jsonl`. `resume=True` appends chunks
+that are not already recorded in the manifest beside that file.
 `get_experiment_run(job_id)` resolves the experiment/run names.
 
 ## Building payloads
@@ -187,6 +217,15 @@ what the CLI's `fwd-bwd` command uses.
 the LoRA subset supported by weight sync. It requires `peft_type` to be exactly
 `"Lora"`, so a config copied from a Hugging Face `adapter_config.json` (which
 writes `"LORA"`) must be adjusted.
+
+`cortex_training.optimizer.normalize_optimizer_config(cfg)` does the same for
+the training optimizer block, returning `(canonical_optimizer,
+gradient_clipping)`. It resolves the `type`/`name` and `beta1`/`beta2` aliases,
+flattens a DeepSpeed `params` sub-object, hoists a nested `gradient_clipping`
+out of the block, and rejects scheduler or unknown keys. `TrainingConfig` runs
+it on construction, so calling it directly is only useful for checking a config
+before building the typed object; see
+[REST API section 8.2](rest-api.md#82-trainingconfig) for the rules.
 
 ## Exceptions
 

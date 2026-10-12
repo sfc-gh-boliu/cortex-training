@@ -33,6 +33,7 @@ from textual.widgets import Input  # noqa: E402
 from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.app import JobListScreen  # noqa: E402
 from cortex_training.tui.app import LogScreen  # noqa: E402
+from cortex_training.tui.format import wrap_log_line  # noqa: E402
 
 
 def _client():
@@ -93,11 +94,11 @@ async def _run_with_picker():
     app = CortexTrainingLogTUI(_client(), poll_interval=0.01)  # no job_id -> picker
     async with app.run_test() as pilot:
         ok = await _wait(
-            pilot, app, lambda: isinstance(app.screen, JobListScreen) and len(app.screen.query("#jobs ListItem")) >= 2
+            pilot, app, lambda: isinstance(app.screen, JobListScreen) and len(app.screen._job_by_item) >= 2
         )
         assert ok, "job picker did not load jobs"
         screen = app.screen
-        # active job (RUNNING) sorted first
+        # live job (RUNNING) is grouped before history
         assert screen._job_by_item["job-0"] == "7"
         assert screen._job_by_item["job-1"] == "old"
         assert re.search(r"last refreshed \d{2}:\d{2}:\d{2}", app.sub_title or "")
@@ -135,7 +136,7 @@ async def _run_refresh_picker():
                 pilot,
                 app,
                 lambda: isinstance(app.screen, JobListScreen)
-                and len(app.screen.query("#jobs ListItem")) == 2,
+                and len(app.screen._job_by_item) == 2,
             )
             assert ok, "initial jobs did not load"
             previous_refresh = app.screen._last_refreshed
@@ -151,7 +152,7 @@ async def _run_refresh_picker():
                 pilot,
                 app,
                 lambda: "refreshing…" not in (app.sub_title or "")
-                and len(app.screen.query("#jobs ListItem")) == 2,
+                and len(app.screen._job_by_item) == 2,
             )
             assert ok, "refresh did not finish cleanly"
             await _settle(app, pilot)
@@ -262,7 +263,7 @@ async def _run_picker_filter():
     app = CortexTrainingLogTUI(_client(), poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(
-            pilot, app, lambda: isinstance(app.screen, JobListScreen) and len(app.screen.query("#jobs ListItem")) >= 2
+            pilot, app, lambda: isinstance(app.screen, JobListScreen) and len(app.screen._job_by_item) >= 2
         )
         assert ok, "jobs did not load"
         s = app.screen
@@ -502,12 +503,13 @@ async def _run_wrap_and_select():
         assert s._logview.ALLOW_SELECT is True
         assert hasattr(s, "action_copy_text")  # `c` → copy selection
 
-        # Wrapping: a long line is split to the pane width on write.
+        # Wrapping: a long line is split to the pane width on write. The pane
+        # may prefix the line with its sub-job tag, which wraps with it.
         s._content_width = lambda: 10
         before = len(s._logview._lines)
-        s._write_line("x" * 60)  # 60 / 10 = 6 visual lines
-        assert len(s._logview._lines) - before == 6
-        assert s._shown_lines[-1] == "x" * 60  # buffer keeps the unwrapped line
+        s._write_line("x" * 60)  # 60 / 10 = 6 visual lines, plus any tag
+        assert len(s._logview._lines) - before == len(wrap_log_line(s._display("x" * 60), 10))
+        assert s._shown_lines[-1] == "x" * 60  # buffer keeps the unwrapped, untagged line
 
         # Re-wrap on width change: widening collapses each buffered line to one.
         s._content_width = lambda: 200

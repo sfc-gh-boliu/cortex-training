@@ -13,15 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Read-only Textual TUI for Cortex Training job logs and scheduling events.
+"""Read-only Textual TUI for Cortex Training jobs.
 
-Flow: open → a list of jobs with their status (via the SDK's list_jobs) →
-pick one → its log sources (zone server / job orchestration / Ray head /
-scheduling events) → live tail. Pass a job_id on the command line to jump
-straight to that job's logs and skip the picker.
+Flow: open → every job from the last six months (live first, then history,
+with sub-job rows; searchable by name, id, or training config) → a job preview
+→ tabbed details (Metrics | Logs | Resources | Checkpoints) for the job or one
+sub-job. Pass a job_id on the command line to jump straight to its Logs tab.
 
-Imports ``textual`` at module load. The interface is strictly read-only and
-never mutates job state.
+Imports ``textual`` at module load. The interface never mutates job state; the
+only writes are local (display names, log and telemetry caches).
 """
 
 from __future__ import annotations
@@ -31,14 +31,18 @@ import tempfile
 import time
 import traceback
 from collections import deque
+from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 
 from rich.markup import escape
+from rich.text import Text
 from textual import work
 from textual.app import App
 from textual.app import ComposeResult
 from textual.containers import Horizontal
 from textual.screen import Screen
+from textual.widgets import DataTable
 from textual.widgets import Footer
 from textual.widgets import Header
 from textual.widgets import Input
@@ -49,15 +53,13 @@ from textual.widgets import Log
 from textual.widgets import Static
 from textual.worker import get_current_worker
 
+from cortex_training.tui import views
 from cortex_training.tui.format import entry_at_level
 from cortex_training.tui.format import entry_matches
+from cortex_training.tui.format import format_created_at
 from cortex_training.tui.format import format_job_config
-from cortex_training.tui.format import format_job_row
 from cortex_training.tui.format import format_log_entry
 from cortex_training.tui.format import is_active_status
-from cortex_training.tui.format import job_matches
-from cortex_training.tui.format import job_status_color
-from cortex_training.tui.format import sort_jobs
 from cortex_training.tui.format import source_label
 from cortex_training.tui.format import wrap_log_line
 from cortex_training.tui.log_cache import LogCache
@@ -67,43 +69,83 @@ _ERROR_LOG = "~/.cortex-training-errors.log"
 
 
 class JobListScreen(Screen):
-    """Pick a job. Lists jobs + status via the SDK's ``list_jobs``."""
+    """Every job in the retention window: live first, then history, with sub-job rows.
+
+    Search matches display names and partial ids (case-insensitive) and takes
+    ``field<op>value`` filters over the training configuration; see
+    :func:`cortex_training.tui.views.parse_query`.
+    """
 
     BINDINGS = [
-        ("/", "filter", "Filter"),
-        ("escape", "clear_filter", "Clear filter"),
+        ("/", "filter", "Search"),
+        ("escape", "clear_filter", "Clear search"),
+        ("s", "cycle_sort", "Sort"),
+        ("o", "toggle_order", "Order"),
+        ("space", "toggle_expand", "Sub-jobs"),
+        ("e", "expand_all", "Expand all"),
+        ("n", "rename", "Name job"),
         ("r", "refresh", "Refresh"),
         ("q", "quit", "Quit"),
     ]
     _REFRESH_SECONDS = 20
+    _COLUMNS = [(" ", 1), ("Name", 34), ("Job ID", 12), ("Type", 12), ("Status", 11), ("Model", 20),
+                ("GPUs", 9), ("Created", 16), ("Updated", 16), ("Owner", 12)]
 
-    def __init__(self, client, *, sub_job_id=None, poll_interval=1.0):
+    def __init__(self, client, *, sub_job_id=None, poll_interval=1.0, aliases=None, now=None):
         super().__init__()
+        from cortex_training.tui.stores import AliasStore
+
         self._client = client
         self._sub_job_id = sub_job_id
         self._poll_interval = poll_interval
+        self._aliases = aliases or AliasStore()
+        self._now = now  # fixed clock for tests/screenshots; None = wall clock
         self._job_by_item: dict[str, str] = {}
         self._status_by_item: dict[str, str] = {}
+        self._jobs_by_id: dict[str, dict] = {}
+        self._sub_by_item: dict[str, tuple] = {}
         self._all_jobs: list = []
         self._filter = ""
+        self._sort = "created"
+        self._descending = True
+        self._expanded: set = set()
+        self._collapsed: set = set()  # live jobs the user folded
         self._last_refreshed = None
         self._refreshing = False
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield ListView(id="jobs")
-        yield Input(placeholder="filter jobs…  (/ focus · Esc clear)", id="jobfilter")
+        yield Static("", id="listinfo")
+        yield DataTable(id="jobs", cursor_type="row", zebra_stripes=False)
+        yield Static("", id="nomatch")
+        yield Input(
+            placeholder="search names / ids…  or fields: model:qwen lr<1e-4 gpus>=8 method:lora gpu:H200  (/ focus · Esc clear)",
+            id="jobfilter",
+        )
+        yield Static(
+            "[dim]fields:[/dim] " + " ".join(views.SEARCH_FIELDS)
+            + "   [dim]ops:[/dim] :  =  !=  >  >=  <  <=   [dim]any config member:[/dim] training_config.optimizer.lr<1e-4",
+            id="searchhelp",
+        )
         yield Footer()
 
     def on_mount(self) -> None:
+        table = self.query_one("#jobs", DataTable)
+        for label, width in self._COLUMNS:
+            table.add_column(label, width=width)
+        self.query_one("#nomatch", Static).display = False
         self._refresh_jobs()
         # Gentle auto-refresh so status changes appear without pressing r.
         self.set_interval(self._REFRESH_SECONDS, self._auto_refresh)
 
     def on_screen_resume(self) -> None:
-        # LogScreen owns the same app-level subtitle while it is active. Restore
-        # the picker status when the user returns from a job.
+        # Detail screens own the same app-level subtitle while they are active.
+        # Restore the list status (and any renamed job) on return.
         self._update_subtitle()
+        self._render_jobs()
+
+    def _clock(self) -> datetime:
+        return self._now or datetime.now(timezone.utc)
 
     def _update_subtitle(self) -> None:
         if self._refreshing:
@@ -113,7 +155,7 @@ class JobListScreen(Screen):
         else:
             refresh_status = f"last refreshed {self._last_refreshed or '—'}"
         self.app.sub_title = (
-            "select a job (↑/↓, Enter · / filter · r refresh)"
+            "select a job (↑/↓, Enter · / search · s sort · space sub-jobs · r refresh)"
             f"  ·  {refresh_status}"
         )
 
@@ -123,8 +165,8 @@ class JobListScreen(Screen):
         self._load_jobs()
 
     def _auto_refresh(self) -> None:
-        # Only refetch while the picker is the active screen — don't poll GS in
-        # the background while the user is down in the log view.
+        # Only refetch while the list is the active screen — don't poll in the
+        # background while the user is down in a job.
         if self.app.screen is self:
             self._refresh_jobs()
 
@@ -138,16 +180,80 @@ class JobListScreen(Screen):
         inp = self.query_one("#jobfilter", Input)
         if self.focused is inp or self._filter:
             inp.value = ""  # fires on_input_changed → clears the filter
-            self.set_focus(self.query_one("#jobs", ListView))
+            self.set_focus(self.query_one("#jobs", DataTable))
 
-    async def on_input_changed(self, event: Input.Changed) -> None:
+    def action_cycle_sort(self) -> None:
+        keys = views.SORT_KEYS
+        self._sort = keys[(keys.index(self._sort) + 1) % len(keys)]
+        self._render_jobs()
+
+    def action_toggle_order(self) -> None:
+        self._descending = not self._descending
+        self._render_jobs()
+
+    def _highlighted(self) -> tuple:
+        table = self.query_one("#jobs", DataTable)
+        try:
+            key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        except Exception:  # noqa: BLE001 - empty table
+            return None, None
+        if key in self._job_by_item:
+            return key, self._job_by_item[key]
+        if key in self._sub_by_item:
+            return key, self._sub_by_item[key][0]
+        return key, None
+
+    def _is_expanded(self, job: dict) -> bool:
+        jid = views.job_id_of(job)
+        if jid in self._collapsed:
+            return False
+        return jid in self._expanded or views.is_live(job)
+
+    def action_toggle_expand(self) -> None:
+        _key, jid = self._highlighted()
+        job = self._jobs_by_id.get(jid or "")
+        if not job:
+            return
+        if self._is_expanded(job):
+            self._expanded.discard(jid)
+            self._collapsed.add(jid)
+        else:
+            self._collapsed.discard(jid)
+            self._expanded.add(jid)
+        self._render_jobs(keep=jid)
+
+    def action_expand_all(self) -> None:
+        if self._expanded:
+            self._expanded.clear()
+            self._collapsed = {views.job_id_of(j) for j in self._all_jobs if views.is_live(j)}
+        else:
+            self._collapsed.clear()
+            self._expanded = {views.job_id_of(j) for j in self._all_jobs}
+        self._render_jobs()
+
+    def action_rename(self) -> None:
+        from cortex_training.tui.screens import PromptScreen
+
+        _key, jid = self._highlighted()
+        if not jid:
+            return
+        current = views.display_name(self._jobs_by_id.get(jid, {}), self._aliases.all())
+
+        def done(value):
+            if value is not None:
+                self._aliases.set(jid, value)
+                self._render_jobs(keep=jid)
+
+        self.app.push_screen(PromptScreen(f"Display name for {jid}", current, "e.g. qwen3-8b lora sweep #3"), done)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "jobfilter":
             self._filter = event.value.strip()
-            await self._render_jobs()
+            self._render_jobs()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "jobfilter":
-            self.set_focus(self.query_one("#jobs", ListView))
+            self.set_focus(self.query_one("#jobs", DataTable))
 
     @work(thread=True, exclusive=True, group="jobs")
     def _load_jobs(self) -> None:
@@ -161,66 +267,153 @@ class JobListScreen(Screen):
             return
         self.app.call_from_thread(self._on_jobs, jobs, None)
 
-    async def _on_jobs(self, jobs, error) -> None:
+    def _on_jobs(self, jobs, error) -> None:
         self._refreshing = False
         if error:
             self._update_subtitle()
-            lv = self.query_one("#jobs", ListView)
-            await lv.clear()
             self._all_jobs = []
-            self._job_by_item = {}
-            self._status_by_item = {}
-            lv.append(ListItem(Label(f"[error] {error}")))
+            self._render_jobs(error=error)
             return
-        self._all_jobs = sort_jobs(jobs)
+        self._all_jobs = [j for j in (jobs or []) if isinstance(j, dict) and views.job_id_of(j)]
+        self._jobs_by_id = {views.job_id_of(j): j for j in self._all_jobs}
         self._last_refreshed = time.strftime("%H:%M:%S")
         self._update_subtitle()
-        await self._render_jobs()
+        self._render_jobs()
 
-    async def _render_jobs(self) -> None:
-        lv = self.query_one("#jobs", ListView)
-        prev = lv.index
-        # await clear() so old items (job-0, …) are gone before re-appending
-        # ones with the same IDs.
-        await lv.clear()
+    def _job_row(self, job: dict, name: str) -> list:
+        live = views.is_live(job)
+        word = views.status_word(job.get("status"))
+        status_style = {"running": "bold green", "failed": "bold red"}.get(word, "yellow" if live else "grey62")
+        jid = views.job_id_of(job)
+        models = views.job_models(job)
+        model = models[0].split("/")[-1] if models else "—"
+        if len(models) > 1:
+            model += f" +{len(models) - 1}"
+        marker = Text("●", style="bold green") if live else Text("○", style="grey50")
+        name_cell = Text(name, style="bold") if name else Text("—", style="grey50")
+        if views.sub_jobs(job):
+            name_cell = Text.assemble(("▾ " if self._is_expanded(job) else "▸ ", "grey50"), name_cell)
+        return [
+            marker,
+            name_cell,
+            jid[:8] + "…" if len(jid) > 9 else jid,
+            views.job_type_label(job),
+            Text(word.upper(), style=status_style),
+            model,
+            f"{views.total_gpus(job) or '—'}" + (f" {job['hardware']}" if job.get("hardware") else ""),
+            format_created_at(job.get("created_at")) or "—",
+            format_created_at(job.get("updated_at")) or "—",
+            str(job.get("submitted_by") or job.get("owner_role") or "—"),
+        ]
+
+    @staticmethod
+    def _sub_row(sj: dict, last: bool) -> list:
+        word = views.status_word(sj.get("status"))
+        style = {"running": "green", "failed": "red"}.get(word, "grey62")
+        branch = "└─" if last else "├─"
+        return [
+            "",
+            Text(f"   {branch} {views.sub_job_label(sj)}", style="grey70"),
+            Text(":" + ":".join(str(sj.get("sub_job_id") or "").split(":")[1:]), style="grey50"),
+            Text(str(sj.get("job_type") or "").lower(), style="grey70"),
+            Text(word.upper(), style=style),
+            Text(str(sj.get("model_name") or "—").split("/")[-1], style="grey70"),
+            Text(str(views.sub_job_gpus(sj) or "—"), style="grey70"),
+            "",
+            "",
+            "",
+        ]
+
+    def _render_jobs(self, *, keep: str | None = None, error: str | None = None) -> None:
+        table = self.query_one("#jobs", DataTable)
+        nomatch = self.query_one("#nomatch", Static)
+        if keep is None:
+            _k, keep = self._highlighted()
+        table.clear()
         self._job_by_item = {}
         self._status_by_item = {}
-        visible = [j for j in self._all_jobs if job_matches(j, self._filter)]
-        if not visible:
-            lv.append(ListItem(Label("(no matching jobs)" if self._filter else "(no jobs found)")))
+        self._sub_by_item = {}
+        if error:
+            self.query_one("#listinfo", Static).update(f"[red][error] {escape(error)}[/red]")
+            nomatch.display = False
             return
-        for i, job in enumerate(visible):
-            jid = job.get("job_id") or job.get("id")
-            if not jid:
-                continue
-            item_id = f"job-{i}"
-            self._job_by_item[item_id] = jid
-            self._status_by_item[item_id] = job.get("status")
-            # Tint only the leading status word (subtle); the rest stays default.
-            plain = format_job_row(job)
-            status_disp = (str(job.get("status", "")).strip() or "?").removeprefix("JOB_STATE_")
-            color = job_status_color(job.get("status"))
-            if color and plain.startswith(status_disp):
-                text = f"[{color}]{escape(status_disp)}[/]{escape(plain[len(status_disp):])}"
-            else:
-                text = escape(plain)
-            lv.append(ListItem(Label(text), id=item_id))
-        # Keep the cursor roughly where it was so auto-refresh doesn't jump it.
-        if prev is not None and self._job_by_item:
-            lv.index = min(prev, len(self._job_by_item) - 1)
+        now = self._clock()
+        aliases = self._aliases.all()
+        recent = [j for j in self._all_jobs if views.within_retention(j, now)]
+        hidden = len(self._all_jobs) - len(recent)
+        query = views.parse_query(self._filter)
+        names = {views.job_id_of(j): views.display_name(j, aliases) for j in recent}
+        visible = [j for j in recent if views.job_matches_query(j, query, names[views.job_id_of(j)])]
+        ordered = views.sort_job_list(visible, self._sort, self._descending)
+        live = [j for j in ordered if views.is_live(j)]
+        history = [j for j in ordered if not views.is_live(j)]
 
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        item_id = event.item.id or ""
-        jid = self._job_by_item.get(item_id)
-        if jid:
+        arrow = "↓" if self._descending else "↑"
+        info = (
+            f"  [bold green]● {len(live)} live[/]   [grey62]○ {len(history)} historical[/]"
+            f"   [dim]·  last 6 months ({len(recent)} jobs"
+            + (f", {hidden} older hidden" if hidden else "")
+            + f")  ·  sort: [/dim][b]{self._sort} {arrow}[/b]"
+        )
+        if self._filter:
+            info += f"   [dim]·  search:[/dim] [b]{escape(self._filter)}[/b] → {len(visible)} match(es)"
+        self.query_one("#listinfo", Static).update(info)
+
+        if not visible:
+            if self._filter:
+                nomatch.update(views.no_match_message(self._filter, query, len(recent)))
+            else:
+                nomatch.update("No jobs in the last 6 months for this role.")
+            nomatch.display = True
+            table.display = False
+            return
+        nomatch.display = False
+        table.display = True
+
+        idx = 0
+        target_row = None
+        for group, jobs in (("LIVE", live), ("HISTORY", history)):
+            if not jobs:
+                continue
+            style = "bold green" if group == "LIVE" else "bold grey62"
+            label = "running or queued" if group == "LIVE" else "ended or failed"
+            table.add_row("", Text.assemble((f"{group} ({len(jobs)})  ", style), (label, "dim")),
+                          *[""] * 8, key=f"hdr-{group.lower()}")
+            for job in jobs:
+                jid = views.job_id_of(job)
+                item_id = f"job-{idx}"
+                idx += 1
+                self._job_by_item[item_id] = jid
+                self._status_by_item[item_id] = job.get("status")
+                table.add_row(*self._job_row(job, names[jid]), key=item_id)
+                if jid == keep and target_row is None:
+                    target_row = table.row_count - 1
+                if self._is_expanded(job):
+                    subs = views.sub_jobs(job)
+                    for si, sj in enumerate(subs):
+                        sub_key = f"sub-{item_id}-{si}"
+                        self._sub_by_item[sub_key] = (jid, sj.get("sub_job_id"))
+                        table.add_row(*self._sub_row(sj, si == len(subs) - 1), key=sub_key)
+        if target_row is None:
+            target_row = 1  # first job row (row 0 is a group header)
+        table.move_cursor(row=min(target_row, table.row_count - 1), animate=False)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        from cortex_training.tui.screens import JobDetailScreen
+        from cortex_training.tui.screens import JobSummaryScreen
+
+        key = event.row_key.value
+        if key in self._job_by_item:
+            jid = self._job_by_item[key]
             self.app.push_screen(
-                LogScreen(
-                    self._client,
-                    jid,
-                    sub_job_id=self._sub_job_id,
-                    poll_interval=self._poll_interval,
-                    job_status=self._status_by_item.get(item_id),
-                )
+                JobSummaryScreen(self._client, jid, job=self._jobs_by_id.get(jid), aliases=self._aliases,
+                                 poll_interval=self._poll_interval)
+            )
+        elif key in self._sub_by_item:
+            jid, sid = self._sub_by_item[key]
+            self.app.push_screen(
+                JobDetailScreen(self._client, jid, job=self._jobs_by_id.get(jid), sub_job_id=sid,
+                                initial_tab="tab-metrics", aliases=self._aliases, poll_interval=self._poll_interval)
             )
 
 
@@ -483,6 +676,7 @@ class LogScreen(Screen):
             # The summary line is reserved for static config; status/reason go
             # on the subtitle line instead.
             self._post(self._set_summary, format_job_config(job))
+            self._post(self._on_job_loaded, job)
         self._post(self._update_subtitle)
 
         # Each sub-job is a tailable source (its zone-manager / Ray-head pod,
@@ -514,10 +708,19 @@ class LogScreen(Screen):
             sid = s["sub_job_id"]
             item_id = f"src-{i}"
             self._source_by_item[item_id] = sid
-            lv.append(ListItem(Label(source_label(s)), id=item_id))
+            lv.append(ListItem(Label(views.sub_job_label(s)), id=item_id))
         if items:
-            lv.index = 0
-            self._start_tail(items[0]["sub_job_id"])
+            # --sub-job-id (or a sub-job drill-down) picks the source to open.
+            first = next((i for i, s in enumerate(items) if s["sub_job_id"] == self._sub_job_id), 0)
+            lv.index = first
+            self._start_tail(items[first]["sub_job_id"])
+
+    def _on_job_loaded(self, job: dict) -> None:
+        """UI thread. Hook for subclasses that render more of the job."""
+
+    def _display(self, line: str) -> str:
+        """Hook: how a buffered line is shown. The buffer (and save/copy) keep it raw."""
+        return line
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         sid = self._source_by_item.get(event.item.id or "")
@@ -794,7 +997,7 @@ class LogScreen(Screen):
         w = self._content_width()
         wrapped: list[str] = []
         for line in lines:
-            wrapped.extend(wrap_log_line(line, w))
+            wrapped.extend(wrap_log_line(self._display(line), w))
         # One write_lines call per page keeps the UI responsive under
         # high-velocity logs (vs. a cross-thread hop + write per line).
         lv.write_lines(wrapped, scroll_end=follow)
@@ -810,7 +1013,7 @@ class LogScreen(Screen):
         self._wrap_width = w
         lv.clear()
         for line in self._shown_lines:
-            for piece in wrap_log_line(line, w):
+            for piece in wrap_log_line(self._display(line), w):
                 lv.write_line(piece)
         # Re-wrapping clears + repaints (resetting scroll to the top), so snap
         # back to the tail unless the user has paused to read history.
@@ -819,16 +1022,38 @@ class LogScreen(Screen):
 
 
 class CortexTrainingLogTUI(App):
-    """Entry app: show the job picker, or jump straight to a job's logs when a
+    """Entry app: show the job list, or jump straight to a job's Logs tab when a
     job_id is supplied."""
 
     CSS = """
-    #jobs { padding: 0 1; }
+    #jobs { height: 1fr; }
+    #listinfo { padding: 0 1; height: 1; }
+    #nomatch { padding: 1 2; color: $warning; height: auto; }
+    #searchhelp { padding: 0 1; height: auto; }
     #sources { width: 48; border-right: solid $panel; }
     #logview { padding: 0 1; }
-    #summary { color: $text-muted; padding: 0 1; }
+    #summary { color: $text-muted; padding: 0 1; height: 1; }
     #logfilter { border: tall $panel; }
     #jobfilter { border: tall $panel; }
+    #tabs { height: 1fr; }
+    TabPane { padding: 0; }
+    #metric-head, #cp-head { padding: 0 1; height: auto; margin-bottom: 1; }
+    #metriclist { width: 40; border-right: solid $panel; }
+    #metric-pane, #gpu-pane { padding: 0 1; }
+    #cptable { height: auto; max-height: 70%; }
+    #cp-foot { padding: 1 1; height: auto; }
+    #summary-body { padding: 1 1; }
+    #preview { height: auto; }
+    #health { height: auto; margin: 1 0; }
+    #subjobs-title { height: auto; margin-top: 1; }
+    #subjobs { height: auto; max-height: 12; margin: 0 1; }
+    #glance { height: auto; padding: 0 1; }
+    #cp-detail { padding: 1 2; }
+    .cp-title { margin-top: 1; color: $accent; }
+    .cp-section { padding: 0 2; color: $text; }
+    PromptScreen { align: center middle; }
+    #prompt { width: 80; height: auto; border: thick $accent; background: $surface; padding: 1 2; }
+    #prompt-hint { color: $text-muted; }
     /* Text-selection highlight: reuse the picker's subtle "blurred cursor"
        shade so it's visible but not a heavy saturated block. */
     LogScreen > .screen--selection {
@@ -838,20 +1063,29 @@ class CortexTrainingLogTUI(App):
     """
     BINDINGS = [("q", "quit", "Quit")]
 
-    def __init__(self, client, job_id=None, *, sub_job_id=None, poll_interval=1.0):
+    def __init__(self, client, job_id=None, *, sub_job_id=None, poll_interval=1.0, now=None):
         super().__init__()
         self._client = client
         self._job_id = job_id
         self._sub_job_id = sub_job_id
         self._poll_interval = poll_interval
-        self.title = "cortex training logs"
+        self._now = now
+        self.title = "cortex training"
 
     def on_mount(self) -> None:
         if self._job_id:
+            from cortex_training.tui.screens import JobDetailScreen
+
             self.push_screen(
-                LogScreen(self._client, self._job_id, sub_job_id=self._sub_job_id, poll_interval=self._poll_interval)
+                JobDetailScreen(
+                    self._client,
+                    self._job_id,
+                    sub_job_id=self._sub_job_id,
+                    initial_tab="tab-logs",
+                    poll_interval=self._poll_interval,
+                )
             )
         else:
             self.push_screen(
-                JobListScreen(self._client, sub_job_id=self._sub_job_id, poll_interval=self._poll_interval)
+                JobListScreen(self._client, sub_job_id=self._sub_job_id, poll_interval=self._poll_interval, now=self._now)
             )

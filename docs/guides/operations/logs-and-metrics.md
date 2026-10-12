@@ -31,7 +31,12 @@ View a running job's live logs, or a finished job's saved console, in the termin
 cortex-training tui JOB_ID
 ```
 
-Recipe-level metrics are also written under each recipe's `log_path`.
+The same TUI charts GPU telemetry, lists checkpoints, and plots the training
+metrics a recipe logged from this machine. See [Log TUI](../../reference/cli.md#log-tui).
+
+Recipe-level metrics are also written under each recipe's `log_path`, and
+to the TUI's local store (`jobs/<job>/metrics.jsonl` under
+`~/.cache/cortex-training/`).
 
 Snowflake profile and PAT clients also emit best-effort client-side operation
 metrics over Snowflake's OTLP endpoint. Failures of essential SDK methods are

@@ -49,14 +49,16 @@ To log the same metrics to Snowflake experiment tracking, pass
 Recipes are Python modules so they can share code without path manipulation:
 
 ```bash
-python -m recipes.sft.conversational.train config=/path/to/config.json
-python -m recipes.rl.math_grpo.train config=/path/to/config.json
-python -m recipes.inference.serve config=/path/to/config.json
+python -m recipes.sft.conversational.train
+python -m recipes.rl.math_grpo.train
+python -m recipes.inference.serve
 ```
 
-`config=` is the Snowflake PAT/connection file. It is optional — if omitted,
-recipes fall back to environment variables or your default `connections.toml`
-profile. See each recipe README for hardware, expected metrics, common
+Recipes use the connection you set up once in
+[Authentication](../docs/getting-started/authentication.md). Connection problems? See the same page. To use a specific JSON file, add
+`config=/path/to/config.json`.
+
+See each recipe README for hardware, expected metrics, common
 variations, and the JSON job configs loaded from `configs/` (SFT and GRPO
 examples, plus inference configs for every catalog model).
 

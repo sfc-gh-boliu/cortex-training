@@ -2,8 +2,8 @@
 
 > **You only need to do this once per machine.** After that, the CLI, recipes,
 > notebooks, and `connect()` all use the same connection automatically, so no
-> command needs connection details. Repeat Step 2 only when your PAT expires or
-> you switch accounts.
+> command needs connection details. Run `cortex-training login` again when your
+> PAT expires or you switch accounts.
 
 Cortex Training authenticates through a Snowflake Programmatic Access Token
 (PAT). This page walks you through two steps:

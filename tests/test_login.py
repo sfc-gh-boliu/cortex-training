@@ -79,6 +79,9 @@ class FakeClientClass:
 def _isolated(monkeypatch, tmp_path):
     for name in _login._ENV_VARS + ("CORTEX_TRAINING_ENDPOINT",):
         monkeypatch.delenv(name, raising=False)
+    # The folder must exist: the connector (and login) only use SNOWFLAKE_HOME
+    # when it does, and otherwise fall back to the real platform config folder.
+    (tmp_path / "snowflake").mkdir()
     monkeypatch.setenv("SNOWFLAKE_HOME", str(tmp_path / "snowflake"))
     monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "login.json"))
 
@@ -175,7 +178,7 @@ def test_validate_host_rejects_with_fix(raw, message):
 
 
 def test_write_profile_keeps_other_profiles_and_comments(connections_file):
-    connections_file.parent.mkdir(parents=True)
+    connections_file.parent.mkdir(parents=True, exist_ok=True)
     connections_file.write_text(
         '# my notes\n[other]\naccount = "X"\nuser = "U"  # keep me\n', encoding="utf-8"
     )
@@ -857,3 +860,41 @@ def test_ctrl_c_during_reset_reports_the_removed_login(tmp_path, connections_fil
     assert rc == 130
     assert "Already done: removed the saved login." in stderr
     assert "saved" in tomlkit.parse(connections_file.read_text())
+
+
+# ---------------------------------------------------------------------------
+# Where connections.toml lives (same rule as the Snowflake Connector)
+# ---------------------------------------------------------------------------
+
+
+def test_connections_file_uses_snowflake_home_when_it_exists(tmp_path, monkeypatch):
+    home = tmp_path / "custom-home"
+    home.mkdir()
+    monkeypatch.setenv("SNOWFLAKE_HOME", str(home))
+
+    assert _login.connections_file_path() == home / "connections.toml"
+
+
+def test_connections_file_falls_back_to_platform_folder(tmp_path, monkeypatch):
+    import platformdirs
+
+    class FakePlatformDirs:
+        def __init__(self, appname, appauthor):
+            assert (appname, appauthor) == ("snowflake", False)
+            self.user_config_dir = str(tmp_path / "platform" / "snowflake")
+
+    monkeypatch.setenv("SNOWFLAKE_HOME", str(tmp_path / "does-not-exist"))
+    monkeypatch.setattr(platformdirs, "PlatformDirs", FakePlatformDirs)
+
+    assert _login.connections_file_path() == tmp_path / "platform" / "snowflake" / "connections.toml"
+
+
+def test_connections_file_matches_the_connector(tmp_path, monkeypatch):
+    from snowflake.connector import sf_dirs
+
+    for home in (tmp_path / "exists", tmp_path / "missing"):
+        if home.name == "exists":
+            home.mkdir()
+        monkeypatch.setenv("SNOWFLAKE_HOME", str(home))
+        connector_dir = Path(sf_dirs._resolve_platform_dirs().user_config_path)
+        assert _login.connections_file_path() == connector_dir / "connections.toml"

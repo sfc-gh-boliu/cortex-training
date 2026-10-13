@@ -150,13 +150,19 @@ class Discovery:
 
 
 def connections_file_path() -> Path:
-    """Return the ``connections.toml`` the Snowflake Connector reads."""
-    home = env("SNOWFLAKE_HOME")
-    if home:
-        return Path(home).expanduser() / "connections.toml"
-    from snowflake.connector.constants import CONNECTIONS_FILE
+    """Return the ``connections.toml`` the Snowflake Connector reads.
 
-    return Path(CONNECTIONS_FILE)
+    Same rule as the connector: ``$SNOWFLAKE_HOME`` (default ``~/.snowflake``)
+    when that folder exists, otherwise the platform's config folder, such as
+    ``~/.config/snowflake`` on Linux.
+    """
+    home = Path(env("SNOWFLAKE_HOME") or "~/.snowflake").expanduser()
+    if home.is_dir():
+        return home / "connections.toml"
+    from platformdirs import PlatformDirs
+
+    config_dir = PlatformDirs(appname="snowflake", appauthor=False).user_config_dir
+    return Path(config_dir) / "connections.toml"
 
 
 def read_profiles(path: Path) -> dict[str, dict[str, Any]]:

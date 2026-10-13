@@ -292,10 +292,12 @@ cortex-training login
    `app.snowflake.com/REGION/LOCATOR` becomes
    `LOCATOR.REGION.snowflakecomputing.com`. A typed host with underscores is
    rejected with the hyphenated form to use instead.
-3. It writes the profile to the Snowflake Connector's `connections.toml`
-   (`~/.snowflake/connections.toml`, or `$SNOWFLAKE_HOME/connections.toml`),
-   keeps every other profile and comment, and sets the file to mode `600`. It
-   asks before replacing a profile with the same name.
+3. It writes the profile to the Snowflake Connector's `connections.toml`: in
+   `$SNOWFLAKE_HOME` or `~/.snowflake/` if that folder exists, otherwise in
+   `~/.config/snowflake/` (Linux) or `~/Library/Application Support/snowflake/`
+   (macOS). Login prints the exact path after saving. It keeps every other
+   profile and comment, sets the file to mode `600`, and asks before replacing
+   a profile with the same name.
 4. It runs a capacity request through the new profile. If the database does not
    exist yet, the client creates it with
    `CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB`, and login prints that

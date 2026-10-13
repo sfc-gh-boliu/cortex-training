@@ -57,7 +57,7 @@ What it does:
   profile.
 
 Files:
-  ~/.snowflake/connections.toml (or $SNOWFLAKE_HOME/connections.toml)
+  connections.toml in your Snowflake config folder (login prints the exact path)
   ~/.config/cortex-training/login.json: the saved login, a pointer to a
   profile or config file; it never stores credentials."""
 

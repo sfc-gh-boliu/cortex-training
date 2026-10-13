@@ -45,12 +45,29 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
 
+from cortex_training.snowflake_auth import SnowflakeProfileError
+
 if TYPE_CHECKING:
     from cortex_training.client import CortexTrainingClient
 
 logger = logging.getLogger(__name__)
 
 LOGIN_STATE_ENV = "CORTEX_TRAINING_LOGIN_FILE"
+
+# The Snowflake Connector's wording when the profile it was asked for is missing.
+_PROFILE_NOT_FOUND = "cannot be found, known ones are"
+
+# Absolute link: pip installs do not include the repository's docs.
+_NO_CONNECTION_HINT = (
+    "No Cortex Training connection is configured. The easiest way to set one up\n"
+    "(once per machine) is to put your host, PAT, and database in a JSON file and\n"
+    "register it:\n"
+    "\n"
+    "    cortex-training login --config config.json\n"
+    "\n"
+    "For other options (connections.toml profiles, environment variables), see:\n"
+    "https://github.com/snowflakedb/cortex-training/blob/main/docs/getting-started/authentication.md"
+)
 
 DEFAULT_SCHEMA = "PUBLIC"
 DEFAULT_ENDPOINT = "cortex-training"
@@ -414,11 +431,18 @@ def build_client(
     if settings.base_url:
         return client_cls(base_url=settings.base_url, **kwargs)
     if settings.use_connection_profile:
-        return client_cls.from_connection_name(
-            connection_name=settings.connection_name,
-            verify_ssl=settings.verify_ssl,
-            **kwargs,
-        )
+        try:
+            return client_cls.from_connection_name(
+                connection_name=settings.connection_name,
+                verify_ssl=settings.verify_ssl,
+                **kwargs,
+            )
+        except SnowflakeProfileError as exc:
+            # Only the "nothing configured at all" fallback gets setup steps; a
+            # named profile that is missing is a typo the error already names.
+            if settings.connection_name is None and _PROFILE_NOT_FOUND in str(exc):
+                raise SnowflakeProfileError(f"{exc}\n\n{_NO_CONNECTION_HINT}") from exc
+            raise
     return client_cls.from_pat(
         host=normalize_host(settings.host),
         pat=settings.pat,

@@ -57,7 +57,8 @@ def connect(
 ) -> CortexTrainingClient:
     """Build a CortexTrainingClient from the best available credentials.
 
-    Explicit arguments always win over environment variables. Passing
+    Anything passed explicitly (``connection_name``, ``config_path``, ``host``
+    + ``pat``, or ``base_url``) wins over environment variables. Passing
     ``connection_name`` together with ``config_path``, ``host``, ``pat``, or
     ``base_url`` is an error. With no explicit source, the first match wins:
 

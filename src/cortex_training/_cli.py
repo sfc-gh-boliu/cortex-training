@@ -18,9 +18,13 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
+import re
 import sys
+from datetime import date
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from pathlib import Path
 from typing import Any
@@ -66,6 +70,34 @@ examples:
 
 Docs: https://github.com/snowflakedb/cortex-training/blob/main/docs/reference/cli.md#login"""
 
+# The statuses each `list --status` word matches, as on the account-level
+# route: pending excludes placing, done takes the DONE older jobs show, and
+# UNKNOWN rows match nothing.
+_LIST_STATUS_FILTERS = {
+    "pending": {"pending"},
+    "placing": {"placing"},
+    "initializing": {"initializing"},
+    "running": {"running"},
+    "failed": {"failed"},
+    "cancelled": {"cancelled"},
+    "terminated": {"terminated"},
+    "active": {"pending", "placing", "initializing", "running"},
+    "done": {"cancelled", "terminated", "done"},
+}
+
+# Status words the server can answer with that are not the ones it filters on:
+# older rows, and states a backend ahead of the API layer reports.
+_STATUS_ALIASES = {
+    "queued": "pending",
+    "creating": "initializing",
+    "canceled": "cancelled",
+    "completed": "done",
+    "succeeded": "done",
+    "error": "failed",
+}
+
+
+
 
 def _load_cortex_training_client_class():
     from .client import CortexTrainingClient
@@ -85,6 +117,9 @@ def _hardware_choices() -> list[str]:
     return [member.value for member in Hardware]
 
 
+_FRACTION_RE = re.compile(r"\.([0-9]+)")
+
+
 def _created_epoch(raw: Any) -> float | None:
     if raw is None:
         return None
@@ -93,6 +128,10 @@ def _created_epoch(raw: Any) -> float | None:
         return None
     if created_at.endswith("Z"):
         created_at = created_at[:-1] + "+00:00"
+    # Before Python 3.11, fromisoformat takes only 3 or 6 fractional digits.
+    created_at = _FRACTION_RE.sub(
+        lambda match: "." + match.group(1)[:6].ljust(6, "0"), created_at, count=1
+    )
     try:
         created = datetime.fromisoformat(created_at)
     except ValueError:
@@ -125,6 +164,116 @@ def _jobs_latest_last(jobs: list[Any]) -> list[Any]:
             )
         ]
     return list(reversed(jobs))
+
+
+def _newest_jobs(jobs: list[Any], limit: int) -> list[Any]:
+    """The ``limit`` newest jobs by ``created_at``, in the order given.
+
+    A missing timestamp ranks oldest, so ``--limit`` drops those rows first;
+    ties break toward the earlier row, the server answering newest first.
+    """
+    if limit >= len(jobs):
+        return list(jobs)
+    last = len(jobs) - 1
+
+    def rank(item: tuple[int, Any]) -> tuple[float, int]:
+        index, job = item
+        created = _created_epoch(job.get("created_at")) if isinstance(job, dict) else None
+        return (created if created is not None else float("-inf"), last - index)
+
+    newest = sorted(enumerate(jobs), key=rank)[-limit:]
+    return [job for _, job in sorted(newest)]
+
+
+def _status_list(raw: str) -> str:
+    """argparse type for --status: the comma list, lowercased, every word known."""
+    words = [word.strip().lower() for word in raw.split(",")]
+    for word in words:
+        if word not in _LIST_STATUS_FILTERS:
+            raise argparse.ArgumentTypeError(
+                f"unknown status {word!r}; use a comma-separated list of "
+                + ", ".join(_LIST_STATUS_FILTERS)
+            )
+    return ",".join(words)
+
+
+def _list_statuses(words: str) -> set[str]:
+    """The job statuses a --status list from _status_list keeps."""
+    statuses: set[str] = set()
+    for word in words.split(","):
+        statuses |= _LIST_STATUS_FILTERS[word]
+    return statuses
+
+
+_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+def _utc_date(value: str) -> date:
+    """argparse type for --since/--until: a YYYY-MM-DD date, read as a UTC day."""
+    # Matched first because date.fromisoformat also takes forms such as 20261001.
+    if _DATE_RE.fullmatch(value):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            pass
+    raise argparse.ArgumentTypeError(f"expected a YYYY-MM-DD date, got {value!r}")
+
+
+def _utc_midnight(day: date) -> float:
+    return datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp()
+
+
+def _same_name(wanted: str, actual: Any) -> bool:
+    # Rows carry names as stored. SQL identifier rules, as the server applies to
+    # submitted_by: an unquoted name means its uppercase form, a "quoted" one
+    # exactly what is between the quotes.
+    if len(wanted) > 1 and wanted[0] == wanted[-1] == '"':
+        wanted = wanted[1:-1].replace('""', '"')
+    else:
+        wanted = wanted.upper()
+    return isinstance(actual, str) and actual == wanted
+
+
+def _list_filter(args: argparse.Namespace) -> Callable[[dict], bool]:
+    """Build the list filters for the schema's jobs; --all has the server apply them."""
+    # Rows can carry an enum name (JOB_STATE_RUNNING) or an alias, so compare
+    # on the normalized word rather than the raw field.
+    from .client import CortexTrainingClient
+
+    def status_of(job: dict) -> str:
+        word = CortexTrainingClient._normalize_job_status(job.get("status"))
+        return _STATUS_ALIASES.get(word, word)
+
+    statuses = None if args.status is None else _list_statuses(args.status)
+    since = None if args.since is None else _utc_midnight(args.since)
+    # --until names the last day kept, so the bound is the next midnight.
+    until = None if args.until is None else _utc_midnight(args.until + timedelta(days=1))
+
+    def keep(job: dict) -> bool:
+        if statuses is not None and status_of(job) not in statuses:
+            return False
+        if args.user is not None and not _same_name(args.user, job.get("submitted_by")):
+            return False
+        if since is None and until is None:
+            return True
+        created = _created_epoch(job.get("created_at"))
+        return (
+            created is not None
+            and (since is None or created >= since)
+            and (until is None or created < until)
+        )
+
+    return keep
+
+
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number, got {value!r}") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {number}")
+    return number
 
 
 def build_parser(
@@ -229,7 +378,43 @@ def build_parser(
     checkpoints.add_argument("job_id")
 
     list_jobs = subparsers.add_parser("list", help="List Cortex Training jobs.")
-    list_jobs.add_argument("--status", help="Optional status filter.")
+    list_jobs.add_argument(
+        "--status",
+        type=_status_list,
+        help=(
+            "Comma-separated statuses to keep: "
+            + ", ".join(_LIST_STATUS_FILTERS)
+            + ". active is pending through running; done is cancelled, terminated, "
+            "and the DONE that older jobs show."
+        ),
+    )
+    list_jobs.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "List jobs across every schema in the account that the current user "
+            "can see, not just the configured one. Fails if account-level listing "
+            "is not enabled for the account."
+        ),
+    )
+    list_jobs.add_argument("--user", help="Keep jobs submitted by this user.")
+    list_jobs.add_argument(
+        "--since",
+        type=_utc_date,
+        metavar="YYYY-MM-DD",
+        help="Keep jobs created on or after this date (a UTC day).",
+    )
+    list_jobs.add_argument(
+        "--until",
+        type=_utc_date,
+        metavar="YYYY-MM-DD",
+        help="Keep jobs created on or before this date (a UTC day).",
+    )
+    list_jobs.add_argument(
+        "--limit",
+        type=_positive_int,
+        help="Print at most this many of the newest matching jobs.",
+    )
 
     capacity = subparsers.add_parser(
         "capacity",
@@ -373,6 +558,15 @@ def build_parser(
             "Defaults to the current working directory."
         ),
     )
+    download_log.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue an earlier stdout download in the output directory and "
+            "fetch only output that is not already saved. Two downloads of the "
+            "same directory at once are unsupported."
+        ),
+    )
 
     download_metrics = subparsers.add_parser(
         "download-metrics",
@@ -385,6 +579,15 @@ def build_parser(
         help=(
             "Directory to write <sub_job_id>/gpu.jsonl files. Created if "
             "missing. Defaults to the current working directory."
+        ),
+    )
+    download_metrics.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue an earlier metrics download in the output directory and "
+            "fetch only metrics that are not already saved. Two downloads of "
+            "the same directory at once are unsupported."
         ),
     )
 
@@ -539,6 +742,14 @@ def parse_args(
 ) -> argparse.Namespace:
     parser = build_parser(prog=prog, include_tui=include_tui)
     args = parser.parse_args(argv)
+    if args.command == "list":
+        if args.since is not None and args.until is not None and args.since > args.until:
+            parser.error("--since must not be later than --until")
+        # --until is sent as the day after, which does not exist for the last date.
+        if args.until == date.max:
+            parser.error(f"--until must be earlier than {date.max}")
+        if args.user is not None and not args.user.strip():
+            parser.error("--user must not be empty")
     if args.command == "login":
         args.login_config = args.login_config or args.login_config_option
         interactive_flags = (
@@ -586,18 +797,49 @@ def _read_json_object(path: str, stdin: TextIO) -> dict[str, Any]:
     return parsed
 
 
+# Duplicated from client.py rather than imported: submit --dry-run must stay
+# importable without pulling in the client (and therefore torch).
+_LOG_PROBABILITY_JOB_TYPE_ALIASES = frozenset({"log_probability", "log_prob"})
+_UNSUPPORTED_LOG_PROBABILITY_MESSAGE = (
+    "log_probability sub-jobs are not currently supported"
+)
+
+
+def _normalized_job_type(job_type: Any) -> str:
+    if not isinstance(job_type, str):
+        return ""
+    return job_type.strip().lower().removeprefix("job_type_")
+
+
+def _is_log_probability_job_type(job_type: Any) -> bool:
+    return _normalized_job_type(job_type) in _LOG_PROBABILITY_JOB_TYPE_ALIASES
+
+
+def _reject_log_probability_sub_job(job_type: Any, *, location: str) -> None:
+    if _is_log_probability_job_type(job_type):
+        raise ValueError(f"{location}: {_UNSUPPORTED_LOG_PROBABILITY_MESSAGE}")
+
+
 def _validate_create_job_body(body: dict[str, Any]) -> None:
+    from .client import _validate_raw_sub_job_configs
+
     sub_job_configs = body.get("sub_job_configs")
     if not isinstance(sub_job_configs, list) or not sub_job_configs:
         raise ValueError("job JSON must contain a non-empty sub_job_configs list")
     # Mirrors client.create_job_from_body; submit --dry-run never builds a client.
-    training_sub_jobs = sum(
-        1
-        for cfg in sub_job_configs
-        if isinstance(cfg, dict) and str(cfg.get("job_type") or "").strip().lower() == "training"
-    )
-    if training_sub_jobs > 1:
-        raise ValueError("at most one training sub-job is supported per job")
+    training_sub_jobs = 0
+    for index, cfg in enumerate(sub_job_configs):
+        if not isinstance(cfg, dict):
+            continue
+        job_type = cfg.get("job_type")
+        _reject_log_probability_sub_job(
+            job_type, location=f"sub_job_configs[{index}].job_type"
+        )
+        if str(job_type or "").strip().lower() == "training":
+            training_sub_jobs += 1
+            if training_sub_jobs > 1:
+                raise ValueError("at most one training sub-job is supported per job")
+    _validate_raw_sub_job_configs(sub_job_configs)
 
 
 def _print_json(value: Any, stdout: TextIO, *, compact: bool) -> None:
@@ -693,6 +935,33 @@ def _cmd_login_interactive(
         format_error=_format_error,
         print_json=lambda value, out: _print_json(value, out, compact=args.compact),
     )
+
+
+def _cmd_list(args: argparse.Namespace, client, stdout: TextIO) -> int:
+    if args.all:
+        jobs = list(
+            itertools.islice(
+                client.iter_jobs(
+                    status=args.status,
+                    submitted_by=args.user,
+                    created_after=args.since,
+                    # The server's bound is exclusive; --until names the last day kept.
+                    created_before=(
+                        None if args.until is None else args.until + timedelta(days=1)
+                    ),
+                    # No bigger than what gets printed; the server takes 1 to 1000.
+                    page_size=min(args.limit or 100, 1000),
+                ),
+                args.limit,
+            )
+        )
+    else:
+        keep = _list_filter(args)
+        jobs = [job for job in client.list_jobs() if keep(job)]
+    if args.limit is not None:
+        jobs = _newest_jobs(jobs, args.limit)
+    _print_json({"jobs": _jobs_latest_last(jobs)}, stdout, compact=args.compact)
+    return 0
 
 
 def _cmd_login(args: argparse.Namespace, stdout: TextIO) -> int:
@@ -798,10 +1067,16 @@ def _cmd_generate(
     if not isinstance(prompts, list) or not prompts:
         raise ValueError("generate JSON must contain a non-empty prompts list")
 
+    # A flat list of integers is one pre-tokenized prompt, not a batch of
+    # single-token prompts, and the client encodes it that way. ``bool`` is an
+    # ``int`` subclass, so exclude it rather than read [true, false] as tokens.
+    single_tokenized = isinstance(prompts[0], int) and not isinstance(prompts[0], bool)
+    prompt_count = 1 if single_tokenized else len(prompts)
+
     sampling_params = payload.get("sampling_params")
     if sampling_params is not None:
         if isinstance(sampling_params, list):
-            if len(sampling_params) != len(prompts):
+            if len(sampling_params) != prompt_count:
                 raise ValueError("generate sampling_params list length must match prompts length")
             if any(item is not None and not isinstance(item, dict) for item in sampling_params):
                 raise ValueError("generate sampling_params list items must be objects or null")
@@ -821,7 +1096,7 @@ def _cmd_generate(
     )
     response = {
         "job_id": args.job,
-        "prompt_count": len(prompts),
+        "prompt_count": prompt_count,
         "request_id": request_id,
     }
     if poll:
@@ -863,7 +1138,7 @@ def _cmd_weight_sync(args: argparse.Namespace, client, stdout: TextIO) -> int:
 def _cmd_download_log(args: argparse.Namespace, client, stdout: TextIO) -> int:
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
     if args.log_type == "stdout":
-        logs = client.download_stdout_logs(args.job_id, out_dir)
+        logs = client.download_stdout_logs(args.job_id, out_dir, resume=args.resume)
         _print_json(
             {"job_id": args.job_id, "logs": logs},
             stdout,
@@ -893,7 +1168,7 @@ def _cmd_download_metrics(
     args: argparse.Namespace, client, stdout: TextIO
 ) -> int:
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
-    metrics = client.download_metrics(args.job_id, out_dir)
+    metrics = client.download_metrics(args.job_id, out_dir, resume=args.resume)
     _print_json(
         {"job_id": args.job_id, "metrics": metrics},
         stdout,
@@ -917,6 +1192,9 @@ def _run(
     if args.command == "submit" and args.dry_run:
         return _cmd_submit(args, None, stdout, stdin)
 
+    if args.command == "download-log" and args.resume and args.log_type != "stdout":
+        raise ValueError("--resume applies to --log-type stdout, not execution logs")
+
     client = client_factory(args)
     if args.command == "submit":
         return _cmd_submit(args, client, stdout, stdin)
@@ -931,9 +1209,7 @@ def _run(
         )
         return 0
     if args.command == "list":
-        jobs = client.list_jobs(status=args.status)
-        _print_json({"jobs": _jobs_latest_last(jobs)}, stdout, compact=args.compact)
-        return 0
+        return _cmd_list(args, client, stdout)
     if args.command == "capacity":
         if args.hardware is not None:
             capacity = client.get_capacity(hardware=args.hardware)

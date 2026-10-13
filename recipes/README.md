@@ -8,9 +8,9 @@ under its `configs/` directory.
 
 | Recipe | Method | Dataset | Status |
 |---|---|---|---|
-| [Conversational SFT](sft/conversational/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets | Runnable |
-| [Math GRPO](rl/math_grpo/README.md) | Reinforcement learning | Hendrycks MATH and MATH-500 | Runnable |
-| [Inference endpoint](inference/README.md) | Serve, generate, eval | Open weights, checkpoints, MATH-500 | Runnable |
+| [Conversational SFT](sft/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets, GSM8K, identity | Runnable |
+| [Math GRPO](rl/README.md) | Reinforcement learning | Hendrycks MATH and MATH-500 | Runnable |
+| [Inference endpoint](inference/README.md) | Serve, generate, eval | Open weights, checkpoints, MATH-500, GSM8K, identity | Runnable |
 
 GRPO can also be run from [SkyRL](../docs/integrations/skyrl.md), which uses its
 own entry point and install rather than the prerequisites below.
@@ -49,14 +49,16 @@ To log the same metrics to Snowflake experiment tracking, pass
 Recipes are Python modules so they can share code without path manipulation:
 
 ```bash
-python -m recipes.sft.conversational.train config=/path/to/config.json
-python -m recipes.rl.math_grpo.train config=/path/to/config.json
-python -m recipes.inference.serve config=/path/to/config.json
+python -m recipes.sft.conversational.train
+python -m recipes.rl.math_grpo.train
+python -m recipes.inference.serve
 ```
 
-`config=` is the Snowflake PAT/connection file. It is optional — if omitted,
-recipes fall back to environment variables or your default `connections.toml`
-profile. See each recipe README for hardware, expected metrics, common
+Recipes use the connection you set up once in
+[Authentication](../docs/getting-started/authentication.md). Connection problems? See the same page. To use a specific JSON file, add
+`config=/path/to/config.json`.
+
+See each recipe README for hardware, expected metrics, common
 variations, and the JSON job configs loaded from `configs/` (SFT and GRPO
 examples, plus inference configs for every catalog model).
 

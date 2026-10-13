@@ -465,3 +465,52 @@ def test_connect_matches_cli(case, monkeypatch):
     via_cli = _constructor_call(cli_cls)
 
     assert via_connect == via_cli
+
+
+class TestNothingConfiguredHint:
+    _DEFAULT_MISSING = (
+        "could not open the configured default Snowflake connection: "
+        "Default connection with name 'default' cannot be found, known ones are []"
+    )
+
+    def test_hint_added_when_default_profile_is_missing(self):
+        from cortex_training.snowflake_auth import SnowflakeProfileError
+
+        original = SnowflakeProfileError(self._DEFAULT_MISSING)
+        with patch(MOCK_TARGET) as mock_cls:
+            mock_cls.from_connection_name.side_effect = original
+            with pytest.raises(SnowflakeProfileError) as excinfo:
+                connect()
+        message = str(excinfo.value)
+        assert message.startswith(self._DEFAULT_MISSING)
+        assert "No Cortex Training connection is configured." in message
+        assert "cortex-training login --config config.json" in message
+        assert "docs/getting-started/authentication.md" in message
+        assert excinfo.value.__cause__ is original
+
+    def test_no_hint_for_a_missing_named_profile(self):
+        from cortex_training.snowflake_auth import SnowflakeProfileError
+
+        error = SnowflakeProfileError(
+            "could not open Snowflake connection 'typo': "
+            "Invalid connection_name 'typo', known ones are ['training']"
+        )
+        with patch(MOCK_TARGET) as mock_cls:
+            mock_cls.from_connection_name.side_effect = error
+            with pytest.raises(SnowflakeProfileError) as excinfo:
+                connect(connection_name="typo")
+        assert excinfo.value is error
+        assert "No Cortex Training connection is configured." not in str(excinfo.value)
+
+    def test_no_hint_for_other_default_profile_errors(self):
+        from cortex_training.snowflake_auth import SnowflakeProfileError
+
+        error = SnowflakeProfileError(
+            "could not open the configured default Snowflake connection: "
+            "394400 (08001): Programmatic access token is invalid."
+        )
+        with patch(MOCK_TARGET) as mock_cls:
+            mock_cls.from_connection_name.side_effect = error
+            with pytest.raises(SnowflakeProfileError) as excinfo:
+                connect()
+        assert excinfo.value is error

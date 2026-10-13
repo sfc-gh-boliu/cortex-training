@@ -83,12 +83,12 @@ The conversational SFT recipe fine-tunes Qwen3-8B on a one-example chat dataset
 
 ```bash
 python -m recipes.sft.conversational.train \
-  config=/path/to/your-config.json \
   max_steps=10
 ```
 
-If you used `connections.toml` with a default connection, the recipe picks it
-up automatically. If you used a JSON config, pass the path as `config=`.
+Recipes use the connection you set up once in
+[Authentication](authentication.md). Connection problems? See the same page. To use a specific JSON file, add
+`config=/path/to/config.json`.
 
 What happens during this run:
 
@@ -108,7 +108,6 @@ confirm the model learned the expected answer:
 
 ```bash
 python -m recipes.inference.generate \
-  config=/path/to/your-config.json \
   job_config=recipes/inference/configs/qwen3_8b_full.json \
   source_job_id=<training_job_id> \
   checkpoint_id=<checkpoint_id> \
@@ -134,11 +133,11 @@ cortex-training tui                   # terminal UI for browsing jobs and logs
 You have a working setup. From here:
 
 - **Try different training methods**: adjust the job config JSON to use
-  [LoRA](../../recipes/sft/conversational/README.md)
+  [LoRA](../../recipes/sft/README.md)
   (`job_config=configs/qwen3_8b_lora.json`), a different model, or different
   hyperparameters
 - **Try reinforcement learning**: run the
-  [Math GRPO recipe](../../recipes/rl/math_grpo/README.md)
+  [Math GRPO recipe](../../recipes/rl/README.md)
 - **Explore all recipes**: browse the [recipe catalog](../../recipes/README.md)
 - **Learn the CLI**: see the [CLI reference](../reference/cli.md) for all
   available commands

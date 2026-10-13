@@ -800,3 +800,60 @@ def test_saved_login_checked_earlier_in_the_run_is_not_checked_again(tmp_path, c
     assert json.loads(login_file.read_text()) == {"connection": "saved"}
     assert [call["connection_name"] for call in fake_client.profile_calls] == ["saved", "fresh"]
     assert "Your saved login is unchanged" in stderr
+
+
+# ---------------------------------------------------------------------------
+# Ctrl-C
+# ---------------------------------------------------------------------------
+
+
+class InterruptingInput(TTYInput):
+    """A terminal whose user presses Ctrl-C after ``answers`` lines."""
+
+    def __init__(self, text: str, answers: int) -> None:
+        super().__init__(text)
+        self._answers_left = answers
+
+    def readline(self, *args):
+        if self._answers_left == 0:
+            raise KeyboardInterrupt
+        self._answers_left -= 1
+        return super().readline(*args)
+
+
+def test_ctrl_c_at_a_prompt_exits_quietly(tmp_path, connections_file, fake_client):
+    rc, stdout, stderr = _run([], InterruptingInput("", answers=0))
+
+    assert rc == 130
+    assert "Login cancelled. Nothing was changed." in stderr
+    assert "Traceback" not in stderr
+    assert stdout == ""
+    assert not connections_file.exists()
+    assert not (tmp_path / "login.json").exists()
+
+
+def test_ctrl_c_during_the_check_reports_the_saved_profile(tmp_path, connections_file, fake_client, monkeypatch):
+    def interrupt():
+        raise KeyboardInterrupt
+
+    fake_client.on_capacity = interrupt
+    monkeypatch.setenv("CORTEX_TRAINING_PAT", PAT)
+
+    rc, _, stderr = _run(["--host", HOST, "--user", "ME"], io.StringIO())
+
+    assert rc == 130
+    assert f"saved profile [cortex-training] to {connections_file}" in stderr
+    assert "it was not set as your saved login" in stderr
+    assert not (tmp_path / "login.json").exists()
+
+
+def test_ctrl_c_during_reset_reports_the_removed_login(tmp_path, connections_file, fake_client):
+    _write_existing_profile(connections_file, "saved")
+    _remember(tmp_path, {"connection": "saved"})
+
+    # --reset removes the saved login, then asks whether to remove the profile.
+    rc, _, stderr = _run(["--reset"], InterruptingInput("", answers=0))
+
+    assert rc == 130
+    assert "Already done: removed the saved login." in stderr
+    assert "saved" in tomlkit.parse(connections_file.read_text())

@@ -757,6 +757,78 @@ def run_login(
     format_error: Callable[[BaseException], str],
     print_json: Callable[[Any, TextIO], None],
 ) -> int:
+    """Run login. On Ctrl-C, exit 130 and say what had already changed."""
+    before = _snapshot()
+    try:
+        return _run_login(
+            options,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            client_cls=client_cls,
+            format_error=format_error,
+            print_json=print_json,
+        )
+    except KeyboardInterrupt:
+        changes = _describe_changes(before, _snapshot())
+        if changes:
+            stderr.write("\nLogin cancelled. Already done: " + "; ".join(changes) + ".\n")
+        else:
+            stderr.write("\nLogin cancelled. Nothing was changed.\n")
+        return 130
+
+
+def _snapshot() -> tuple[str | None, dict[str, dict[str, Any]]]:
+    """The saved login and the connections.toml profiles, to report changes."""
+    state_path = login_state_path()
+    try:
+        state = state_path.read_text(encoding="utf-8") if state_path.exists() else None
+    except OSError:
+        state = None
+    try:
+        profiles = read_profiles(connections_file_path())
+    except ValueError:
+        profiles = {}
+    return state, profiles
+
+
+def _describe_changes(
+    before: tuple[str | None, dict[str, dict[str, Any]]],
+    after: tuple[str | None, dict[str, dict[str, Any]]],
+) -> list[str]:
+    (state_before, profiles_before), (state_after, profiles_after) = before, after
+    path = connections_file_path()
+    remembered = read_login_state_quietly() if state_after is not None else None
+    changes = []
+    for name in sorted(profiles_after.keys() - profiles_before.keys()):
+        changes.append(f"saved profile [{name}] to {path}")
+    for name in sorted(profiles_before.keys() & profiles_after.keys()):
+        if profiles_before[name] != profiles_after[name]:
+            changes.append(f"replaced profile [{name}] in {path}")
+    for name in sorted(profiles_before.keys() - profiles_after.keys()):
+        changes.append(f"removed profile [{name}] from {path}")
+    written = [
+        name
+        for name in profiles_after
+        if name not in profiles_before or profiles_before[name] != profiles_after[name]
+    ]
+    if any(remembered != ("connection", name) for name in written):
+        changes.append("it was not set as your saved login")
+    if state_before != state_after:
+        changes.append("removed the saved login" if state_after is None else "updated the saved login")
+    return changes
+
+
+def _run_login(
+    options: LoginOptions,
+    *,
+    stdin: TextIO,
+    stdout: TextIO,
+    stderr: TextIO,
+    client_cls: Any,
+    format_error: Callable[[BaseException], str],
+    print_json: Callable[[Any, TextIO], None],
+) -> int:
     interactive = bool(getattr(stdin, "isatty", lambda: False)()) and not options.pat_stdin
     prompter = _Prompter(stdin, stderr, interactive)
     discovery = discover()

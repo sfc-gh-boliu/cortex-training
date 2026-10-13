@@ -61,7 +61,8 @@ _AUTH_DOCS_URL = (
 _HOST_HELP = (
     "Your account host: ORG-ACCOUNT.snowflakecomputing.com, where ORG and ACCOUNT\n"
     "are the two parts of your Snowsight URL (app.snowflake.com/ORG/ACCOUNT).\n"
-    "You can also paste that Snowsight URL. More help:\n"
+    "You can also paste that Snowsight URL; older ones (app.snowflake.com/REGION/LOCATOR)\n"
+    "work too. More help:\n"
     f"  {_AUTH_DOCS_URL}#finding-your-account-and-host"
 )
 _USER_HELP = (
@@ -257,14 +258,24 @@ def validate_host(raw: str) -> str:
     """Return a bare account host, or raise ValueError with the fix."""
     host, _, path = normalize_host(raw.strip()).partition("/")
     if host.lower() == "app.snowflake.com":
-        # A pasted Snowsight URL: app.snowflake.com/ORG/ACCOUNT[/...]
-        parts = [part for part in path.split("/") if part]
+        # A pasted Snowsight URL, in either form:
+        #   app.snowflake.com/ORG/ACCOUNT     -> ORG-ACCOUNT.snowflakecomputing.com
+        #   app.snowflake.com/REGION/LOCATOR  -> LOCATOR.REGION.snowflakecomputing.com
+        # Organization names are only letters and digits, so a "-" or "." in the
+        # first part marks a region (us-west-2, us-east-2.aws, east-us-2.azure).
+        parts = [part for part in path.split("#", 1)[0].split("/") if part]
         if len(parts) < 2:
             raise ValueError(
-                "that Snowsight URL has no ORG/ACCOUNT part. Expected "
-                "app.snowflake.com/ORG/ACCOUNT or ORG-ACCOUNT.snowflakecomputing.com."
+                "that Snowsight URL is missing a part. Expected app.snowflake.com/ORG/ACCOUNT, "
+                "app.snowflake.com/REGION/LOCATOR, or a host such as "
+                "ORG-ACCOUNT.snowflakecomputing.com."
             )
-        host = f"{parts[0]}-{parts[1]}.snowflakecomputing.com"
+        first, second = parts[0], parts[1]
+        if "-" in first or "." in first:
+            host = f"{second}.{first}.snowflakecomputing.com"
+        else:
+            # Snowflake accepts an account name's underscores as hyphens in a host.
+            host = f"{first}-{second.replace('_', '-')}.snowflakecomputing.com"
     if not host or " " in host or "." not in host:
         raise ValueError(
             f"{raw!r} is not an account host. Expected ORG-ACCOUNT.snowflakecomputing.com."

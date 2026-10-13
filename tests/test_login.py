@@ -130,6 +130,21 @@ def _write_existing_profile(path: Path, name: str = "existing", **values) -> Non
 
 
 @pytest.mark.parametrize(
+    ("url", "host"),
+    [
+        ("https://app.snowflake.com/us-west-2/xy12345", "xy12345.us-west-2.snowflakecomputing.com"),
+        ("https://app.snowflake.com/us-east-2.aws/cd12345/#/homepage", "cd12345.us-east-2.aws.snowflakecomputing.com"),
+        ("app.snowflake.com/east-us-2.azure/ab12345", "ab12345.east-us-2.azure.snowflakecomputing.com"),
+        ("https://app.snowflake.com/acme/analytics/#/homepage", "acme-analytics.snowflakecomputing.com"),
+        ("https://app.snowflake.com/acme/marketing_test_account", "acme-marketing-test-account.snowflakecomputing.com"),
+    ],
+    ids=["region-only", "region-and-cloud", "azure-region", "org-account", "account-with-underscores"],
+)
+def test_validate_host_converts_snowsight_urls(url, host):
+    assert _login.validate_host(url) == host
+
+
+@pytest.mark.parametrize(
     "raw",
     [
         HOST,
@@ -147,7 +162,8 @@ def test_validate_host_accepts_and_normalizes(raw):
     ("raw", "message"),
     [
         ("ORG_ACCOUNT.snowflakecomputing.com", "Use 'ORG-ACCOUNT.snowflakecomputing.com'"),
-        ("https://app.snowflake.com/", "no ORG/ACCOUNT part"),
+        ("https://app.snowflake.com/", "missing a part"),
+        ("https://app.snowflake.com/us-west-2/", "missing a part"),
         ("app.snowflake.com/org_name/acct", "Use 'org-name-acct.snowflakecomputing.com'"),
         ("ORG-ACCOUNT", "not an account host"),
         ("", "not an account host"),

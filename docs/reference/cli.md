@@ -286,9 +286,12 @@ cortex-training login
    profile name (default `cortex-training`). Values found in other profiles or
    environment variables are offered as defaults. The host and PAT prompts link
    to [Authentication](../getting-started/authentication.md), which shows where
-   to find each value, with screenshots. A pasted Snowsight URL
-   (`app.snowflake.com/ORG/ACCOUNT`) is converted to the host, and hosts with
-   underscores are rejected.
+   to find each value, with screenshots. A pasted Snowsight URL is converted to
+   the host: `app.snowflake.com/ORG/ACCOUNT` becomes
+   `ORG-ACCOUNT.snowflakecomputing.com`, and the older
+   `app.snowflake.com/REGION/LOCATOR` becomes
+   `LOCATOR.REGION.snowflakecomputing.com`. A typed host with underscores is
+   rejected with the hyphenated form to use instead.
 3. It writes the profile to the Snowflake Connector's `connections.toml`
    (`~/.snowflake/connections.toml`, or `$SNOWFLAKE_HOME/connections.toml`),
    keeps every other profile and comment, and sets the file to mode `600`. It

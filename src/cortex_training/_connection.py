@@ -60,12 +60,12 @@ _PROFILE_NOT_FOUND = "cannot be found, known ones are"
 # Absolute link: pip installs do not include the repository's docs.
 _NO_CONNECTION_HINT = (
     "No Cortex Training connection is configured. The easiest way to set one up\n"
-    "(once per machine) is to put your host, PAT, and database in a JSON file and\n"
-    "register it:\n"
+    "(once per machine):\n"
     "\n"
-    "    cortex-training login --config config.json\n"
+    "    cortex-training login\n"
     "\n"
-    "For other options (connections.toml profiles, environment variables), see:\n"
+    "For other options (connections.toml profiles, JSON configs, environment\n"
+    "variables), see:\n"
     "https://github.com/snowflakedb/cortex-training/blob/main/docs/getting-started/authentication.md"
 )
 

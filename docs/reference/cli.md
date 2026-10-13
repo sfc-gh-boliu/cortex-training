@@ -293,14 +293,17 @@ cortex-training login
    (`~/.snowflake/connections.toml`, or `$SNOWFLAKE_HOME/connections.toml`),
    keeps every other profile and comment, and sets the file to mode `600`. It
    asks before replacing a profile with the same name.
-4. It remembers the profile, so later commands, recipes, and `connect()` use it
-   when no other connection is given. If an environment variable such as
-   `CORTEX_TRAINING_CONNECTION` would still take precedence, login says so.
-5. It runs a capacity request through the new profile. If the database does not
+4. It runs a capacity request through the new profile. If the database does not
    exist yet, the client creates it with
    `CREATE DATABASE IF NOT EXISTS CORTEX_TRAINING_DB`, and login prints that
-   statement and its result. If the check fails, the profile is kept, the error
-   and next steps are printed, and login exits with status `1`.
+   statement and its result.
+5. If the check passes, it remembers the profile, so later commands, recipes,
+   and `connect()` use it when no other connection is given. If an environment
+   variable such as `CORTEX_TRAINING_CONNECTION` would still take precedence,
+   login says so. If the check fails, the profile stays in `connections.toml` so
+   you can fix it, but it is not remembered: a working saved login stays in use,
+   a saved login that no longer works is removed, and login exits with status
+   `1`.
 
 Prompts and progress go to stderr; stdout gets one JSON summary.
 

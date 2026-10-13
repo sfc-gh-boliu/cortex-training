@@ -24,6 +24,7 @@ call. Prompts and progress go to stderr; the final summary is JSON on stdout.
 from __future__ import annotations
 
 import getpass
+import io
 import logging
 import os
 import re
@@ -512,6 +513,16 @@ class _Prompter:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _LoginRun:
+    """What this run of login has learned about the existing setup."""
+
+    # Profiles that failed their check, so their values are not offered as defaults.
+    distrusted: set[str] = field(default_factory=set)
+    # True once the saved login passed its check during this run.
+    saved_login_works: bool = False
+
+
 def _prefill(discovery: Discovery, distrusted: set[str]) -> dict[str, str | None]:
     """Defaults for the prompts, never taken from a profile that just failed."""
     profile = None
@@ -605,12 +616,12 @@ def _check_existing_setup(
     client_cls: Any,
     format_error: Callable[[BaseException], str],
     print_json: Callable[[Any, TextIO], None],
-    distrusted: set[str],
+    run: _LoginRun,
 ) -> int | None:
     """Report and verify the setup in use; return an exit code, or None to set up.
 
-    A profile that fails its check is added to ``distrusted`` so its values are
-    not offered again as prompt defaults.
+    A profile that fails its check is added to ``run.distrusted`` so its values
+    are not offered again as prompt defaults.
 
     A remembered login is always verified before it is trusted. If it is stale
     or fails the check, it is removed; login then uses whatever else is
@@ -648,7 +659,7 @@ def _check_existing_setup(
         verify(discovery.active, client_cls, stderr)
     except Exception as exc:
         if discovery.active.use_connection_profile:
-            distrusted.add(discovery.active.connection_name or discovery.default_profile_name)
+            run.distrusted.add(discovery.active.connection_name or discovery.default_profile_name)
         if remembered:
             _forget_login(f"the connection check failed.\n{format_error(exc)}", stderr)
             return _start_setup(interactive, stderr)
@@ -659,6 +670,7 @@ def _check_existing_setup(
             return None
         return 1
 
+    run.saved_login_works = remembered
     stderr.write("Connected. You're all set; nothing was changed.\n")
     if prompter.confirm("Create a new connections.toml profile anyway?", default=False):
         return None
@@ -737,10 +749,10 @@ def run_login(
     interactive = bool(getattr(stdin, "isatty", lambda: False)()) and not options.pat_stdin
     prompter = _Prompter(stdin, stderr, interactive)
     discovery = discover()
-    distrusted: set[str] = set()
+    run = _LoginRun()
 
     if options.reset:
-        distrusted |= _reset(discovery, prompter, options, stderr)
+        run.distrusted |= _reset(discovery, prompter, options, stderr)
         discovery = discover()
         if not options.creates_profile and not interactive:
             stderr.write("Run 'cortex-training login' to set up a connection again.\n")
@@ -755,14 +767,14 @@ def run_login(
             client_cls=client_cls,
             format_error=format_error,
             print_json=print_json,
-            distrusted=distrusted,
+            run=run,
         )
         if outcome is not None:
             return outcome
         # A saved login may have just been removed; look again for defaults.
         discovery = discover()
 
-    defaults = _prefill(discovery, distrusted)
+    defaults = _prefill(discovery, run.distrusted)
     stderr.write("\nSet up a connections.toml profile for Cortex Training.\n")
     host = options.host and validate_host(options.host)
     host = host or prompter.ask(
@@ -795,16 +807,6 @@ def run_login(
 
     write_profile(path, name, host=host, user=user, pat=pat, database=database, schema=schema)
     stderr.write(f"\nSaved profile [{name}] to {path} (permissions 600).\n")
-    previous = read_login_state_quietly()
-    write_login_state(connection=name)
-    if previous is not None and previous != ("connection", name):
-        stderr.write(
-            f"Remembered [{name}] for later commands, replacing the remembered "
-            f"{previous[0]} {previous[1]}.\n"
-        )
-    else:
-        stderr.write(f"Remembered [{name}] for later commands.\n")
-    _warn_if_overridden(name, stderr)
 
     summary: dict[str, Any] = {
         "logged_in": True,
@@ -820,22 +822,114 @@ def run_login(
     try:
         verify(resolve_connection(connection_name=name), client_cls, stderr)
     except Exception as exc:
+        # Never remember a profile that doesn't work, and never keep a saved
+        # login that doesn't work either.
         _report_failure(exc, stderr, format_error)
-        stderr.write(
-            f"\nThe profile was kept. Fix the issue above, then run "
-            f"'cortex-training --connection {name} capacity' or 'cortex-training login' again.\n"
+        previous, label, reason = _settle_previous_login(name, run, client_cls, format_error)
+        stderr.write(_failed_profile_message(name, path, previous, label, reason))
+        print_json(
+            {**summary, "verified": False, "remembered": False, "previous_login": previous},
+            stdout,
         )
-        print_json({**summary, "verified": False}, stdout)
         return 1
 
+    stderr.write("Connected.\n")
+    earlier = read_login_state_quietly()
+    write_login_state(connection=name)
+    if earlier is not None and earlier != ("connection", name):
+        stderr.write(
+            f"Remembered [{name}] for later commands, replacing the remembered "
+            f"{earlier[0]} {earlier[1]}.\n"
+        )
+    else:
+        stderr.write(f"Remembered [{name}] for later commands.\n")
+    _warn_if_overridden(name, stderr)
     stderr.write(
-        "Connected.\n\nNext steps:\n"
+        "\nNext steps:\n"
         "  cortex-training capacity\n"
         "  cortex-training list\n"
         "Recipes and connect() use the same connection.\n"
     )
-    print_json({**summary, "verified": True}, stdout)
+    print_json({**summary, "verified": True, "remembered": True}, stdout)
     return 0
+
+
+def _settle_previous_login(
+    new_name: str,
+    run: _LoginRun,
+    client_cls: Any,
+    format_error: Callable[[BaseException], str],
+) -> tuple[str, str | None, str | None]:
+    """Keep the saved login if it works; remove it if it doesn't.
+
+    Returns ``(outcome, label, reason)``, where ``outcome`` is ``"kept"``,
+    ``"removed"``, or ``"none"``.
+    """
+    try:
+        state = read_login_state()
+    except ValueError as exc:
+        clear_login_state()
+        return "removed", "the saved login", str(exc)
+    if state is None:
+        return "none", None, None
+
+    kind, value = state
+    label = f"profile [{value}]" if kind == "connection" else f"config file {value}"
+    if kind == "connection" and value == new_name:
+        # The saved login named the profile that was just replaced and failed.
+        clear_login_state()
+        return "removed", label, "it now points to the profile that just failed"
+    if run.saved_login_works:
+        return "kept", label, None
+
+    if kind == "connection" and value not in read_profiles(connections_file_path()):
+        reason = "the profile no longer exists"
+    elif kind == "config" and not Path(value).expanduser().is_file():
+        reason = "the config file no longer exists"
+    else:
+        try:
+            if kind == "connection":
+                settings = resolve_connection(connection_name=value)
+            else:
+                settings = resolve_connection(config_path=value)
+            verify(settings, client_cls, io.StringIO())
+            return "kept", label, None
+        except Exception as exc:
+            reason = format_error(exc).splitlines()[0][:160]
+    clear_login_state()
+    return "removed", label, reason
+
+
+def _failed_profile_message(
+    name: str,
+    path: Path,
+    previous: str,
+    label: str | None,
+    reason: str | None,
+) -> str:
+    lines = [
+        f"\nThe new profile [{name}] doesn't work yet, so it was not set as your saved login.",
+        f"  - It is saved in {path}. Fix it there, or run",
+        f"    'cortex-training login --connection {name} --force' to enter it again.",
+        f"  - After fixing it, check it with: cortex-training --connection {name} capacity",
+    ]
+    if previous == "kept":
+        lines += [
+            "  - Your saved login is unchanged: commands without --connection still use",
+            f"    {label}.",
+        ]
+    elif previous == "removed":
+        lines += [
+            f"  - Your earlier saved login ({label}) doesn't work either ({reason}),",
+            "    so it was removed.",
+            "  - To set one up from scratch, run 'cortex-training login --reset'.",
+        ]
+    else:
+        lines += [
+            f"  - No saved login was set, so commands without --connection won't use [{name}]",
+            "    until it works and you run 'cortex-training login' again.",
+        ]
+    return "\n".join(lines) + "\n"
 
 
 def _warn_if_overridden(name: str, stderr: TextIO) -> None:

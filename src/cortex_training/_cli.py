@@ -48,10 +48,11 @@ What it does:
      is checked first and removed if it no longer works.
   2. If nothing works, prompts for host, user, PAT (hidden), database, schema,
      and profile name. Found values are offered as defaults.
-  3. Writes the profile to connections.toml (other profiles kept, mode 600)
-     and remembers it for later commands.
+  3. Writes the profile to connections.toml (other profiles kept, mode 600).
   4. Checks it with a capacity request. A missing database is created with
-     CREATE DATABASE IF NOT EXISTS <database>.
+     CREATE DATABASE IF NOT EXISTS <database>. Only a profile that passes is
+     remembered for later commands; a saved login that no longer works is
+     removed.
   Nothing is changed if your current setup works, unless you ask for a new
   profile.
 

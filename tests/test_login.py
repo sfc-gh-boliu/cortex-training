@@ -40,8 +40,9 @@ class TTYInput(io.StringIO):
 
 
 class FakeLiveClient:
-    def __init__(self, owner: "FakeClientClass") -> None:
+    def __init__(self, owner: "FakeClientClass", profile: str | None = None) -> None:
         self._owner = owner
+        self._profile = profile
         self.closed = False
 
     def get_capacity(self, hardware=None):
@@ -49,6 +50,8 @@ class FakeLiveClient:
             self._owner.on_capacity()
         if self._owner.capacity_error is not None:
             raise self._owner.capacity_error
+        if self._profile in self._owner.failing_profiles:
+            raise RuntimeError(f"Programmatic access token is invalid for [{self._profile}]")
         return {"gpus": 8}
 
     def close(self) -> None:
@@ -59,12 +62,13 @@ class FakeClientClass:
     def __init__(self, capacity_error=None, on_capacity=None) -> None:
         self.capacity_error = capacity_error
         self.on_capacity = on_capacity
+        self.failing_profiles: set[str] = set()
         self.profile_calls: list[dict] = []
         self.pat_calls: list[dict] = []
 
     def from_connection_name(self, **kwargs):
         self.profile_calls.append(kwargs)
-        return FakeLiveClient(self)
+        return FakeLiveClient(self, kwargs.get("connection_name"))
 
     def from_pat(self, **kwargs):
         self.pat_calls.append(kwargs)
@@ -355,8 +359,11 @@ def test_failed_check_keeps_profile_and_explains(connections_file, fake_client):
     assert rc == 1
     assert "cortex-training" in tomlkit.parse(connections_file.read_text())
     assert "Programmatic access token is invalid" in stderr
-    assert "The profile was kept." in stderr
-    assert json.loads(stdout)["verified"] is False
+    assert "doesn't work yet, so it was not set as your saved login" in stderr
+    assert "No saved login was set" in stderr
+    assert not (connections_file.parent.parent / "login.json").exists()
+    summary = json.loads(stdout)
+    assert (summary["verified"], summary["remembered"], summary["previous_login"]) == (False, False, "none")
 
 
 def test_database_creation_is_explained(connections_file, fake_client):
@@ -684,3 +691,96 @@ def test_login_help_explains_what_it_changes(capsys):
     ):
         assert expected in help_text
     assert "LOGIN_HOST" not in help_text
+
+
+# ---------------------------------------------------------------------------
+# A failed login never replaces or keeps a saved login that doesn't work
+# ---------------------------------------------------------------------------
+
+
+def _scripted_second_profile(monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_PAT", "typo")
+    return _run(["--host", HOST, "--user", "ME", "--connection", "second"], io.StringIO())
+
+
+def test_working_new_profile_replaces_saved_login(tmp_path, connections_file, fake_client, monkeypatch):
+    _write_existing_profile(connections_file, "old")
+    login_file = _remember(tmp_path, {"connection": "old"})
+    monkeypatch.setenv("CORTEX_TRAINING_PAT", PAT)
+
+    rc, stdout, stderr = _run(["--host", HOST, "--user", "ME", "--connection", "second"], io.StringIO())
+
+    assert rc == 0, stderr
+    assert json.loads(login_file.read_text()) == {"connection": "second"}
+    assert "replacing the remembered connection old" in stderr
+    assert json.loads(stdout)["remembered"] is True
+
+
+def test_failed_new_profile_keeps_working_saved_login(tmp_path, connections_file, fake_client, monkeypatch):
+    """Karthik's repro: one mistyped PAT must not break a working setup."""
+    _write_existing_profile(connections_file, "cortex-training")
+    login_file = _remember(tmp_path, {"connection": "cortex-training"})
+    fake_client.failing_profiles = {"second"}
+
+    rc, stdout, stderr = _scripted_second_profile(monkeypatch)
+
+    assert rc == 1
+    assert json.loads(login_file.read_text()) == {"connection": "cortex-training"}
+    assert "second" in tomlkit.parse(connections_file.read_text())
+    assert "Your saved login is unchanged" in stderr
+    assert "profile [cortex-training]" in stderr
+    assert json.loads(stdout)["previous_login"] == "kept"
+
+
+def test_failed_new_profile_removes_broken_saved_login(tmp_path, connections_file, fake_client, monkeypatch):
+    _write_existing_profile(connections_file, "old")
+    login_file = _remember(tmp_path, {"connection": "old"})
+    fake_client.failing_profiles = {"second", "old"}
+
+    rc, stdout, stderr = _scripted_second_profile(monkeypatch)
+
+    assert rc == 1
+    assert not login_file.exists()
+    assert "Your earlier saved login (profile [old]) doesn't work either" in stderr
+    assert "cortex-training login --reset" in stderr
+    assert "old" in tomlkit.parse(connections_file.read_text())  # profiles are never deleted here
+    assert json.loads(stdout)["previous_login"] == "removed"
+
+
+def test_failed_new_profile_removes_saved_login_to_missing_profile(tmp_path, connections_file, fake_client, monkeypatch):
+    login_file = _remember(tmp_path, {"connection": "gone"})
+    fake_client.failing_profiles = {"second"}
+
+    rc, _, stderr = _scripted_second_profile(monkeypatch)
+
+    assert rc == 1
+    assert not login_file.exists()
+    assert "the profile no longer exists" in stderr
+
+
+def test_failed_new_profile_removes_saved_login_to_same_profile(tmp_path, connections_file, fake_client, monkeypatch):
+    _write_existing_profile(connections_file, "second")
+    login_file = _remember(tmp_path, {"connection": "second"})
+    fake_client.failing_profiles = {"second"}
+    monkeypatch.setenv("CORTEX_TRAINING_PAT", "typo")
+
+    rc, _, stderr = _run(["--host", HOST, "--user", "ME", "--connection", "second", "--force"], io.StringIO())
+
+    assert rc == 1
+    assert not login_file.exists()
+    assert "it now points to the profile that just failed" in stderr
+
+
+def test_saved_login_checked_earlier_in_the_run_is_not_checked_again(tmp_path, connections_file, fake_client):
+    _write_existing_profile(connections_file, "saved")
+    login_file = _remember(tmp_path, {"connection": "saved"})
+    fake_client.failing_profiles = {"fresh"}
+    # The saved login passes; create another anyway: yes; then the prompts.
+    stdin = TTYInput(f"y\n{HOST}\nME\n{PAT}\n\n\nfresh\n")
+
+    rc, _, stderr = _run([], stdin)
+
+    assert rc == 1
+    assert json.loads(login_file.read_text()) == {"connection": "saved"}
+    assert [call["connection_name"] for call in fake_client.profile_calls] == ["saved", "fresh"]
+    assert "Your saved login is unchanged" in stderr

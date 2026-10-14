@@ -10,5 +10,6 @@ These JSON files demonstrate individual Cortex Training request bodies:
 | `external-weights-training.json` | Create a training sub-job initialized from a Hugging Face model directory uploaded to a stage |
 | `fwd-bwd.json` | Submit a readable forward/backward batch |
 | `generate.json` | Submit prompts for generation |
+| `model-deployment-checkpoint.json` | Create an evaluation model deployment from a weights-only checkpoint (`cortex-training model-deployment create --spec`; not a CreateJob body) |
 
 They are wire-format examples, not end-to-end training recipes.

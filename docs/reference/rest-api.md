@@ -2229,7 +2229,7 @@ paths or object-store credentials.
 
 ### 12.3 Persisted stdout download
 
-`download_stdout_logs(job_id, output_dir, *, resume=False)` downloads gzip chunks
+`download_stdout_logs(job_id, output_dir, *, resume=False, progress=None)` downloads gzip chunks
 under `_stdout/{sub_job_id}/`, orders them by artifact name, and streams them
 into `<output_dir>/<sub_job_id>/stdout.log`. A large download may open
 additional Snowflake sessions to fetch one sub-job's chunks, and each of
@@ -2244,13 +2244,16 @@ list and the file is at least that many bytes. A longer file is truncated back
 to the committed length. A missing or shorter file is rebuilt, as is a chunk
 list that is no longer a prefix of the sorted paths.
 Two downloads of the same output directory at once are unsupported.
+The method stays silent unless `progress` is passed. On a terminal, the CLI
+draws one updating line on stderr; a redirected stderr gets one final line per
+sub-job.
 
 ### 12.4 GPU metrics download
 
-`download_metrics(job_id, output_dir, *, resume=False)` applies the same
+`download_metrics(job_id, output_dir, *, resume=False, progress=None)` applies the same
 reconstruction to `gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under
 `_metrics/{sub_job_id}/` and writes `<output_dir>/<sub_job_id>/gpu.jsonl`,
-including `resume` and the manifest beside that file.
+including `resume`, `progress`, and the manifest beside that file.
 
 The reconstructed file contains the JSONL records emitted by the deployed
 training runtime. Version 2 GPU rows have no `kind` field and include:

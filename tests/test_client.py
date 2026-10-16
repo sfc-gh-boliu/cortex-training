@@ -29,19 +29,30 @@ Two suites:
 from __future__ import annotations
 
 import base64
+import contextlib
 import gzip
 import importlib
 import json
+import logging
+import os
 import sys
+import threading
+import time
+from datetime import date
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from pathlib import Path
 from pathlib import PurePosixPath
 from types import SimpleNamespace
 from urllib.parse import unquote
 from urllib.parse import urlparse
 from unittest.mock import MagicMock
+from unittest.mock import patch
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 # Import the module directly so we don't pull src/cortex_training/__init__.py
 # (which imports torch via wire.py).
@@ -64,6 +75,17 @@ InferenceConfig = nc.InferenceConfig
 SubJobConfig = nc.SubJobConfig
 CortexTrainingClient = nc.CortexTrainingClient
 Hardware = nc.Hardware
+
+# Spellings a caller could plausibly pass for the unsupported log-probability
+# type: the enum, loose casing, the fully-qualified enum name, the short alias,
+# and surrounding whitespace.
+LOG_PROBABILITY_JOB_TYPES = [
+    JobType.LOG_PROBABILITY,
+    "LOG_PROBABILITY",
+    "JOB_TYPE_LOG_PROBABILITY",
+    "log_prob",
+    " log_probability ",
+]
 
 
 def _wire_load(data: bytes):
@@ -139,70 +161,55 @@ class TestTrainingConfig:
         _ok_training().validate()
 
     def test_validate_rejects_zero_max_seq_len(self):
-        tc = _ok_training()
-        tc.max_seq_len = 0
-        with pytest.raises(ValueError, match="max_seq_len"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="max_seq_len"):
+            TrainingConfig(optimizer={"type": "adamw"}, max_seq_len=0, train_batch_size=1, n_gpus=2)
 
     def test_validate_rejects_zero_train_batch_size(self):
-        tc = _ok_training()
-        tc.train_batch_size = 0
-        with pytest.raises(ValueError, match="train_batch_size"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="train_batch_size"):
+            TrainingConfig(optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=0, n_gpus=2)
 
     def test_validate_rejects_empty_optimizer(self):
-        tc = _ok_training()
-        tc.optimizer = {}
-        with pytest.raises(ValueError, match="optimizer"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="optimizer"):
+            TrainingConfig(optimizer={}, max_seq_len=128, train_batch_size=1, n_gpus=2)
 
     def test_validate_accepts_nested_primerl_fused_ce_false(self):
-        tc = _ok_training()
-        tc.extra = {
-            "fp32_lm_head": True,
-            "fused_lm_head_token_chunk_size": 8192,
-            "prime_rl": {
-                "fused_cross_entropy": False,
-                "fp32_lm_head": True,
-                "fused_lm_head_token_chunk_size": 8192,
-            },
-        }
-        tc.validate()
+        TrainingConfig(
+            optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+            fp32_lm_head=True, fused_lm_head_token_chunk_size=8192,
+            prime_rl={"fused_cross_entropy": False, "fp32_lm_head": True, "fused_lm_head_token_chunk_size": 8192},
+        )
 
     def test_validate_nested_primerl_overrides_top_level_fused_ce(self):
-        tc = _ok_training()
-        tc.extra = {
-            "fused_cross_entropy": "liger",
-            "fp32_lm_head": True,
-            "prime_rl": {
-                "fused_cross_entropy": False,
-                "fp32_lm_head": True,
-            },
-        }
-        tc.validate()
+        TrainingConfig(
+            optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+            fused_cross_entropy="liger", fp32_lm_head=True,
+            prime_rl={"fused_cross_entropy": False, "fp32_lm_head": True},
+        )
 
     def test_validate_rejects_default_fused_ce_with_chunked_lm_head(self):
-        tc = _ok_training()
-        tc.extra = {"fused_lm_head_token_chunk_size": 8192}
-        with pytest.raises(ValueError, match="cannot combine fused_cross_entropy"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="cannot combine fused_cross_entropy"):
+            TrainingConfig(
+                optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+                fused_lm_head_token_chunk_size=8192,
+            )
 
     def test_validate_rejects_nested_primerl_fused_ce_with_fp32_lm_head(self):
+        with pytest.raises(ValidationError, match="cannot combine fused_cross_entropy"):
+            TrainingConfig(
+                optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+                fused_cross_entropy=False,
+                prime_rl={"fused_cross_entropy": "liger", "fp32_lm_head": True},
+            )
+
+    def test_validate_rejects_mutation(self):
         tc = _ok_training()
-        tc.extra = {
-            "fused_cross_entropy": False,
-            "prime_rl": {
-                "fused_cross_entropy": "liger",
-                "fp32_lm_head": True,
-            },
-        }
-        with pytest.raises(ValueError, match="cannot combine fused_cross_entropy"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="n_gpus"):
+            tc.n_gpus = 0
 
     def test_to_wire_required_fields(self):
         wire = _ok_training().to_wire()
         assert wire == {
-            "optimizer": {"type": "adamw", "lr": 1e-5},
+            "optimizer": {"name": "adamw", "lr": 1e-5},
             "max_seq_len": 128,
             "train_batch_size": 1,
             "n_gpus": 2,
@@ -220,14 +227,11 @@ class TestTrainingConfig:
         assert _ok_training().to_wire()["n_gpus"] == 2
 
     def test_validate_rejects_zero_n_gpus(self):
-        tc = _ok_training()
-        tc.n_gpus = 0
-        with pytest.raises(ValueError, match="n_gpus"):
-            tc.validate()
+        with pytest.raises(ValidationError, match="n_gpus"):
+            TrainingConfig(optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=1, n_gpus=0)
 
     def test_to_wire_includes_multiplex_job_id_when_set(self):
-        tc = _ok_training()
-        tc.multiplex_job_id = "train-1"
+        tc = TrainingConfig(optimizer={"type": "adamw", "lr": 1e-5}, max_seq_len=128, train_batch_size=1, n_gpus=2, multiplex_job_id="train-1")
         assert tc.to_wire()["multiplex_job_id"] == "train-1"
 
     def test_to_wire_omits_multiplex_job_id_when_none(self):
@@ -247,20 +251,125 @@ class TestTrainingConfig:
         assert tc.to_wire()["load_optimizer_states"] is True
 
     def test_to_wire_merges_extra_passthrough(self):
-        tc = _ok_training()
-        tc.extra = {"fp16": {"enabled": True}, "zero_stage": 2}
+        tc = TrainingConfig(
+            optimizer={"type": "adamw", "lr": 1e-5}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+            extra={"fp16": {"enabled": True}, "zero_stage": 2},
+        )
         wire = tc.to_wire()
         assert wire["fp16"] == {"enabled": True}
         assert wire["zero_stage"] == 2
 
     def test_to_wire_extra_does_not_override_required(self):
-        # If a caller stuffs a required field name into `extra`, the typed
-        # required value wins. Mirrors setdefault semantics.
-        tc = _ok_training()
-        tc.extra = {"max_seq_len": 999, "optimizer": {"type": "sgd"}}
+        tc = TrainingConfig(
+            optimizer={"type": "adamw", "lr": 1e-5}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+            extra={"max_seq_len": 999, "optimizer": {"type": "sgd"}},
+        )
         wire = tc.to_wire()
         assert wire["max_seq_len"] == 128
-        assert wire["optimizer"] == {"type": "adamw", "lr": 1e-5}
+        assert wire["optimizer"] == {"name": "adamw", "lr": 1e-5}
+
+
+# ─── TrainingConfig — optimizer canonicalization ────────────────────────
+
+
+class TestTrainingConfigOptimizer:
+    def test_aliases_are_canonicalized_on_construction(self):
+        tc = TrainingConfig(
+            optimizer={"type": "adamw", "beta1": 0.9, "beta2": 0.95},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+        )
+        assert tc.optimizer == {"name": "adamw", "betas": [0.9, 0.95]}
+        assert tc.to_wire()["optimizer"] == {"name": "adamw", "betas": [0.9, 0.95]}
+
+    def test_nested_gradient_clipping_is_hoisted(self):
+        tc = TrainingConfig(
+            optimizer={"lr": 1e-5, "gradient_clipping": 0.5},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+        )
+        assert tc.optimizer == {"lr": 1e-5}
+        assert tc.gradient_clipping == 0.5
+        assert tc.to_wire()["gradient_clipping"] == 0.5
+
+    def test_typed_gradient_clipping_wins_over_the_nested_value(self):
+        tc = TrainingConfig(
+            optimizer={"lr": 1e-5, "gradient_clipping": 0.5},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+            gradient_clipping=2.0,
+        )
+        assert tc.gradient_clipping == 2.0
+        assert "gradient_clipping" not in tc.optimizer
+
+    def test_clip_only_optimizer_empties_the_block_and_revalidates(self):
+        tc = TrainingConfig(
+            optimizer={"gradient_clipping": 1.0},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+        )
+        assert tc.optimizer == {}
+        assert tc.gradient_clipping == 1.0
+        # The canonical model must survive a second pass; validate() and
+        # create_job both re-run model_validate.
+        tc.validate()
+        assert tc.to_wire()["optimizer"] == {}
+
+    def test_empty_optimizer_with_gradient_clipping_is_accepted(self):
+        tc = TrainingConfig(
+            optimizer={},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+            gradient_clipping=1.0,
+        )
+        assert tc.to_wire()["optimizer"] == {}
+        assert tc.to_wire()["gradient_clipping"] == 1.0
+
+    def test_unknown_optimizer_key_is_rejected(self):
+        with pytest.raises(ValidationError, match=r"training\.optimizer contains unsupported field"):
+            TrainingConfig(
+                optimizer={"lr": 1e-5, "momentum": 0.9},
+                max_seq_len=128,
+                train_batch_size=1,
+                n_gpus=2,
+            )
+
+    def test_scheduler_optimizer_key_is_rejected(self):
+        with pytest.raises(ValidationError, match="unsupported scheduler field"):
+            TrainingConfig(
+                optimizer={"lr": 1e-5, "warmup_steps": 10},
+                max_seq_len=128,
+                train_batch_size=1,
+                n_gpus=2,
+            )
+
+    def test_peft_config_in_extra_is_normalized(self):
+        tc = TrainingConfig(
+            optimizer={"lr": 1e-5},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+            peft_config={"peft_type": "Lora", "r": 16, "target_modules": ["q_proj"]},
+        )
+        peft = tc.to_wire()["peft_config"]
+        assert peft["task_type"] == "CAUSAL_LM"
+        assert peft["lora_alpha"] == 8
+        assert peft["target_parameters"] == []
+
+    def test_invalid_peft_config_in_extra_is_rejected(self):
+        with pytest.raises(ValidationError, match=r"training\.extra\.peft_config\.peft_type"):
+            TrainingConfig(
+                optimizer={"lr": 1e-5},
+                max_seq_len=128,
+                train_batch_size=1,
+                n_gpus=2,
+                peft_config={"peft_type": "LORA", "target_modules": ["q_proj"]},
+            )
 
 
 # ─── InferenceConfig ────────────────────────────────────────────────────
@@ -271,12 +380,12 @@ class TestInferenceConfig:
         _ok_inference().validate()
 
     def test_validate_rejects_zero(self):
-        with pytest.raises(ValueError, match="max_seq_len"):
-            InferenceConfig(max_seq_len=0, n_gpus=1).validate()
+        with pytest.raises(ValidationError, match="max_seq_len"):
+            InferenceConfig(max_seq_len=0, n_gpus=1)
 
     def test_validate_rejects_zero_n_gpus(self):
-        with pytest.raises(ValueError, match="n_gpus"):
-            InferenceConfig(max_seq_len=2048, n_gpus=0).validate()
+        with pytest.raises(ValidationError, match="n_gpus"):
+            InferenceConfig(max_seq_len=2048, n_gpus=0)
 
     def test_to_wire_includes_extra(self):
         ic = InferenceConfig(max_seq_len=4096, n_gpus=1, extra={"gpu_memory_utilization": 0.9})
@@ -296,6 +405,27 @@ class TestInferenceConfig:
         ic = InferenceConfig(max_seq_len=4096, n_gpus=1, extra={"max_seq_len": 1})
         assert ic.to_wire()["max_seq_len"] == 4096
 
+    def test_peft_config_in_extra_is_normalized(self):
+        sub = SubJobConfig.sampling_job(
+            model_name="gpt2",
+            max_seq_len=4096,
+            n_gpus=1,
+            extra_sampling={
+                "peft_config": {"peft_type": "Lora", "r": 16, "target_modules": ["q_proj"]}
+            },
+        )
+        peft = sub.to_wire()["inference_config"]["peft_config"]
+        assert peft["task_type"] == "CAUSAL_LM"
+        assert peft["target_parameters"] == []
+
+    def test_invalid_peft_config_in_extra_is_rejected(self):
+        with pytest.raises(ValidationError, match=r"sampling\.extra\.peft_config\.peft_type"):
+            InferenceConfig(
+                max_seq_len=4096,
+                n_gpus=1,
+                peft_config={"peft_type": "LORA", "target_modules": ["q_proj"]},
+            )
+
 
 # ─── SubJobConfig — factories ───────────────────────────────────────────
 
@@ -313,7 +443,7 @@ class TestSubJobConfigFactories:
         assert sub.model_name == "gpt2"
         assert isinstance(sub.training, TrainingConfig)
         assert sub.sampling is None
-        assert sub.training.extra == {}
+        assert sub.training.model_extra == {}
 
     def test_training_job_factory_full(self):
         sub = SubJobConfig.training_job(
@@ -337,11 +467,11 @@ class TestSubJobConfigFactories:
         assert sub.training.multiplex_job_id == "train-1"
         assert sub.training.load_optimizer_states is False
         assert sub.training.to_wire()["load_optimizer_states"] is False
-        assert sub.training.extra == {"fp16": {"enabled": True}}
+        assert sub.training.model_extra == {"fp16": {"enabled": True}}
         assert sub.global_batch_size == 4
         assert sub.dtype == "bf16"
         assert sub.seed == 42
-        assert sub.model_post_init == ["init_a", "init_b"]
+        assert sub.model_post_init_ops == ["init_a", "init_b"]
         assert sub.source_checkpoint_info == {"checkpoint_id": "cp_1", "source_job_id": "job-a"}
 
     def test_sampling_job_factory_default_type(self):
@@ -370,17 +500,21 @@ class TestSubJobConfigFactories:
         )
         assert sub.source_checkpoint_info == source
 
-    def test_sampling_job_factory_log_probability(self):
-        sub = SubJobConfig.sampling_job(
-            model_name="gpt2",
-            max_seq_len=128,
-            n_gpus=1,
-            job_type=JobType.LOG_PROBABILITY,
-        )
-        assert sub.job_type == JobType.LOG_PROBABILITY
+    @pytest.mark.parametrize("job_type", LOG_PROBABILITY_JOB_TYPES)
+    def test_sampling_job_factory_rejects_log_probability(self, job_type):
+        with pytest.raises(
+            ValueError,
+            match=r"sampling_job\(\)\.job_type: log_probability sub-jobs are not currently supported",
+        ):
+            SubJobConfig.sampling_job(
+                model_name="gpt2",
+                max_seq_len=128,
+                n_gpus=1,
+                job_type=job_type,
+            )
 
     def test_sampling_job_factory_rejects_training_type(self):
-        with pytest.raises(ValueError, match="SAMPLING or LOG_PROBABILITY"):
+        with pytest.raises(ValueError, match="only accepts SAMPLING, got"):
             SubJobConfig.sampling_job(
                 model_name="gpt2",
                 max_seq_len=128,
@@ -401,7 +535,7 @@ class TestSubJobConfigFactories:
             extra_training=extra,
         )
         extra["leaked"] = "yes"
-        assert "leaked" not in sub.training.extra
+        assert "leaked" not in (sub.training.model_extra or {})
 
 
 # ─── SubJobConfig — validate ────────────────────────────────────────────
@@ -430,50 +564,49 @@ class TestSubJobConfigValidate:
         ).validate()
 
     def test_rejects_empty_model_name(self):
-        with pytest.raises(ValueError, match="model_name"):
+        with pytest.raises(ValidationError, match="model_name"):
             SubJobConfig(
                 job_type=JobType.TRAINING,
                 model_name="",
                 training=_ok_training(),
-            ).validate()
+            )
 
     def test_training_without_training_block(self):
-        with pytest.raises(ValueError, match="training sub-job requires"):
-            SubJobConfig(job_type=JobType.TRAINING, model_name="gpt2").validate()
+        with pytest.raises(ValidationError, match="training sub-job requires"):
+            SubJobConfig(job_type=JobType.TRAINING, model_name="gpt2")
 
     def test_sampling_without_sampling_block(self):
-        with pytest.raises(ValueError, match="sampling sub-job requires"):
-            SubJobConfig(job_type=JobType.SAMPLING, model_name="gpt2").validate()
+        with pytest.raises(ValidationError, match="sampling sub-job requires"):
+            SubJobConfig(job_type=JobType.SAMPLING, model_name="gpt2")
 
     def test_log_probability_without_sampling_block(self):
-        with pytest.raises(ValueError, match="log_probability sub-job requires"):
+        with pytest.raises(ValidationError, match="log_probability sub-job requires"):
             SubJobConfig(
                 job_type=JobType.LOG_PROBABILITY,
                 model_name="gpt2",
-            ).validate()
+            )
 
     def test_mutually_exclusive(self):
-        with pytest.raises(ValueError, match="mutually exclusive"):
+        with pytest.raises(ValidationError, match="mutually exclusive"):
             SubJobConfig(
                 job_type=JobType.TRAINING,
                 model_name="gpt2",
                 training=_ok_training(),
                 sampling=_ok_inference(),
-            ).validate()
+            )
 
     def test_propagates_nested_validation_failure(self):
-        bad = SubJobConfig(
-            job_type=JobType.TRAINING,
-            model_name="gpt2",
-            training=TrainingConfig(
-                optimizer={"type": "adamw"},
-                max_seq_len=128,
-                train_batch_size=0,
-                n_gpus=2,
-            ),
-        )
-        with pytest.raises(ValueError, match="train_batch_size"):
-            bad.validate()
+        with pytest.raises(ValidationError, match="train_batch_size"):
+            SubJobConfig(
+                job_type=JobType.TRAINING,
+                model_name="gpt2",
+                training=TrainingConfig(
+                    optimizer={"type": "adamw"},
+                    max_seq_len=128,
+                    train_batch_size=0,
+                    n_gpus=2,
+                ),
+            )
 
 
 # ─── SubJobConfig — to_wire ─────────────────────────────────────────────
@@ -492,7 +625,7 @@ class TestSubJobConfigToWire:
             "job_type": "training",
             "model_name": "gpt2",
             "training_config": {
-                "optimizer": {"type": "adamw"},
+                "optimizer": {"name": "adamw"},
                 "max_seq_len": 128,
                 "train_batch_size": 1,
                 "n_gpus": 2,
@@ -520,11 +653,12 @@ class TestSubJobConfigToWire:
         assert wire["source_checkpoint_info"] == {"checkpoint_id": "cp_1", "source_job_id": "job-a"}
 
     def test_sampling_block_used_for_log_probability(self):
-        sub = SubJobConfig.sampling_job(
-            model_name="gpt2",
-            max_seq_len=128,
-            n_gpus=1,
+        # Constructed directly: the factory rejects log-probability, but the
+        # schema type still serializes.
+        sub = SubJobConfig(
             job_type=JobType.LOG_PROBABILITY,
+            model_name="gpt2",
+            sampling=InferenceConfig(max_seq_len=128, n_gpus=1),
         )
         wire = sub.to_wire()
         assert wire["job_type"] == "log_probability"
@@ -579,6 +713,52 @@ class TestClientConstruction:
         assert c.poll_backoff_multiplier == 1.25
         assert c.poll_max_interval == 6.0
 
+    def test_default_request_timeout_is_a_connect_read_pair(self):
+        c = CortexTrainingClient(
+            base_url="http://x.test", database="DB", schema="SCH"
+        )
+        assert c.request_timeout == (30.0, 600.0)
+        assert c._session.default_timeout == c.request_timeout
+
+    def test_scalar_request_timeout_applies_to_connect_and_read(self):
+        c = CortexTrainingClient(
+            base_url="http://x.test",
+            database="DB",
+            schema="SCH",
+            request_timeout=12,
+        )
+        assert c.request_timeout == (12.0, 12.0)
+
+    @pytest.mark.parametrize(
+        "bad",
+        [0, -1, (30.0, 0), (30.0,), float("inf"), float("nan"), None, True, "30"],
+    )
+    def test_rejects_invalid_request_timeout(self, bad):
+        with pytest.raises(ValueError, match="request_timeout"):
+            CortexTrainingClient(
+                base_url="http://x.test",
+                database="DB",
+                schema="SCH",
+                request_timeout=bad,
+            )
+
+    def test_session_injects_default_timeout_unless_call_overrides_it(
+        self, monkeypatch
+    ):
+        seen = []
+
+        def fake_request(_session, *_args, **kwargs):
+            seen.append(kwargs["timeout"])
+            return _make_response()
+
+        monkeypatch.setattr(nc.requests.Session, "request", fake_request)
+        session = nc._DefaultTimeoutSession((2.0, 3.0))
+
+        session.get("http://x.test/default")
+        session.get("http://x.test/override", timeout=(0.5, 1.0))
+
+        assert seen == [(2.0, 3.0), (0.5, 1.0)]
+
     @pytest.mark.parametrize(
         ("kwargs", "match"),
         [
@@ -604,6 +784,10 @@ class TestClientConstruction:
     def test_prefix_url(self):
         c = CortexTrainingClient(base_url="http://x.test", database="DB", schema="SCH")
         assert c._prefix == "http://x.test/api/v2/databases/DB/schemas/SCH/cortex-training"
+
+    def test_prefix_url_leaves_dollar_in_plain_names_bare(self):
+        c = CortexTrainingClient(base_url="http://x.test", database="MY$DB", schema="S$1")
+        assert c._prefix == "http://x.test/api/v2/databases/MY$DB/schemas/S$1/cortex-training"
 
     def test_from_pat_sets_headers_and_verify(self):
         c = CortexTrainingClient.from_pat(
@@ -642,6 +826,103 @@ class TestClientConstruction:
         assert c._metric_emitter.timeout == 1.5
         assert c._metric_emitter.token_provider.timeout == 1.5
 
+    def test_from_connection_name_uses_connector_context(self, monkeypatch):
+        auth = MagicMock()
+        auth.base_url = "https://profile.example:8443"
+        auth.database = "PROFILE_DB"
+        auth.schema = "PROFILE_SCHEMA"
+        auth.open_artifact_connection = MagicMock()
+        auth_type = MagicMock(return_value=auth)
+        monkeypatch.setattr(nc, "SnowflakeProfileAuth", auth_type)
+
+        c = CortexTrainingClient.from_connection_name("training-profile")
+
+        auth_type.assert_called_once_with("training-profile")
+        assert c.base_url == "https://profile.example:8443"
+        assert c.database == "PROFILE_DB"
+        assert c.schema == "PROFILE_SCHEMA"
+        assert c._auth_provider is auth
+        assert c._artifact_connection_factory is auth.open_artifact_connection
+        assert isinstance(
+            c._metric_emitter.token_provider,
+            nc.SnowflakeTelemetryTokenProvider,
+        )
+        assert c._metric_emitter.token_provider._auth is auth
+
+        c.close()
+        auth.close.assert_called_once()
+
+    def test_from_connection_name_allows_routing_overrides(self, monkeypatch):
+        auth = MagicMock()
+        auth.base_url = "https://profile.example"
+        auth.database = "PROFILE_DB"
+        auth.schema = "PROFILE_SCHEMA"
+        monkeypatch.setattr(nc, "SnowflakeProfileAuth", MagicMock(return_value=auth))
+
+        c = CortexTrainingClient.from_connection_name(
+            "training-profile", database="OVERRIDE_DB", schema="OVERRIDE_SCHEMA"
+        )
+
+        assert c.database == "OVERRIDE_DB"
+        assert c.schema == "OVERRIDE_SCHEMA"
+
+    def test_from_connection_name_requires_database(self, monkeypatch):
+        auth = MagicMock()
+        auth.base_url = "https://profile.example"
+        auth.database = None
+        auth.schema = None
+        monkeypatch.setattr(nc, "SnowflakeProfileAuth", MagicMock(return_value=auth))
+
+        with pytest.raises(ValueError, match="must set database"):
+            CortexTrainingClient.from_connection_name("training-profile")
+
+        auth.close.assert_called_once()
+
+    def test_profile_client_sends_live_session_token(self):
+        c = _make_client(get_json={"job_id": "j1"})
+        auth = MagicMock()
+        auth.get_token.return_value = "session-token"
+        c._auth_provider = auth
+
+        assert c.get_job("j1") == {"job_id": "j1"}
+
+        c._session.get.assert_called_once_with(
+            f"{c._prefix}/j1",
+            headers={"Authorization": 'Snowflake Token="session-token"'},
+        )
+
+    def test_profile_client_refreshes_and_replays_once_on_session_expiry(self):
+        c = _make_client()
+        expired = _make_error_response({"code": "390112"}, status_code=401)
+        succeeded = _make_response({"job_id": "j1"})
+        c._session.get.side_effect = [expired, succeeded]
+        auth = MagicMock()
+        auth.get_token.side_effect = ["old-token", "new-token"]
+        c._auth_provider = auth
+
+        assert c.get_job("j1") == {"job_id": "j1"}
+
+        auth.refresh.assert_called_once_with("old-token")
+        assert c._session.get.call_args_list[0].kwargs["headers"] == {
+            "Authorization": 'Snowflake Token="old-token"'
+        }
+        assert c._session.get.call_args_list[1].kwargs["headers"] == {
+            "Authorization": 'Snowflake Token="new-token"'
+        }
+
+    def test_profile_client_does_not_refresh_structured_non_expiry_401(self):
+        c = _make_client()
+        rejected = _make_error_response({"code": "390100"}, status_code=401)
+        c._session.get.return_value = rejected
+        auth = MagicMock()
+        auth.get_token.return_value = "session-token"
+        c._auth_provider = auth
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.get_job("j1")
+
+        auth.refresh.assert_not_called()
+
     def test_emit_metric_is_noop_without_pat(self):
         c = CortexTrainingClient(base_url="http://x.test", database="DB", schema="SCH")
         assert c.emit_metric("event") is None
@@ -659,6 +940,14 @@ class TestClientConstruction:
         c.close()
         c._metric_emitter.close.assert_called_once()
         c._session.close.assert_called_once()
+
+    def test_close_releases_profile_auth(self):
+        c = _make_client()
+        c._auth_provider = MagicMock()
+
+        c.close()
+
+        c._auth_provider.close.assert_called_once()
 
     def test_telemetry_close_error_does_not_skip_http_session_close(self):
         c = _make_client()
@@ -686,6 +975,7 @@ class TestOperationMetrics:
         "list_models",
         "cancel_job",
         "get_capacity",
+        "get_capacity_breakdown",
         "get_experiment_run",
         "fetch_execution_logs",
         "forward_backward",
@@ -765,7 +1055,10 @@ class TestOperationMetrics:
         response.headers["x-snowflake-request-id"] = "sf-request-1"
         c._session.post.return_value = response
 
-        with pytest.raises(nc.requests.exceptions.HTTPError):
+        with pytest.raises(
+            nc.requests.exceptions.HTTPError,
+            match=r"^\[snowflake request id: sf-request-1\] ",
+        ):
             c.step("job-1")
 
         _, value = c._metric_emitter.emit.call_args.args
@@ -774,13 +1067,392 @@ class TestOperationMetrics:
         assert value["attempt_count"] == 1
         assert value["request_count"] == 1
         assert value["retry_count"] == 0
+        assert "snowflake request id: sf-request-1" in value["error_message"]
         assert attributes == {
             "job_id": "job-1",
             "error.type": "HTTPError",
             "error.http_status": 400,
+            "error.snowflake_request_id": "sf-request-1",
             "snowflake.request_id": "sf-request-1",
+            "snowflake.request_ids": ["sf-request-1"],
             "error.code": "CORTEX_TRAINING_BAD_REQUEST",
         }
+
+    def test_http_error_message_carries_request_id_without_telemetry(self, caplog):
+        c = _make_client()
+        c._metric_emitter = None
+        response = _make_error_response({"code": "CORTEX_TRAINING_BAD_REQUEST"}, 400)
+        response.headers["x-snowflake-request-id"] = "sf-request-1"
+        c._session.post.return_value = response
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(
+                nc.requests.exceptions.HTTPError,
+                match=r"^\[snowflake request id: sf-request-1\] 400 Client Error",
+            ):
+                c.step("job-1")
+
+        # The id is already in the raised error, so no duplicate warning.
+        assert not [r for r in caplog.records if "last snowflake request id" in r.message]
+        assert c._operation_metric_state.active == set()
+        assert c._operation_metric_state.snowflake_request_ids == []
+
+    def test_non_http_failure_logs_last_request_id_from_history(
+        self, monkeypatch, caplog
+    ):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        responses = []
+        for index, status in enumerate(("running", "failed"), start=1):
+            response = _make_error_response({"status": status, "error": "oom"}, 200)
+            response.headers["x-snowflake-request-id"] = f"sf-poll-{index}"
+            responses.append(response)
+        c._session.get.side_effect = responses
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(RuntimeError, match="oom"):
+                c.poll_request("job-1", "r1")
+
+        assert any(
+            "[last snowflake request id: sf-poll-2] poll_request failed" in r.getMessage()
+            for r in caplog.records
+        )
+        operation, value = c._metric_emitter.emit.call_args.args
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert operation == "poll_request"
+        assert value["success"] is False
+        assert attributes["error.type"] == "RuntimeError"
+        assert "error.snowflake_request_id" not in attributes
+        assert attributes["snowflake.request_ids"] == ["sf-poll-1", "sf-poll-2"]
+
+    def test_non_http_failure_logs_request_id_without_telemetry(
+        self, monkeypatch, caplog
+    ):
+        c = _make_client()
+        c._metric_emitter = None
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        response = _make_error_response({"status": "failed", "error": "oom"}, 200)
+        response.headers["x-snowflake-request-id"] = "sf-poll-1"
+        c._session.get.return_value = response
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(RuntimeError, match="oom"):
+                c.poll_request("job-1", "r1")
+
+        assert any(
+            "[last snowflake request id: sf-poll-1] poll_request failed" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_failure_before_any_request_logs_no_request_id(self, caplog):
+        c = _make_client()
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(ValueError, match="checkpoint_type"):
+                c.save("job-1", checkpoint_type="invalid")
+
+        assert not [r for r in caplog.records if "snowflake request id" in r.message]
+
+    def test_http_error_without_header_does_not_borrow_an_earlier_id(
+        self, monkeypatch, caplog
+    ):
+        c = _make_client()
+        c.max_retries = 0
+        c._metric_emitter = MagicMock()
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        running = _make_error_response({"status": "running"}, 200)
+        running.headers["x-snowflake-request-id"] = "sf-prev"
+        c._session.get.side_effect = [running, _make_error_response({}, 502)]
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+                c.poll_request("job-1", "r1")
+
+        assert "sf-prev" not in str(excinfo.value)
+        assert not [r for r in caplog.records if "sf-prev" in r.getMessage()]
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert attributes["error.http_status"] == 502
+        assert "error.snowflake_request_id" not in attributes
+        assert attributes["snowflake.request_ids"] == ["sf-prev"]
+
+    def test_validation_error_after_lookup_is_not_blamed_on_the_lookup(
+        self, caplog
+    ):
+        c = _make_client(
+            post_json={"request_id": "g1"},
+            get_json={
+                "sub_jobs": [
+                    {"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}
+                ]
+            },
+        )
+        c._session.get.return_value.headers = {
+            "x-snowflake-request-id": "sf-getjob"
+        }
+        c._metric_emitter = MagicMock()
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(ValueError, match="prompt at index 0 has 5 tokens"):
+                c.generate("j1", prompts=[[1, 2, 3, 4, 5]])
+
+        assert not [r for r in caplog.records if "sf-getjob" in r.getMessage()]
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert attributes["error.type"] == "ValueError"
+        assert "error.snowflake_request_id" not in attributes
+        # Recorded only as history, never as the failing request.
+        assert attributes["snowflake.request_ids"] == ["sf-getjob"]
+
+    def test_retried_attempts_record_every_request_id(self, monkeypatch):
+        c = _make_client()
+        c.max_retries = 2
+        c._metric_emitter = MagicMock()
+        monkeypatch.setattr(
+            nc,
+            "wait_exponential_jitter",
+            lambda **kwargs: lambda retry_state: 0,
+        )
+        responses = []
+        for index in range(1, 4):
+            response = _make_error_response({"code": "TEMPORARY"}, 503)
+            response.headers["x-snowflake-request-id"] = f"sf-{index}"
+            responses.append(response)
+        c._session.post.side_effect = responses
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as excinfo:
+            c.step("job-1")
+
+        message = str(excinfo.value)
+        assert message.startswith("[snowflake request id: sf-3] ")
+        assert message.count("snowflake request id") == 1
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert attributes["error.snowflake_request_id"] == "sf-3"
+        assert attributes["snowflake.request_ids"] == ["sf-1", "sf-2", "sf-3"]
+
+    def test_nested_operation_accumulates_ids_with_one_warning(
+        self, monkeypatch, caplog
+    ):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        pending = _make_error_response({"status": "pending"}, 200)
+        pending.headers["x-snowflake-request-id"] = "sf-job-1"
+        failed = _make_error_response({"status": "failed", "reason": "boom"}, 200)
+        failed.headers["x-snowflake-request-id"] = "sf-job-2"
+        c._session.get.side_effect = [pending, failed]
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(RuntimeError, match="boom"):
+                c.wait_for_job("job-1")
+
+        warnings = [r.getMessage() for r in caplog.records if "last snowflake request id" in r.getMessage()]
+        assert warnings == [
+            "[last snowflake request id: sf-job-2] wait_for_job failed: "
+            "Job job-1 reached terminal state 'failed': boom"
+        ]
+        c._metric_emitter.emit.assert_called_once()
+        operation, _ = c._metric_emitter.emit.call_args.args
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert operation == "wait_for_job"
+        assert attributes["snowflake.request_ids"] == ["sf-job-1", "sf-job-2"]
+
+    def test_chunk_group_error_message_carries_request_id(self, caplog):
+        c = _make_client()
+        response = _make_error_response(
+            {
+                "code": "517604",
+                "message": (
+                    "Cortex training forwardBackward failed: zone returned 409: "
+                    '{"detail":{"message":"request chunk group is missing chunks",'
+                    '"chunk_group_id":"group-a","missing_chunks":[0,1]}}'
+                ),
+            }
+        )
+        response.headers["x-snowflake-request-id"] = "sf-chunk"
+        c._session.post.return_value = response
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(nc.ChunkGroupConflictError) as excinfo:
+                c.forward_backward("j1", b"small")
+
+        assert str(excinfo.value).startswith("[snowflake request id: sf-chunk] ")
+        assert not [r for r in caplog.records if "last snowflake request id" in r.getMessage()]
+
+    def test_redirect_error_message_carries_request_id(self):
+        c = _make_client()
+        response = _make_error_response({}, 302)
+        response.headers["x-snowflake-request-id"] = "sf-redirect"
+        c._session.post.return_value = response
+
+        with pytest.raises(
+            nc.requests.exceptions.HTTPError,
+            match=r"^\[snowflake request id: sf-redirect\] Unexpected redirect 302 ",
+        ):
+            c.step("job-1")
+
+    def test_untracked_send_still_tags_http_errors(self):
+        c = _make_client()
+        response = _make_error_response({}, 500)
+        response.headers["x-snowflake-request-id"] = "sf-raw"
+        c._session.get.return_value = response
+        c.max_retries = 0
+
+        with pytest.raises(
+            nc.requests.exceptions.HTTPError,
+            match=r"^\[snowflake request id: sf-raw\] ",
+        ):
+            c._send("GET", "http://test.local/raw")
+        assert getattr(c._operation_metric_state, "active", set()) == set()
+
+    def test_success_event_records_request_id_history(self, monkeypatch):
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
+        c = _make_client(post_json={"request_id": "r1"})
+        c._session.post.return_value.headers = {"x-snowflake-request-id": "sf-ok"}
+        c._metric_emitter = MagicMock()
+
+        assert c.step("job-1") == "r1"
+
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert "error.snowflake_request_id" not in attributes
+        assert attributes["snowflake.request_ids"] == ["sf-ok"]
+
+    def test_request_id_survives_error_message_truncation(self):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        response = _make_error_response({"code": "BAD"}, 400)
+        response.url = "http://test.local/" + "x" * 1000
+        response.headers["x-snowflake-request-id"] = "sf-long"
+        c._session.post.return_value = response
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.step("job-1")
+
+        _, value = c._metric_emitter.emit.call_args.args
+        assert len(value["error_message"]) == nc._METRIC_ERROR_MESSAGE_LIMIT
+        assert value["error_message"].startswith("[snowflake request id: sf-long] ")
+
+    def test_undecodable_server_payload_logs_last_request_id(
+        self, monkeypatch, caplog
+    ):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        response = _make_error_response({"status": "done"}, 200)
+        response.headers["x-snowflake-request-id"] = "sf-bad-payload"
+        c._session.get.return_value = response
+
+        def bad_payload(_status):
+            raise nc.wire.WireError("not a valid DSSST1 safetensors payload")
+
+        monkeypatch.setattr(c, "_decode_stream_result_events", bad_payload)
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(nc.wire.WireError):
+                c.poll_request("job-1", "r1")
+
+        assert any(
+            "[last snowflake request id: sf-bad-payload] poll_request failed"
+            in r.getMessage()
+            for r in caplog.records
+        )
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert attributes["error.type"] == "WireError"
+        assert attributes["snowflake.request_ids"] == ["sf-bad-payload"]
+
+    @pytest.mark.parametrize("status", ["done", "cancelled"])
+    def test_wait_for_job_non_failed_terminal_state_logs_nothing(
+        self, monkeypatch, caplog, status
+    ):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        response = _make_error_response({"status": status, "reason": "r"}, 200)
+        response.headers["x-snowflake-request-id"] = "sf-job"
+        c._session.get.return_value = response
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(RuntimeError, match=f"terminal state '{status}'"):
+                c.wait_for_job("job-1")
+
+        assert not [
+            r for r in caplog.records if "last snowflake request id" in r.getMessage()
+        ]
+        # Telemetry keeps the history even when nothing is logged.
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert attributes["snowflake.request_ids"] == ["sf-job"]
+
+    def test_poll_request_cancelled_logs_nothing(self, monkeypatch, caplog):
+        c = _make_client()
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        response = _make_error_response({"status": "cancelled"}, 200)
+        response.headers["x-snowflake-request-id"] = "sf-poll"
+        c._session.get.return_value = response
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(RuntimeError, match="cancelled"):
+                c.poll_request("job-1", "r1")
+
+        assert not [
+            r for r in caplog.records if "last snowflake request id" in r.getMessage()
+        ]
+
+    def test_poll_request_timeout_logs_last_request_id(self, monkeypatch, caplog):
+        c = _make_client()
+        c.poll_interval = 0.01
+        c.poll_max_interval = 0.01
+        c.poll_timeout = 0.05
+        response = _make_error_response({"status": "running"}, 200)
+        response.headers["x-snowflake-request-id"] = "sf-running"
+        c._session.get.return_value = response
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(TimeoutError):
+                c.poll_request("job-1", "r1")
+
+        assert any(
+            "[last snowflake request id: sf-running] poll_request failed"
+            in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_session_expired_401_request_id_is_recorded(self, monkeypatch):
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        expired = _make_error_response({"code": "390112"}, status_code=401)
+        expired.headers["x-snowflake-request-id"] = "sf-401"
+        succeeded = _make_response({"job_id": "j1"})
+        succeeded.headers = {"x-snowflake-request-id": "sf-ok"}
+        c._session.get.side_effect = [expired, succeeded]
+        auth = MagicMock()
+        auth.get_token.side_effect = ["old-token", "new-token"]
+        c._auth_provider = auth
+
+        assert c.get_job("j1") == {"job_id": "j1"}
+
+        auth.refresh.assert_called_once_with("old-token")
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert attributes["snowflake.request_ids"] == ["sf-401", "sf-ok"]
+
+    def test_tracked_request_ids_are_bounded(self, monkeypatch):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        total = nc._MAX_TRACKED_SNOWFLAKE_REQUEST_IDS + 5
+        responses = []
+        for index in range(1, total + 1):
+            status = "failed" if index == total else "running"
+            response = _make_error_response({"status": status, "error": "x"}, 200)
+            response.headers["x-snowflake-request-id"] = f"sf-{index}"
+            responses.append(response)
+        c._session.get.side_effect = responses
+
+        with pytest.raises(RuntimeError):
+            c.poll_request("job-1", "r1")
+
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert attributes["snowflake.request_ids"] == [
+            f"sf-{index}" for index in range(6, total + 1)
+        ]
 
     def test_retry_attempts_are_summarized_in_final_metric(self, monkeypatch):
         monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
@@ -942,11 +1614,10 @@ class TestCreateJob:
             c.create_job(sub_jobs=[])
 
     def test_validates_each_sub_job_before_post(self):
-        c = _make_client()
-        bad = SubJobConfig(job_type=JobType.TRAINING, model_name="gpt2")  # no training block
-        with pytest.raises(ValueError):
-            c.create_job(sub_jobs=[bad])
-        c._session.post.assert_not_called()
+        # Pydantic validates on construction, so an invalid SubJobConfig
+        # cannot even be created — no HTTP call is possible.
+        with pytest.raises(ValidationError):
+            SubJobConfig(job_type=JobType.TRAINING, model_name="gpt2")  # no training block
 
     def test_posts_in_flight_yaml_shape(self):
         c = _make_client(post_json={"job_id": "srv-1"})
@@ -967,7 +1638,7 @@ class TestCreateJob:
                     "job_type": "training",
                     "model_name": "gpt2",
                     "training_config": {
-                        "optimizer": {"type": "adamw"},
+                        "optimizer": {"name": "adamw"},
                         "max_seq_len": 128,
                         "train_batch_size": 1,
                         "n_gpus": 2,
@@ -1099,7 +1770,7 @@ class TestCreateJob:
         c = _make_client(post_json={"job_id": "srv-1"})
         train = SubJobConfig.training_job(
             model_name="gpt2",
-            optimizer={"a": 1},
+            optimizer={"name": "adamw"},
             max_seq_len=128,
             train_batch_size=1,
             n_gpus=2,
@@ -1149,6 +1820,81 @@ class TestCreateJob:
             c.create_job(sub_jobs=[training, training])
         c._session.post.assert_not_called()
 
+    def test_rejects_log_probability_sub_job_before_post(self):
+        c = _make_client()
+        training = SubJobConfig.training_job(
+            model_name="gpt2",
+            optimizer={"type": "adamw"},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
+        )
+        log_prob = SubJobConfig(
+            job_type=JobType.LOG_PROBABILITY,
+            model_name="gpt2",
+            sampling=_ok_inference(),
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"sub_jobs\[1\]\.job_type: log_probability sub-jobs are not currently supported",
+        ):
+            c.create_job(sub_jobs=[training, log_prob])
+        c._session.post.assert_not_called()
+
+    @pytest.mark.parametrize("job_type", LOG_PROBABILITY_JOB_TYPES)
+    def test_create_job_from_body_rejects_log_probability_before_post(self, job_type):
+        c = _make_client()
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "sampling",
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                },
+                {
+                    "job_type": job_type,
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                },
+            ],
+        }
+        with pytest.raises(
+            ValueError,
+            match=r"sub_job_configs\[1\]\.job_type: log_probability sub-jobs are not currently supported",
+        ):
+            c.create_job_from_body(body)
+        c._session.post.assert_not_called()
+
+    # Only the two documented aliases are rejected; anything else is left to the
+    # server so a newly added schema value is not blocked client-side.
+    @pytest.mark.parametrize("job_type", ["log-probability", "logprob", "sampling"])
+    def test_create_job_from_body_allows_other_job_types(self, job_type):
+        c = _make_client(post_json={"job_id": "srv-1"})
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": job_type,
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                }
+            ],
+        }
+        assert c.create_job_from_body(body) == {"job_id": "srv-1"}
+
+    def test_create_job_from_body_skips_non_dict_sub_job_configs(self):
+        c = _make_client(post_json={"job_id": "srv-1"})
+        body = {
+            "sub_job_configs": [
+                "log_probability",
+                {
+                    "job_type": "sampling",
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                },
+            ],
+        }
+        assert c.create_job_from_body(body) == {"job_id": "srv-1"}
+
     def test_create_job_from_body_rejects_two_training_sub_jobs_before_post(self):
         c = _make_client()
         body = {
@@ -1168,6 +1914,117 @@ class TestCreateJob:
         with pytest.raises(ValueError, match="at most one training sub-job"):
             c.create_job_from_body(body)
         c._session.post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "job_type",
+        ["training", "TRAINING", "JOB_TYPE_TRAINING", " training "],
+    )
+    def test_create_job_from_body_normalizes_training_peft_config(self, job_type, monkeypatch):
+        normalized_peft = {"peft_type": "Lora"}
+        normalize = MagicMock(return_value=normalized_peft)
+        monkeypatch.setattr(nc, "normalize_lora_peft_config", normalize)
+        c = _make_client(post_json={"job_id": "srv-raw"})
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": job_type,
+                    "model_name": "gpt2",
+                    "training_config": {"peft_config": {"r": 8}},
+                },
+            ],
+        }
+
+        assert c.create_job_from_body(body) == {"job_id": "srv-raw"}
+        assert body["sub_job_configs"][0]["training_config"]["peft_config"] == normalized_peft
+        normalize.assert_called_once()
+
+    def test_create_job_from_body_normalizes_sampling_peft_config(self, monkeypatch):
+        normalized_peft = {"peft_type": "Lora"}
+        normalize = MagicMock(return_value=normalized_peft)
+        monkeypatch.setattr(nc, "normalize_lora_peft_config", normalize)
+        c = _make_client(post_json={"job_id": "srv-raw"})
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "sampling",
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1, "peft_config": {"r": 8}},
+                },
+            ],
+        }
+
+        assert c.create_job_from_body(body) == {"job_id": "srv-raw"}
+        assert body["sub_job_configs"][0]["inference_config"]["peft_config"] == normalized_peft
+        normalize.assert_called_once()
+
+    def test_create_job_from_body_rewrites_peft_config_in_place(self):
+        c = _make_client(post_json={"job_id": "srv-raw"})
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "gpt2",
+                    "training_config": {
+                        "optimizer": {"type": "adamw"},
+                        "peft_config": {
+                            "peft_type": "Lora",
+                            "r": 16,
+                            "target_modules": ["q_proj"],
+                        },
+                    },
+                },
+            ],
+        }
+
+        assert c.create_job_from_body(body) == {"job_id": "srv-raw"}
+        training_config = body["sub_job_configs"][0]["training_config"]
+        assert training_config["peft_config"] == {
+            "peft_type": "Lora",
+            "task_type": "CAUSAL_LM",
+            "r": 16,
+            "lora_alpha": 8,
+            "lora_dropout": 0.0,
+            "bias": "none",
+            "target_modules": ["q_proj"],
+            "target_parameters": [],
+        }
+        assert isinstance(training_config["peft_config"]["lora_dropout"], float)
+        # The raw path forwards the optimizer untouched.
+        assert training_config["optimizer"] == {"type": "adamw"}
+
+    def test_create_job_from_body_rejects_invalid_peft_config_before_post(self):
+        c = _make_client()
+        body = {
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "gpt2",
+                    "training_config": {"peft_config": {"peft_type": "LORA"}},
+                },
+            ],
+        }
+
+        with pytest.raises(
+            ValueError,
+            match=r"sub_job_configs\[0\]\.training_config\.peft_config\.peft_type",
+        ):
+            c.create_job_from_body(body)
+        c._session.post.assert_not_called()
+
+    def test_create_job_from_body_ignores_absent_peft_config(self):
+        c = _make_client(post_json={"job_id": "srv-raw"})
+        body = {
+            "sub_job_configs": [
+                "not-an-object",
+                {
+                    "job_type": "sampling",
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                },
+            ],
+        }
+
+        assert c.create_job_from_body(body) == {"job_id": "srv-raw"}
 
     def test_allows_one_training_with_multiple_sampling(self):
         c = _make_client(post_json={"job_id": "srv-1"})
@@ -1245,6 +2102,75 @@ class TestCreateJob:
         assert c.create_job_from_body(body) == {"job_id": "srv"}
 
 
+# ─── CortexTrainingClient — transient HTTP retries ───────────────────────────
+
+
+class TestTransientHttpRetries:
+    def test_307_and_308_are_transient(self):
+        for status in (307, 308):
+            resp = _make_response(status_code=status)
+            exc = nc.requests.exceptions.HTTPError(response=resp)
+            assert nc._is_transient(exc)
+
+    def test_302_is_not_transient(self):
+        resp = _make_response(status_code=302)
+        exc = nc.requests.exceptions.HTTPError(response=resp)
+        assert not nc._is_transient(exc)
+
+    @pytest.mark.parametrize("caller_kwargs", [{}, {"allow_redirects": True}])
+    def test_session_does_not_follow_redirects(self, monkeypatch, caller_kwargs):
+        seen_kwargs = {}
+
+        def fake_request(_session, *_args, **kwargs):
+            seen_kwargs.update(kwargs)
+            return _make_response()
+
+        monkeypatch.setattr(nc.requests.Session, "request", fake_request)
+        session = nc._DefaultTimeoutSession((1.0, 1.0))
+
+        session.get("http://test.local/redirect", **caller_kwargs)
+
+        assert seen_kwargs["allow_redirects"] is False
+
+    def test_send_retries_308_against_original_url(self, monkeypatch):
+        from tenacity import wait_none
+
+        monkeypatch.setattr(
+            nc, "wait_exponential_jitter", lambda **_kwargs: wait_none()
+        )
+        c = _make_client()
+        c.max_retries = 1
+        leaked = nc.requests.Response()
+        leaked.status_code = 308
+        leaked.url = f"{c._prefix}/job-1/forward-backward"
+        leaked.headers["Location"] = "http://unroutable.invalid/forward-backward"
+        ok = _make_response({"job_id": "job-1", "status": "running"})
+        c._session.post.side_effect = [leaked, ok]
+
+        out = c._send("POST", leaked.url, data=b"payload")
+
+        assert out is ok
+        assert c._session.post.call_count == 2
+        urls = [call.args[0] for call in c._session.post.call_args_list]
+        assert urls == [leaked.url, leaked.url]
+
+    def test_send_rejects_non_transient_redirect_without_retry(self):
+        c = _make_client()
+        c.max_retries = 1
+        redirect = nc.requests.Response()
+        redirect.status_code = 302
+        redirect.url = f"{c._prefix}/job-1"
+        redirect.headers["Location"] = "http://example.test/elsewhere"
+        c._session.get.return_value = redirect
+
+        with pytest.raises(
+            nc.requests.exceptions.HTTPError, match="Unexpected redirect 302"
+        ):
+            c._send("GET", redirect.url)
+
+        c._session.get.assert_called_once_with(redirect.url)
+
+
 # ─── CortexTrainingClient — read & control endpoints ─────────────────────────
 
 
@@ -1314,7 +2240,9 @@ class TestReadAndControl:
             "pending_gpus": 16,
             "available_gpus": 40,
         }
-        c._session.get.assert_called_once_with(f"{c._prefix}/capacity")
+        c._session.get.assert_called_once_with(
+            f"{c._prefix}/capacity", timeout=nc._CAPACITY_REQUEST_TIMEOUT
+        )
 
     def test_get_capacity_reports_uncapped_ceiling(self):
         # -1 is the uncapped sentinel and must survive as-is: 0 is a real quota
@@ -1330,8 +2258,45 @@ class TestReadAndControl:
         c = _make_client(get_json={"has_reservation": True, "reserved_gpus": 32})
         c.get_capacity(hardware=Hardware.B200)
         c._session.get.assert_called_once_with(
-            f"{c._prefix}/capacity", params={"hardware": "B200"}
+            f"{c._prefix}/capacity",
+            timeout=nc._CAPACITY_REQUEST_TIMEOUT,
+            params={"hardware": "B200"},
         )
+
+    def test_get_capacity_uses_shorter_caller_timeout_and_does_not_retry(self):
+        c = _make_client()
+        c.request_timeout = (2.0, 0.5)
+        c._session.get.side_effect = nc.requests.exceptions.ReadTimeout("silent peer")
+
+        with pytest.raises(nc.requests.exceptions.ReadTimeout):
+            c.get_capacity()
+
+        c._session.get.assert_called_once_with(
+            f"{c._prefix}/capacity", timeout=(2.0, 0.5)
+        )
+
+    def test_get_capacity_still_replays_once_for_expired_profile_token(self):
+        c = _make_client()
+        c._session.get.side_effect = [
+            _make_error_response({"code": "390112"}, status_code=401),
+            _make_response({"available_gpus": 8}),
+        ]
+        auth = MagicMock()
+        auth.get_token.side_effect = ["old-token", "new-token"]
+        c._auth_provider = auth
+
+        assert c.get_capacity()["available_gpus"] == 8
+
+        auth.refresh.assert_called_once_with("old-token")
+        assert c._session.get.call_count == 2
+        assert c._session.get.call_args_list[0].kwargs == {
+            "headers": {"Authorization": 'Snowflake Token="old-token"'},
+            "timeout": nc._CAPACITY_REQUEST_TIMEOUT,
+        }
+        assert c._session.get.call_args_list[1].kwargs == {
+            "headers": {"Authorization": 'Snowflake Token="new-token"'},
+            "timeout": nc._CAPACITY_REQUEST_TIMEOUT,
+        }
 
     def test_get_capacity_rejects_unknown_hardware(self):
         c = _make_client(get_json={})
@@ -1372,6 +2337,877 @@ class TestReadAndControl:
             "pending_gpus": 8,
             "available_gpus": 0,
         }
+
+
+# ─── CortexTrainingClient — account-level job listing ────────────────────────
+
+ACCOUNT_ROUTE = "http://test.local/api/v2/cortex-training"
+
+
+def _resolve_identifier(segment: str) -> str:
+    """Resolve a URL path segment the way the server resolves an identifier."""
+    identifier = unquote(segment)
+    if identifier.startswith('"'):
+        return identifier[1:-1].replace('""', '"')
+    return identifier.upper()
+
+
+class TestIterJobs:
+    def test_gets_the_account_route_not_the_schema(self):
+        c = _make_client(get_json={"jobs": [{"job_id": "a"}]})
+
+        assert list(c.iter_jobs()) == [{"job_id": "a"}]
+
+        c._session.get.assert_called_once_with(ACCOUNT_ROUTE, params={"limit": 100})
+
+    @pytest.mark.parametrize("page_size", [0, 1001])
+    def test_refuses_a_page_size_the_server_would_reject(self, page_size):
+        c = _make_client(get_json={"jobs": []})
+
+        with pytest.raises(ValueError, match="page_size must be between 1 and 1000"):
+            next(c.iter_jobs(page_size=page_size))
+
+        c._session.get.assert_not_called()
+
+    @pytest.mark.parametrize("page_size", [1, 1000])
+    def test_accepts_the_page_size_bounds(self, page_size):
+        c = _make_client(get_json={"jobs": []})
+
+        assert list(c.iter_jobs(page_size=page_size)) == []
+
+        c._session.get.assert_called_once_with(
+            ACCOUNT_ROUTE, params={"limit": page_size}
+        )
+
+    def test_sends_every_filter(self):
+        c = _make_client(get_json={"jobs": []})
+
+        list(
+            c.iter_jobs(
+                database="ML",
+                schema='"Exp 1"',
+                status=["running", "FAILED"],
+                submitted_by="jdoe",
+                created_after=date(2026, 10, 1),
+                created_before=datetime(
+                    2026, 10, 2, 9, 30, tzinfo=timezone(timedelta(hours=2))
+                ),
+                page_size=50,
+            )
+        )
+
+        c._session.get.assert_called_once_with(
+            ACCOUNT_ROUTE,
+            params={
+                "database": "ML",
+                "schema": '"Exp 1"',
+                "status": "running,FAILED",
+                "submitted_by": "jdoe",
+                "created_after": "2026-10-01",
+                "created_before": "2026-10-02T07:30:00Z",
+                "limit": 50,
+            },
+        )
+
+    def test_refuses_a_schema_without_a_database(self):
+        c = _make_client(get_json={"jobs": []})
+
+        with pytest.raises(ValueError, match="needs database=... with it"):
+            c.iter_jobs(schema="EXP")
+
+        c._session.get.assert_not_called()
+
+    def test_checks_arguments_before_the_first_page_is_iterated(self):
+        c = _make_client(get_json={"jobs": []})
+
+        # Not next(...): the call itself refuses, so nothing is left to iterate.
+        with pytest.raises(ValueError, match="page_size must be between 1 and 1000"):
+            c.iter_jobs(page_size=0)
+        with pytest.raises(ValueError, match="needs database"):
+            c.iter_jobs(schema="EXP")
+
+        c._session.get.assert_not_called()
+
+    def test_ignores_a_count_the_server_no_longer_returns(self):
+        c = _make_client(
+            get_json={"jobs": [{"job_id": "a"}], "unknown_status_count": 3}
+        )
+
+        assert list(c.iter_jobs(status="running")) == [{"job_id": "a"}]
+
+    @pytest.mark.parametrize(
+        ("value", "wire"),
+        [
+            (date(2026, 10, 1), "2026-10-01"),
+            (
+                datetime(2026, 10, 1, 1, 0, tzinfo=timezone(timedelta(hours=-7))),
+                "2026-10-01T08:00:00Z",
+            ),
+            (datetime(2026, 10, 1, 8, 0, 0, 250000), "2026-10-01T08:00:00.250000Z"),
+            ("2026-10-01T00:00:00+02:00", "2026-10-01T00:00:00+02:00"),
+        ],
+    )
+    def test_created_after_is_sent_in_utc_or_as_given(self, value, wire):
+        c = _make_client(get_json={"jobs": []})
+
+        list(c.iter_jobs(status="active", created_after=value))
+
+        assert c._session.get.call_args.kwargs["params"] == {
+            "status": "active",
+            "created_after": wire,
+            "limit": 100,
+        }
+
+    def test_follows_next_page_token_with_the_same_filters(self):
+        c = _make_client()
+        c._session.get.side_effect = [
+            _make_response(
+                {"jobs": [{"job_id": "c"}, {"job_id": "b"}], "next_page_token": "t1"}
+            ),
+            # A page may be empty and still carry a token.
+            _make_response({"jobs": [], "next_page_token": "t2"}),
+            _make_response({"jobs": [{"job_id": "a"}], "next_page_token": None}),
+        ]
+
+        jobs = list(c.iter_jobs(status="failed", page_size=2))
+
+        assert [job["job_id"] for job in jobs] == ["c", "b", "a"]
+        calls = c._session.get.call_args_list
+        assert [call.args for call in calls] == [(ACCOUNT_ROUTE,)] * 3
+        assert [call.kwargs["params"] for call in calls] == [
+            {"status": "failed", "limit": 2},
+            {"status": "failed", "limit": 2, "page_token": "t1"},
+            {"status": "failed", "limit": 2, "page_token": "t2"},
+        ]
+
+    def test_reads_the_next_page_only_when_iterated(self):
+        c = _make_client()
+        c._session.get.side_effect = [
+            _make_response({"jobs": [{"job_id": "b"}], "next_page_token": "t1"}),
+            _make_response({"jobs": [{"job_id": "a"}]}),
+        ]
+
+        jobs = c.iter_jobs()
+
+        assert next(jobs) == {"job_id": "b"}
+        assert c._session.get.call_count == 1
+        assert list(jobs) == [{"job_id": "a"}]
+        assert c._session.get.call_count == 2
+
+    def test_404_is_not_retried_and_says_listing_is_not_enabled(self):
+        c = _make_client()
+        c._session.get.return_value = _make_error_response(
+            {"message": "Account-level job listing is not enabled for this account"},
+            404,
+        )
+
+        with pytest.raises(
+            nc.requests.exceptions.HTTPError,
+            match="account-level job listing is not enabled for this account",
+        ) as exc:
+            list(c.iter_jobs())
+
+        assert exc.value.response.status_code == 404
+        assert c.max_retries == 10
+        c._session.get.assert_called_once()
+        # No auto-create, or any other request, follows a 404.
+        c._session.post.assert_not_called()
+
+    def test_a_not_found_error_does_not_create_the_configured_database(self):
+        c = _make_client()
+        c._session.get.return_value = _make_error_response(
+            {"message": "Database 'NOPE' does not exist or not authorized."}, 400
+        )
+
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="400 Client Error"):
+            list(c.iter_jobs(database="NOPE"))
+
+        # The same response on a schema route would run CREATE DATABASE DB.
+        assert c._is_database_not_found(c._session.get.return_value)
+        c._session.get.assert_called_once()
+        c._session.post.assert_not_called()
+        assert c._db_ensured is False
+
+    def test_other_transient_errors_are_still_retried(self, monkeypatch):
+        monkeypatch.setattr(
+            nc,
+            "wait_exponential_jitter",
+            lambda **kwargs: lambda retry_state: 0,
+        )
+        c = _make_client()
+        c._session.get.side_effect = [
+            _make_error_response({"message": "unavailable"}, 503),
+            _make_response({"jobs": [{"job_id": "a"}]}),
+        ]
+
+        assert list(c.iter_jobs()) == [{"job_id": "a"}]
+        assert c._session.get.call_count == 2
+
+    def test_bad_request_is_raised_unchanged(self):
+        c = _make_client()
+        c._session.get.return_value = _make_error_response(
+            {"message": "Invalid database or schema scope"}, 400
+        )
+
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="400 Client Error"):
+            list(c.iter_jobs(database="NOPE"))
+
+        c._session.get.assert_called_once()
+
+    def test_emits_one_metric_per_page_without_filter_values(self, monkeypatch):
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        c._session.get.side_effect = [
+            _make_response({"jobs": [{"job_id": "b"}], "next_page_token": "t1"}),
+            _make_error_response({"message": "not enabled"}, 404),
+        ]
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            list(c.iter_jobs(submitted_by="jdoe"))
+
+        calls = c._metric_emitter.emit.call_args_list
+        assert [call.args[0] for call in calls] == ["iter_jobs", "iter_jobs"]
+        assert [call.args[1]["success"] for call in calls] == [True, False]
+        assert [call.args[1]["request_count"] for call in calls] == [1, 1]
+        assert [call.kwargs["attributes"] for call in calls] == [
+            {},
+            {"error.type": "HTTPError", "error.http_status": 404},
+        ]
+        assert "jdoe" not in repr(calls)
+
+
+class TestForJob:
+    @pytest.mark.parametrize(
+        ("database_name", "schema_name", "path"),
+        [
+            ("ML", "EXP_1$", "ML/schemas/EXP_1$"),
+            ("_DB", "PUBLIC", "_DB/schemas/PUBLIC"),
+            ("ml", "Exp1", "%22ml%22/schemas/%22Exp1%22"),
+            ("My DB", 'a"b', "%22My%20DB%22/schemas/%22a%22%22b%22"),
+            ("1DB", "a/b?c#d%e", "%221DB%22/schemas/%22a%2Fb%3Fc%23d%25e%22"),
+            ("DB\n", "$X", "%22DB%0A%22/schemas/%22$X%22"),
+        ],
+    )
+    def test_binds_quoted_percent_encoded_names(
+        self, database_name, schema_name, path
+    ):
+        c = _make_client()
+
+        job_client = c.for_job(
+            {"job_id": "j1", "database_name": database_name, "schema_name": schema_name}
+        )
+
+        assert job_client._prefix == (
+            f"http://test.local/api/v2/databases/{path}/cortex-training"
+        )
+        database_segment, schema_segment = path.split("/schemas/")
+        assert _resolve_identifier(database_segment) == database_name
+        assert _resolve_identifier(schema_segment) == schema_name
+
+    def test_shares_session_auth_and_telemetry_and_copies_settings(self):
+        c = CortexTrainingClient(
+            base_url="http://test.local",
+            database="DB",
+            schema="SCH",
+            endpoint="training-v2",
+            poll_interval=1.0,
+            poll_timeout=60.0,
+            poll_backoff_multiplier=2.0,
+            poll_max_interval=8.0,
+            max_retries=3,
+            request_timeout=(5.0, 7.0),
+        )
+        c._session = MagicMock()
+        c._session.get.return_value = _make_response({"job_id": "j1"})
+        c._auth_provider = MagicMock()
+        c._auth_provider.get_token.return_value = "tok"
+        c._metric_emitter = MagicMock()
+        c._artifact_connection_config = {"host": "x.test", "pat": "pat"}
+        c._artifact_connection_factory = MagicMock()
+
+        job_client = c.for_job(
+            {"job_id": "j1", "database_name": "ML", "schema_name": "EXP"}
+        )
+
+        assert type(job_client) is CortexTrainingClient and job_client is not c
+        assert job_client._session is c._session
+        assert job_client._auth_provider is c._auth_provider
+        assert job_client._metric_emitter is c._metric_emitter
+        assert job_client._artifact_connection_config is c._artifact_connection_config
+        assert job_client._artifact_connection_factory is c._artifact_connection_factory
+        assert (
+            job_client.endpoint,
+            job_client.poll_interval,
+            job_client.poll_timeout,
+            job_client.poll_backoff_multiplier,
+            job_client.poll_max_interval,
+            job_client.max_retries,
+            job_client.request_timeout,
+        ) == ("training-v2", 1.0, 60.0, 2.0, 8.0, 3, (5.0, 7.0))
+        assert (c.database, c.schema) == ("DB", "SCH")
+
+        job_client.get_job("j1")
+
+        c._session.get.assert_called_once_with(
+            "http://test.local/api/v2/databases/ML/schemas/EXP/training-v2/j1",
+            headers={"Authorization": 'Snowflake Token="tok"'},
+        )
+
+    def test_closes_the_session_it_opened_before_borrowing(self):
+        c = _make_client()
+
+        with patch.object(
+            nc._DefaultTimeoutSession, "close", autospec=True
+        ) as closed:
+            job_client = c.for_job({"database_name": "ML", "schema_name": "EXP"})
+
+        # The constructor opens a session and a connection pool; for_job
+        # releases them instead of leaking one per call.
+        closed.assert_called_once()
+        leaked = closed.call_args.args[0]
+        assert leaked is not c._session
+        assert job_client._session is c._session
+
+    def test_closing_it_leaves_the_parent_session_auth_and_telemetry_open(self):
+        c = _make_client()
+        c._auth_provider = MagicMock()
+        c._metric_emitter = MagicMock()
+
+        job_client = c.for_job({"database_name": "ML", "schema_name": "EXP"})
+        with job_client:
+            pass
+        job_client.close()
+
+        assert c._session.close.called is False
+        assert c._auth_provider.close.called is False
+        assert c._metric_emitter.close.called is False
+        # The parent still owns all three and closes them.
+        c.close()
+        assert c._session.close.called
+        assert c._auth_provider.close.called
+        assert c._metric_emitter.close.called
+
+    def test_does_not_create_the_jobs_database(self):
+        c = _make_client()
+        c._session.get.return_value = _make_error_response(
+            {"message": "Schema OTHER_DB.PUBLIC is not found or not authorized."}, 400
+        )
+
+        job_client = c.for_job({"database_name": "OTHER_DB", "schema_name": "PUBLIC"})
+        with pytest.raises(nc.requests.exceptions.HTTPError, match="400 Client Error"):
+            job_client.get_job("j1")
+
+        # The listed database already exists and may belong to another role, so
+        # the not-found answer surfaces instead of a CREATE DATABASE for it.
+        assert c._is_database_not_found(c._session.get.return_value)
+        c._session.post.assert_not_called()
+        assert job_client._db_ensured is False
+
+    def test_returns_a_client_of_the_same_class(self):
+        class SubClient(CortexTrainingClient):
+            pass
+
+        c = SubClient(base_url="http://test.local", database="DB", schema="SCH")
+
+        job_client = c.for_job({"database_name": "ML", "schema_name": "EXP"})
+
+        assert type(job_client) is SubClient
+
+
+# ─── CortexTrainingClient — get_capacity_breakdown ───────────────────────────
+
+# One H200 snapshot (a reservation of 64, caller ALICE) in which every split
+# sums to the totals.
+_CAPACITY_TOTALS = {
+    "has_reservation": True,
+    "max_total_gpus": 64,
+    "reserved_gpus": 64,
+    "in_use_gpus": 44,
+    "pending_gpus": 16,
+    "available_gpus": 4,
+}
+_CAPACITY_BREAKDOWN_BODY = {
+    **_CAPACITY_TOTALS,
+    "breakdown": {
+        "unsupported_dimensions": [],
+        "job_count": 6,
+        "truncated": False,
+        "by_job_type": {
+            "status": "OK",
+            "groups": [
+                {"job_type": "TRAINING", "in_use_gpus": 28, "pending_gpus": 16, "sub_job_count": 5},
+                {"job_type": "SAMPLING", "in_use_gpus": 16, "pending_gpus": 0, "sub_job_count": 2},
+                {"job_type": "LOG_PROBABILITY", "in_use_gpus": 0, "pending_gpus": 0, "sub_job_count": 1},
+            ],
+        },
+        "by_submitted_by": {
+            "status": "OK",
+            "groups": [
+                {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                 "in_use_gpus": 24, "pending_gpus": 0, "job_count": 2},
+                {"kind": "OTHER", "in_use_gpus": 16, "pending_gpus": 16, "job_count": 3},
+                {"kind": "UNATTRIBUTED", "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+            ],
+        },
+    },
+}
+
+
+class TestCapacityBreakdown:
+    def test_sends_breakdown_with_capacity_timeout_and_no_retries(self):
+        c = _make_client(get_json=_CAPACITY_BREAKDOWN_BODY)
+        c._send = MagicMock(wraps=c._send)
+
+        c.get_capacity_breakdown(hardware=Hardware.B200)
+
+        c._session.get.assert_called_once_with(
+            f"{c._prefix}/capacity",
+            timeout=nc._CAPACITY_REQUEST_TIMEOUT,
+            params={"hardware": "B200", "breakdown": "job_type,submitted_by"},
+        )
+        assert c._send.call_args.kwargs["max_retries"] == 0
+
+    def test_omits_hardware_when_not_given(self):
+        c = _make_client(get_json=_CAPACITY_BREAKDOWN_BODY)
+
+        c.get_capacity_breakdown()
+
+        c._session.get.assert_called_once_with(
+            f"{c._prefix}/capacity",
+            timeout=nc._CAPACITY_REQUEST_TIMEOUT,
+            params={"breakdown": "job_type,submitted_by"},
+        )
+
+    def test_uses_shorter_caller_timeout_and_does_not_retry(self):
+        c = _make_client()
+        c.request_timeout = (2.0, 0.5)
+        c._session.get.side_effect = nc.requests.exceptions.ReadTimeout("silent peer")
+
+        with pytest.raises(nc.requests.exceptions.ReadTimeout):
+            c.get_capacity_breakdown(dimensions=("job_type",))
+
+        c._session.get.assert_called_once_with(
+            f"{c._prefix}/capacity",
+            timeout=(2.0, 0.5),
+            params={"breakdown": "job_type"},
+        )
+
+    def test_joins_any_iterable_of_dimensions_in_order(self):
+        c = _make_client(get_json={})
+        c.get_capacity_breakdown(dimensions=iter(["submitted_by", "job_type"]))
+        assert c._session.get.call_args.kwargs["params"] == {
+            "breakdown": "submitted_by,job_type",
+        }
+
+    def test_str_enum_dimension_reads_its_own_section(self):
+        from enum import Enum
+
+        # On Python 3.11+ a member like this formats as "Dimension.JOB_TYPE".
+        class Dimension(str, Enum):
+            JOB_TYPE = "job_type"
+
+        c = _make_client(get_json={
+            "in_use_gpus": 8,
+            "breakdown": {
+                "job_count": 1,
+                "by_job_type": {
+                    "status": "OK",
+                    "groups": [{"job_type": "TRAINING", "in_use_gpus": 8, "sub_job_count": 1}],
+                },
+            },
+        })
+
+        by_job_type = c.get_capacity_breakdown(dimensions=(Dimension.JOB_TYPE,))[
+            "breakdown"
+        ]["by_job_type"]
+
+        assert c._session.get.call_args.kwargs["params"] == {"breakdown": "job_type"}
+        assert by_job_type["status"] == "OK"
+        assert by_job_type["groups"][0]["in_use_gpus"] == 8
+
+    @pytest.mark.parametrize(
+        "dimensions",
+        [
+            (), [], "job_type", "job_type,submitted_by", None, 7,
+            ("owner_role",), ("job-type",), ("JOB_TYPE",), ("job_type", None),
+        ],
+    )
+    def test_rejects_bad_dimensions_before_any_request(self, dimensions):
+        c = _make_client(get_json={})
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"^dimensions must be a non-empty iterable of job_type, "
+                r"submitted_by \(not a string\), got "
+            ),
+        ):
+            c.get_capacity_breakdown(dimensions=dimensions)
+        c._session.get.assert_not_called()
+
+    def test_rejects_unknown_hardware_before_any_request(self):
+        c = _make_client(get_json={})
+        with pytest.raises(ValueError, match="hardware must be one of"):
+            c.get_capacity_breakdown(hardware="A10")
+        c._session.get.assert_not_called()
+
+    def test_ok_breakdown_is_normalized(self):
+        c = _make_client(get_json=_CAPACITY_BREAKDOWN_BODY)
+        cap = c.get_capacity_breakdown()
+        assert cap == {
+            **_CAPACITY_TOTALS,
+            "breakdown": {
+                "job_count": 6,
+                "truncated": False,
+                "unsupported_dimensions": [],
+                "by_job_type": {
+                    "status": "OK",
+                    "groups": [
+                        {"job_type": "TRAINING", "in_use_gpus": 28, "pending_gpus": 16, "sub_job_count": 5},
+                        {"job_type": "SAMPLING", "in_use_gpus": 16, "pending_gpus": 0, "sub_job_count": 2},
+                        {"job_type": "LOG_PROBABILITY", "in_use_gpus": 0, "pending_gpus": 0, "sub_job_count": 1},
+                    ],
+                },
+                "by_submitted_by": {
+                    "status": "OK",
+                    "groups": [
+                        {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                         "in_use_gpus": 24, "pending_gpus": 0, "job_count": 2},
+                        {"kind": "OTHER", "submitted_by": None, "is_caller": False,
+                         "in_use_gpus": 16, "pending_gpus": 16, "job_count": 3},
+                        {"kind": "UNATTRIBUTED", "submitted_by": None, "is_caller": False,
+                         "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+                    ],
+                },
+            },
+        }
+        # The CLI prints with sort_keys=True, which needs every key to be a string.
+        json.dumps(cap, sort_keys=True)
+
+    def test_job_types_are_zero_filled_in_order_with_prefix_stripped(self):
+        c = _make_client(get_json={
+            "in_use_gpus": 12,
+            "pending_gpus": 16,
+            "breakdown": {
+                "job_count": 3,
+                "by_job_type": {
+                    "status": "OK",
+                    "groups": [
+                        {"job_type": "JOB_TYPE_SAMPLING", "in_use_gpus": 8, "sub_job_count": 1},
+                        {"job_type": "TRAINING", "pending_gpus": 16, "sub_job_count": 2},
+                        {"job_type": "UNKNOWN", "in_use_gpus": 4, "sub_job_count": 1},
+                    ],
+                },
+            },
+        })
+
+        cap = c.get_capacity_breakdown(dimensions=("job_type",))
+
+        assert cap["breakdown"] == {
+            "job_count": 3,
+            "truncated": False,
+            "unsupported_dimensions": [],
+            "by_job_type": {
+                "status": "OK",
+                "groups": [
+                    {"job_type": "TRAINING", "in_use_gpus": 0, "pending_gpus": 16, "sub_job_count": 2},
+                    {"job_type": "SAMPLING", "in_use_gpus": 8, "pending_gpus": 0, "sub_job_count": 1},
+                    {"job_type": "LOG_PROBABILITY", "in_use_gpus": 0, "pending_gpus": 0, "sub_job_count": 0},
+                    {"job_type": "UNKNOWN", "in_use_gpus": 4, "pending_gpus": 0, "sub_job_count": 1},
+                ],
+            },
+        }
+
+    def test_repeated_known_job_type_is_summed_into_its_row(self):
+        # The server sends each known type once. If it ever repeated one,
+        # summing keeps the groups adding up to the totals.
+        c = _make_client(get_json={
+            "in_use_gpus": 10,
+            "breakdown": {
+                "job_count": 2,
+                "by_job_type": {
+                    "status": "OK",
+                    "groups": [
+                        {"job_type": "TRAINING", "in_use_gpus": 8, "sub_job_count": 1},
+                        {"job_type": "JOB_TYPE_TRAINING", "in_use_gpus": 2, "sub_job_count": 1},
+                    ],
+                },
+            },
+        })
+
+        groups = c.get_capacity_breakdown(dimensions=("job_type",))["breakdown"][
+            "by_job_type"
+        ]["groups"]
+
+        assert [group["job_type"] for group in groups] == list(nc._CAPACITY_BREAKDOWN_JOB_TYPES)
+        assert groups[0] == {
+            "job_type": "TRAINING", "in_use_gpus": 10, "pending_gpus": 0, "sub_job_count": 2,
+        }
+
+    def test_only_user_rows_carry_a_name(self):
+        c = _make_client(get_json={
+            "in_use_gpus": 20,
+            "pending_gpus": 12,
+            "breakdown": {
+                "job_count": 5,
+                "by_submitted_by": {
+                    "status": "OK",
+                    "groups": [
+                        {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                         "in_use_gpus": 8, "job_count": 1},
+                        # A USER row's is_caller is passed through, and is False if omitted.
+                        {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
+                         "in_use_gpus": 4, "job_count": 1},
+                        {"kind": "USER", "submitted_by": "DAVE", "pending_gpus": 4, "job_count": 1},
+                        {"kind": "OTHER", "submitted_by": "BOB", "is_caller": True,
+                         "in_use_gpus": 8, "job_count": 1},
+                        {"kind": "UNATTRIBUTED", "submitted_by": "", "pending_gpus": 8, "job_count": 1},
+                    ],
+                },
+            },
+        })
+
+        groups = c.get_capacity_breakdown(dimensions=("submitted_by",))["breakdown"][
+            "by_submitted_by"
+        ]["groups"]
+
+        assert groups == [
+            {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+             "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+            {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
+             "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+            {"kind": "USER", "submitted_by": "DAVE", "is_caller": False,
+             "in_use_gpus": 0, "pending_gpus": 4, "job_count": 1},
+            {"kind": "OTHER", "submitted_by": None, "is_caller": False,
+             "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+            {"kind": "UNATTRIBUTED", "submitted_by": None, "is_caller": False,
+             "in_use_gpus": 0, "pending_gpus": 8, "job_count": 1},
+        ]
+
+    def test_user_rows_keep_the_server_order(self):
+        # The server orders USER rows by in_use_gpus + pending_gpus descending
+        # and then by name, so the caller, ALICE, comes third.
+        c = _make_client(get_json={
+            "in_use_gpus": 52,
+            "pending_gpus": 16,
+            "breakdown": {
+                "unsupported_dimensions": [],
+                "job_count": 7,
+                "truncated": False,
+                "by_submitted_by": {
+                    "status": "OK",
+                    "groups": [
+                        {"kind": "USER", "submitted_by": "DAVE", "is_caller": False,
+                         "in_use_gpus": 16, "pending_gpus": 8, "job_count": 2},
+                        {"kind": "USER", "submitted_by": "BOB", "is_caller": False,
+                         "in_use_gpus": 16, "pending_gpus": 0, "job_count": 1},
+                        {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                         "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                        {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
+                         "in_use_gpus": 0, "pending_gpus": 8, "job_count": 1},
+                        {"kind": "OTHER", "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                        {"kind": "UNATTRIBUTED", "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+                    ],
+                },
+            },
+        })
+
+        by_submitted_by = c.get_capacity_breakdown(dimensions=("submitted_by",))[
+            "breakdown"
+        ]["by_submitted_by"]
+
+        assert by_submitted_by == {
+            "status": "OK",
+            "groups": [
+                {"kind": "USER", "submitted_by": "DAVE", "is_caller": False,
+                 "in_use_gpus": 16, "pending_gpus": 8, "job_count": 2},
+                {"kind": "USER", "submitted_by": "BOB", "is_caller": False,
+                 "in_use_gpus": 16, "pending_gpus": 0, "job_count": 1},
+                {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                 "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
+                 "in_use_gpus": 0, "pending_gpus": 8, "job_count": 1},
+                {"kind": "OTHER", "submitted_by": None, "is_caller": False,
+                 "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                {"kind": "UNATTRIBUTED", "submitted_by": None, "is_caller": False,
+                 "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+            ],
+        }
+
+    def test_old_server_reports_every_dimension_unavailable(self):
+        c = _make_client(get_json=_CAPACITY_TOTALS)
+        assert c.get_capacity_breakdown() == {
+            **_CAPACITY_TOTALS,
+            "breakdown": {
+                "job_count": 0,
+                "truncated": False,
+                "unsupported_dimensions": [],
+                "by_job_type": {"status": "UNAVAILABLE", "groups": []},
+                "by_submitted_by": {"status": "UNAVAILABLE", "groups": []},
+            },
+        }
+
+    def test_dimension_missing_from_server_breakdown_is_unavailable(self):
+        # A server that knows job_type but not submitted_by lists it as unsupported.
+        c = _make_client(get_json={
+            "in_use_gpus": 8,
+            "breakdown": {
+                "unsupported_dimensions": ["submitted_by"],
+                "job_count": 1,
+                "truncated": False,
+                "by_job_type": {
+                    "status": "OK",
+                    "groups": [{"job_type": "TRAINING", "in_use_gpus": 8, "sub_job_count": 1}],
+                },
+            },
+        })
+
+        breakdown = c.get_capacity_breakdown()["breakdown"]
+
+        assert breakdown["unsupported_dimensions"] == ["submitted_by"]
+        assert breakdown["by_job_type"]["status"] == "OK"
+        assert breakdown["by_submitted_by"] == {"status": "UNAVAILABLE", "groups": []}
+
+    @pytest.mark.parametrize("status", ["DISABLED", "UNAVAILABLE", "UNSUPPORTED", "SOMETHING_NEW", 1])
+    def test_status_is_passed_through_as_sent(self, status):
+        c = _make_client(get_json={
+            "in_use_gpus": 8,
+            "breakdown": {
+                "unsupported_dimensions": [],
+                "by_job_type": {"status": status, "groups": []},
+                "by_submitted_by": {"status": status, "groups": []},
+            },
+        })
+
+        breakdown = c.get_capacity_breakdown()["breakdown"]
+
+        assert breakdown["by_job_type"] == {"status": status, "groups": []}
+        assert breakdown["by_submitted_by"] == {"status": status, "groups": []}
+
+    def test_groups_are_kept_whatever_the_status(self):
+        # The data decides, so a status this client does not know cannot hide a split.
+        c = _make_client(get_json={
+            "in_use_gpus": 8,
+            "breakdown": {
+                "by_job_type": {
+                    "status": "SOMETHING_NEW",
+                    "groups": [{"job_type": "TRAINING", "in_use_gpus": 8, "sub_job_count": 1}],
+                },
+            },
+        })
+
+        by_job_type = c.get_capacity_breakdown(dimensions=("job_type",))["breakdown"][
+            "by_job_type"
+        ]
+
+        assert by_job_type["status"] == "SOMETHING_NEW"
+        assert by_job_type["groups"][0] == {
+            "job_type": "TRAINING", "in_use_gpus": 8, "pending_gpus": 0, "sub_job_count": 1,
+        }
+
+    @pytest.mark.parametrize("status", [None, ""], ids=["null", "empty"])
+    def test_missing_status_is_ok_when_groups_are_sent(self, status):
+        section = {"groups": [{"job_type": "TRAINING", "in_use_gpus": 8, "sub_job_count": 1}]}
+        if status is not None:
+            section["status"] = status
+        c = _make_client(get_json={
+            "in_use_gpus": 8,
+            "breakdown": {"job_count": 1, "by_job_type": section},
+        })
+
+        by_job_type = c.get_capacity_breakdown(dimensions=("job_type",))["breakdown"][
+            "by_job_type"
+        ]
+
+        assert by_job_type["status"] == "OK"
+        assert by_job_type["groups"][0]["in_use_gpus"] == 8
+
+    def test_section_without_status_or_groups_fails_closed_as_unavailable(self):
+        c = _make_client(get_json={"in_use_gpus": 8, "breakdown": {"by_job_type": {}}})
+
+        by_job_type = c.get_capacity_breakdown(dimensions=("job_type",))["breakdown"][
+            "by_job_type"
+        ]
+
+        assert by_job_type == {"status": "UNAVAILABLE", "groups": []}
+
+    def test_truncated_is_passed_through(self):
+        # The jobs the server did not attribute one by one hold the fewest
+        # GPUs, and are counted as UNATTRIBUTED.
+        c = _make_client(get_json={
+            "in_use_gpus": 48,
+            "pending_gpus": 16,
+            "breakdown": {
+                "unsupported_dimensions": [],
+                "job_count": 7,
+                "truncated": True,
+                "by_submitted_by": {
+                    "status": "OK",
+                    "groups": [
+                        {"kind": "OTHER", "in_use_gpus": 48, "job_count": 5},
+                        {"kind": "UNATTRIBUTED", "pending_gpus": 16, "job_count": 2},
+                    ],
+                },
+            },
+        })
+
+        breakdown = c.get_capacity_breakdown(dimensions=("submitted_by",))["breakdown"]
+
+        assert breakdown == {
+            "job_count": 7,
+            "truncated": True,
+            "unsupported_dimensions": [],
+            "by_submitted_by": {
+                "status": "OK",
+                "groups": [
+                    {"kind": "OTHER", "submitted_by": None, "is_caller": False,
+                     "in_use_gpus": 48, "pending_gpus": 0, "job_count": 5},
+                    {"kind": "UNATTRIBUTED", "submitted_by": None, "is_caller": False,
+                     "in_use_gpus": 0, "pending_gpus": 16, "job_count": 2},
+                ],
+            },
+        }
+
+    def test_records_its_own_operation_metric(self, monkeypatch):
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
+        c = _make_client(get_json=_CAPACITY_BREAKDOWN_BODY)
+        c._metric_emitter = MagicMock()
+
+        c.get_capacity_breakdown()
+
+        c._metric_emitter.emit.assert_called_once()
+        operation, value = c._metric_emitter.emit.call_args.args
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert operation == "get_capacity_breakdown"
+        assert value["success"] is True
+        assert value["request_count"] == 1
+        assert value["attempt_count"] == 1
+        # The result names the caller, so none of it becomes part of the metric.
+        assert attributes == {}
+        assert "ALICE" not in repr(c._metric_emitter.emit.call_args)
+
+    def test_bad_dimensions_record_a_failed_operation_without_a_request(self):
+        c = _make_client(get_json=_CAPACITY_BREAKDOWN_BODY)
+        c._metric_emitter = MagicMock()
+
+        with pytest.raises(ValueError, match="dimensions must be"):
+            c.get_capacity_breakdown(dimensions=("owner_role",))
+
+        c._session.get.assert_not_called()
+        c._metric_emitter.emit.assert_called_once()
+        operation, value = c._metric_emitter.emit.call_args.args
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert operation == "get_capacity_breakdown"
+        assert value["success"] is False
+        assert value["request_count"] == 0
+        assert attributes == {"error.type": "ValueError"}
+
+    def test_get_capacity_still_returns_only_the_six_totals(self):
+        c = _make_client(get_json=_CAPACITY_BREAKDOWN_BODY)
+        assert c.get_capacity() == _CAPACITY_TOTALS
+        c._session.get.assert_called_once_with(
+            f"{c._prefix}/capacity", timeout=nc._CAPACITY_REQUEST_TIMEOUT
+        )
 
 
 # ─── CortexTrainingClient — wait_for_job ─────────────────────────────────────
@@ -1707,21 +3543,34 @@ class TestDataPlane:
             strict=True,
         )
         assert out == {"request_id": "s1", "count": 2}
+        # The stream path sends one unchunked frame, never a chunk group.
+        c._session.post.assert_called_once()
         url, kwargs = c._session.post.call_args
         assert url[0] == f"{c._prefix}/j1/generate-stream"
         assert kwargs["headers"]["Content-Type"] == "application/octet-stream"
-        import json as _json
+        body = _wire_load(kwargs["data"])
+        assert body["sampling_params"] == [
+            {"max_tokens": 4, "temperature": 0.7},
+            {"max_tokens": 2, "temperature": 0.3},
+        ]
+        assert body["routing_key"] == ["rk-1", None]
+        assert body["strict"] is True
+        prompts = body["prompts"]
+        assert [p.dtype for p in prompts] == [torch.int32, torch.int32]
+        assert [p.tolist() for p in prompts] == [[1, 2], [3, 4]]
 
-        body = _json.loads(kwargs["data"])
-        assert body == {
-            "prompts": [[1, 2], [3, 4]],
-            "sampling_params": [
-                {"max_tokens": 4, "temperature": 0.7},
-                {"max_tokens": 2, "temperature": 0.3},
-            ],
-            "routing_key": ["rk-1", None],
-            "strict": True,
-        }
+    def test_generate_stream_frame_matches_generate_frame(self):
+        prompts = ["hello", [1, 2, 3]]
+        unary = _make_client(post_json={"request_id": "g-same"})
+        unary.generate("j1", prompts=prompts)
+        stream = _make_client(post_json={"request_id": "s-same"})
+        stream.generate_stream("j1", prompts=prompts)
+
+        from_unary = _wire_load(unary._session.post.call_args.kwargs["data"])["prompts"]
+        from_stream = _wire_load(stream._session.post.call_args.kwargs["data"])["prompts"]
+        assert from_unary[0] == from_stream[0] == "hello"
+        assert from_unary[1].dtype == from_stream[1].dtype == torch.int32
+        assert torch.equal(from_unary[1], from_stream[1])
 
     def test_generate_chunks_oversized_payload(self):
         c = _make_client()
@@ -1808,6 +3657,54 @@ class TestDataPlane:
         with pytest.raises(ValueError, match="does not fit the sampling job's max_seq_len of 4"):
             c.generate_stream("j1", prompts=[[1, 2, 3, 4, 5]])
         c._session.post.assert_not_called()
+
+    def test_generate_rejects_overlong_flat_tokenized_prompt(self):
+        # A flat list of ids is one prompt, so the reported index is 0 even
+        # though the list has four elements.
+        c = _make_client(
+            post_json={"request_id": "g-flat"},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+        )
+        with pytest.raises(ValueError, match="prompt at index 0 has 4 tokens"):
+            c.generate("j1", prompts=[1, 2, 3, 4])
+        c._session.post.assert_not_called()
+
+    def test_generate_rejects_mixed_flat_token_list(self):
+        c = _make_client(
+            post_json={"request_id": "g-mixed"},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 8.0, "n_gpus": 1.0}}]},
+        )
+        with pytest.raises(ValueError, match=r"prompts\[1\] must be an integer token id"):
+            c.generate("j1", prompts=[1, 2.5])
+        c._session.post.assert_not_called()
+
+    def test_generate_allows_bare_tensor_prompt_under_limit(self):
+        c = _make_client(
+            post_json={"request_id": "g-tensor"},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+        )
+        assert c.generate("j1", prompts=torch.tensor([1, 2, 3], dtype=torch.int32)) == "g-tensor"
+        c._session.post.assert_called_once()
+
+    def test_generate_rejects_overlong_bare_tensor_prompt(self):
+        c = _make_client(
+            post_json={"request_id": "g-tensor-long"},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+        )
+        with pytest.raises(ValueError, match="prompt at index 0 has 4 tokens"):
+            c.generate("j1", prompts=torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+        c._session.post.assert_not_called()
+
+    def test_generate_stream_allows_bare_tensor_prompt_under_limit(self):
+        c = _make_client(
+            post_json={"request_id": "s-tensor", "count": 1},
+            get_json={"sub_jobs": [{"inference_config": {"max_seq_len": 4.0, "n_gpus": 1.0}}]},
+        )
+        assert c.generate_stream("j1", prompts=torch.tensor([1, 2, 3], dtype=torch.int32)) == {
+            "request_id": "s-tensor",
+            "count": 1,
+        }
+        c._session.post.assert_called_once()
 
     def test_step_no_lr(self):
         c = _make_client(post_json={"request_id": "r2"})
@@ -2038,6 +3935,7 @@ class TestDataPlane:
             sub_job_type="training",
         )
         assert out == {"request_id": "r-forward"}
+        assert "r-forward" in c._forward_request_ids
         c._session.post.assert_called_once_with(
             f"{c._prefix}/j1/operation",
             json={
@@ -2051,6 +3949,7 @@ class TestDataPlane:
     def test_forward_operation_omits_none_fields(self):
         c = _make_client(post_json={"ok": True})
         c.forward("j1")
+        assert not c._forward_request_ids
         c._session.post.assert_called_once_with(
             f"{c._prefix}/j1/operation",
             json={"operation_type": "forward"},
@@ -2095,12 +3994,165 @@ class TestDataPlane:
             },
         }
 
-    def test_forward_rejects_oversized_bytes_payload(self):
+    def test_forward_chunk_envelope_keys_match_the_backend_reader(self, monkeypatch):
+        """Pin the envelope shape the backend parses: payload_b64 + content_type."""
+        from cortex_training import wire
+
+        monkeypatch.setenv(nc._OPERATION_MAX_JSON_BYTES_ENV, str(64 * 1024))
+        c = _make_client(post_json={"chunk_cached": True})
+        frame = wire.dumps({"input_ids": torch.zeros(1, 60_000, dtype=torch.long)})
+        with contextlib.suppress(RuntimeError):
+            c.forward("j1", frame, sub_job_id="j1:training:0")
+
+        assert c._session.post.call_count > 1
+        for call in c._session.post.call_args_list:
+            payload = call.kwargs["json"]["payload"]
+            assert set(payload) == {"payload_b64", "content_type"}
+            assert payload["content_type"] == "application/octet-stream"
+            assert isinstance(payload["payload_b64"], str)
+
+    def test_forward_sends_a_fitting_frame_as_one_unchunked_post(self):
+        # The server assembler rejects total_chunks <= 1, so a fitting frame
+        # is posted raw.
+        from cortex_training import wire
+
         c = _make_client(post_json={"request_id": "r-forward"})
-        oversized = b"\x00" * (CortexTrainingClient._MAX_FWD_BWD_BYTES + 1)
-        with pytest.raises(ValueError, match="exceeds the maximum allowed size"):
-            c.forward("j1", oversized)
+        frame = wire.dumps({"input_ids": torch.zeros(2, 4, dtype=torch.long)})
+        c.forward("j1", frame, sub_job_id="j1:training:0")
+        assert c._session.post.call_count == 1
+        payload = c._session.post.call_args.kwargs["json"]["payload"]
+        sent = base64.b64decode(payload["payload_b64"])
+        assert sent == frame
+        assert wire.read_byte_chunk_metadata(sent) is None
+        assert "r-forward" in c._forward_request_ids
+
+    def test_forward_chunks_an_oversized_frame_across_operation_posts(self, monkeypatch):
+        from cortex_training import wire
+
+        max_json = 64 * 1024
+        monkeypatch.setenv(nc._OPERATION_MAX_JSON_BYTES_ENV, str(max_json))
+        frame = wire.dumps({"input_ids": torch.zeros(1, 60_000, dtype=torch.long)})
+        expected_chunks = len(
+            wire.encode_byte_chunks(
+                frame,
+                kind="request",
+                operation="forward",
+                max_bytes=nc._operation_chunk_max_bytes(max_json),
+            )
+        )
+        assert expected_chunks > 1
+
+        c = _make_client()
+        bodies = [{"chunk_cached": True}] * (expected_chunks - 1) + [{"request_id": "r-forward"}]
+        c._session.post.side_effect = [_make_response(body) for body in bodies]
+
+        out = c.forward("j1", frame, sub_job_id="j1:training:0")
+        assert out == {"request_id": "r-forward"}
+        assert "r-forward" in c._forward_request_ids
+        assert c._session.post.call_count == expected_chunks
+
+        chunks = []
+        for call in c._session.post.call_args_list:
+            body = call.kwargs["json"]
+            assert body["operation_type"] == "forward"
+            assert body["sub_job_id"] == "j1:training:0"
+            assert len(json.dumps(body).encode("utf-8")) <= 64 * 1024
+            chunks.append(base64.b64decode(body["payload"]["payload_b64"]))
+
+        descriptors = [wire.read_byte_chunk_metadata(chunk) for chunk in chunks]
+        assert all(desc is not None for desc in descriptors)
+        assert {desc["operation"] for desc in descriptors} == {"forward"}
+        assert len({desc["chunk_group_id"] for desc in descriptors}) == 1
+        assert wire.decode_byte_chunks(chunks, kind="request") == frame
+
+    def test_forward_raises_when_a_non_final_chunk_returns_a_request_id(self, monkeypatch):
+        from cortex_training import wire
+
+        monkeypatch.setenv(nc._OPERATION_MAX_JSON_BYTES_ENV, str(64 * 1024))
+        c = _make_client(post_json={"request_id": "r-forward"})
+        frame = wire.dumps({"input_ids": torch.zeros(1, 60_000, dtype=torch.long)})
+        with pytest.raises(RuntimeError, match="chunk 0 unexpectedly returned request_id"):
+            c.forward("j1", frame)
+        assert "r-forward" not in c._forward_request_ids
+
+    def test_operation_rejects_a_body_over_the_declared_ceiling(self):
+        c = _make_client(post_json={})
+        with pytest.raises(ValueError, match="exceeds the .* limit for one /operation"):
+            c._operation("j1", "forward", payload=b"\x00" * 4096, max_json_bytes=1024)
         c._session.post.assert_not_called()
+
+    def test_forward_does_not_retry_a_chunk_group_conflict(self, monkeypatch):
+        from cortex_training import wire
+
+        monkeypatch.setenv(nc._OPERATION_MAX_JSON_BYTES_ENV, str(64 * 1024))
+        c = _make_client()
+        conflict = _make_error_response(
+            {
+                "code": "chunk_group_missing_chunks",
+                "message": "request chunk group is missing chunks",
+                "chunk_group_id": "grp-1",
+                "missing_chunks": [0, 1],
+            }
+        )
+        c._session.post.return_value = conflict
+        frame = wire.dumps({"input_ids": torch.zeros(1, 60_000, dtype=torch.long)})
+
+        with pytest.raises(nc.ChunkGroupConflictError) as excinfo:
+            c.forward("j1", frame)
+        assert excinfo.value.detail["missing_chunks"] == [0, 1]
+        assert c._session.post.call_count == 1
+
+    def test_operation_body_size_is_measured_without_copying_the_payload(self):
+        body = {
+            "operation_type": "forward",
+            "sub_job_id": "j1:training:0",
+            "payload": {"payload_b64": "QUJD" * 1000, "content_type": "application/octet-stream"},
+        }
+        assert nc._operation_body_json_bytes(body) == len(json.dumps(body).encode("utf-8"))
+        no_payload = {"operation_type": "step"}
+        assert nc._operation_body_json_bytes(no_payload) == len(
+            json.dumps(no_payload).encode("utf-8")
+        )
+
+    def test_operation_without_a_declared_ceiling_is_unbounded(self):
+        c = _make_client(post_json={"ok": True})
+        assert c._operation("j1", "weight-sync", payload=b"\x00" * 4096) == {"ok": True}
+        c._session.post.assert_called_once()
+
+    def test_forward_operation_json_ceiling_env_must_be_sane(self, monkeypatch):
+        monkeypatch.setenv(nc._OPERATION_MAX_JSON_BYTES_ENV, "not-a-number")
+        with pytest.raises(ValueError, match="must be an integer"):
+            nc._operation_max_json_bytes()
+        monkeypatch.setenv(
+            nc._OPERATION_MAX_JSON_BYTES_ENV,
+            str(nc._MIN_OPERATION_MAX_JSON_BYTES - 1),
+        )
+        with pytest.raises(ValueError, match="must be at least 16384 bytes"):
+            nc._operation_max_json_bytes()
+        monkeypatch.setenv(
+            nc._OPERATION_MAX_JSON_BYTES_ENV,
+            str(nc._MIN_OPERATION_MAX_JSON_BYTES),
+        )
+        assert nc._operation_max_json_bytes() == 16 * 1024
+        assert nc._operation_chunk_max_bytes(nc._operation_max_json_bytes()) == 9 * 1024
+
+    def test_forward_dict_payload_still_takes_the_plain_operation_path(self):
+        c = _make_client(post_json={"request_id": "r-forward"})
+        c.forward("j1", {"probe": True}, sub_job_type="training")
+        assert c._session.post.call_count == 1
+        assert c._session.post.call_args.kwargs["json"] == {
+            "operation_type": "forward",
+            "sub_job_type": "training",
+            "payload": {"probe": True},
+        }
+
+    def test_operation_debug_log_omits_the_base64_payload(self, caplog, capsys):
+        c = _make_client(post_json={"request_id": "r-forward"})
+        with caplog.at_level(logging.DEBUG, logger=nc.logger.name):
+            c.forward("j1", b"\xab" * 4096)
+        assert "base64 chars>" in caplog.text
+        assert base64.b64encode(b"\xab" * 4096).decode("ascii") not in caplog.text
+        assert capsys.readouterr().out == ""
 
     def test_bootstrap_router_replay(self):
         c = _make_client(post_json={"request_id": "r-bootstrap"})
@@ -2198,6 +4250,72 @@ class TestDataPlane:
         }
 
 
+# ─── Pre-tokenized prompt packing ────────────────────────────────────────
+
+
+class TestPromptTensorPacking:
+    def test_batch_of_token_lists_becomes_int32_tensors(self):
+        packed = nc._pack_token_prompts([[1, 2], [3, 4, 5]])
+        assert [p.dtype for p in packed] == [torch.int32, torch.int32]
+        assert [p.tolist() for p in packed] == [[1, 2], [3, 4, 5]]
+
+    def test_string_prompts_are_left_alone(self):
+        assert nc._pack_token_prompts(["a", "b"]) == ["a", "b"]
+
+    def test_mixed_batch_packs_only_token_lists(self):
+        packed = nc._pack_token_prompts(["a", [1, 2]])
+        assert packed[0] == "a"
+        assert packed[1].tolist() == [1, 2]
+
+    def test_empty_inner_list_stays_a_list(self):
+        # The server's own non-empty check should be the one that rejects it.
+        assert nc._pack_token_prompts([[]]) == [[]]
+
+    def test_mixed_flat_list_is_rejected(self):
+        with pytest.raises(ValueError, match=r"prompts\[1\] must be an integer token id"):
+            nc._pack_token_prompts([1, 2.5])
+
+    def test_bool_list_is_not_packed_as_token_ids(self):
+        assert nc._pack_token_prompts([True, False]) == [True, False]
+
+    def test_flat_token_list_is_one_prompt(self):
+        packed = nc._pack_token_prompts([7, 8, 9])
+        assert torch.is_tensor(packed)
+        assert packed.dtype == torch.int32
+        assert packed.tolist() == [7, 8, 9]
+
+    def test_empty_and_non_list_prompts_are_unchanged(self):
+        assert nc._pack_token_prompts([]) == []
+        assert nc._pack_token_prompts("hello") == "hello"
+
+    def test_existing_tensor_is_not_recast(self):
+        tensor = torch.tensor([1, 2], dtype=torch.int64)
+        assert nc._pack_token_prompts(tensor) is tensor
+        assert nc._pack_token_prompts([tensor])[0] is tensor
+
+    def test_token_id_beyond_int32_falls_back_to_int64(self, caplog):
+        caplog.set_level(logging.WARNING, logger=nc.logger.name)
+        packed = nc._pack_token_prompts([[2**31]])
+        assert packed[0].dtype == torch.int64
+        assert packed[0].tolist() == [2**31]
+        assert "int32" in caplog.text
+
+    def test_env_var_keeps_list_prompts_inside_the_frame(self, monkeypatch):
+        # The hatch changes the encoding of the prompts, not the body: both
+        # calls still post a DSSST1 frame.
+        monkeypatch.setenv(nc.DISABLE_TENSOR_PROMPTS_ENV, "1")
+
+        unary = _make_client(post_json={"request_id": "g-raw"})
+        unary.generate("j1", prompts=[[1, 2], [3, 4]])
+        stream = _make_client(post_json={"request_id": "s-raw", "count": 2})
+        stream.generate_stream("j1", prompts=[[1, 2], [3, 4]])
+
+        for client in (unary, stream):
+            kwargs = client._session.post.call_args.kwargs
+            assert kwargs["headers"]["Content-Type"] == "application/octet-stream"
+            assert _wire_load(kwargs["data"])["prompts"] == [[1, 2], [3, 4]]
+
+
 # ─── CortexTrainingClient — request polling ──────────────────────────────────
 
 
@@ -2235,6 +4353,7 @@ class TestRequestPolling:
                 "text": "ok",
                 "token_ids": torch.tensor([1, 2, 3], dtype=torch.int64),
                 "logprobs": torch.tensor([0.125, -0.5], dtype=torch.float32),
+                "metrics": {"model/tokens": 3},
             }
         )
         c = _make_client(
@@ -2250,6 +4369,7 @@ class TestRequestPolling:
                             "encoding": "base64",
                             "wire_format": "DSSST1",
                             "payload_b64": base64.b64encode(payload).decode("ascii"),
+                            "metrics": {"router_replay/tx_bytes_avg": 12.0},
                         },
                     },
                     {"type": "done", "completed": 1, "failed": 0},
@@ -2265,6 +4385,10 @@ class TestRequestPolling:
                     "text": "ok",
                     "token_ids": [1, 2, 3],
                     "logprobs": [0.125, -0.5],
+                    "metrics": {
+                        "model/tokens": 3,
+                        "router_replay/tx_bytes_avg": 12.0,
+                    },
                 },
             },
             {"type": "done", "completed": 1, "failed": 0},
@@ -2315,11 +4439,67 @@ class TestRequestPolling:
                     "encoding": "base64",
                     "wire_format": "DSSST1",
                     "payload_b64": base64.b64encode(payload).decode("ascii"),
+                    "metrics": {"router_replay/tx_bytes_avg": 12.0},
                 },
             }
         )
         monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
-        assert c.poll_request("j1", "r1") == {"avg_loss": 0.5}
+        assert c.poll_request("j1", "r1") == {
+            "avg_loss": 0.5,
+            "metrics": {"router_replay/tx_bytes_avg": 12.0},
+        }
+
+    def test_poll_request_keeps_payload_metrics_when_envelope_has_none(self, monkeypatch):
+        from cortex_training import wire
+
+        payload = wire.dumps({"avg_loss": 0.5, "metrics": {"model/tokens": 8}})
+        c = _make_client(
+            get_json={
+                "status": "done",
+                "result": {
+                    "content_type": "application/octet-stream",
+                    "encoding": "base64",
+                    "wire_format": "DSSST1",
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                },
+            }
+        )
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        assert c.poll_request("j1", "r1") == {
+            "avg_loss": 0.5,
+            "metrics": {"model/tokens": 8},
+        }
+
+    def test_poll_request_envelope_metrics_win_on_key_collision(self, monkeypatch):
+        from cortex_training import wire
+
+        payload = wire.dumps(
+            {
+                "avg_loss": 0.5,
+                "metrics": {"model/tokens": 8, "shared/bytes": 1.0},
+            }
+        )
+        c = _make_client(
+            get_json={
+                "status": "done",
+                "result": {
+                    "content_type": "application/octet-stream",
+                    "encoding": "base64",
+                    "wire_format": "DSSST1",
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                    "metrics": {"router_replay/tx_bytes_avg": 12.0, "shared/bytes": 2.0},
+                },
+            }
+        )
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        assert c.poll_request("j1", "r1") == {
+            "avg_loss": 0.5,
+            "metrics": {
+                "model/tokens": 8,
+                "shared/bytes": 2.0,
+                "router_replay/tx_bytes_avg": 12.0,
+            },
+        }
 
     def test_poll_request_keeps_non_generate_dssst1_tensors(self, monkeypatch):
         from cortex_training import wire
@@ -2384,6 +4564,63 @@ class TestRequestPolling:
         }
         assert "r-generate" not in c._generate_request_ids
 
+    def test_poll_request_decodes_a_legacy_forward_result_envelope(self, monkeypatch):
+        from cortex_training import wire
+
+        payload = wire.dumps(
+            {"job_id": "j1", "logprobs": torch.tensor([0.25, -1.5], dtype=torch.float32)}
+        )
+        c = _make_client(
+            get_json={
+                "status": "done",
+                "result": {
+                    "job_id": "j1",
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                    "metrics": {"router_replay/tx_bytes_peak": 24.0},
+                },
+            }
+        )
+        c._forward_request_ids.add("r-forward")
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+
+        result = c.poll_request("j1", "r-forward")
+        assert torch.equal(result["logprobs"], torch.tensor([0.25, -1.5]))
+        assert result["metrics"] == {"router_replay/tx_bytes_peak": 24.0}
+        assert "r-forward" not in c._forward_request_ids
+
+    def test_poll_request_leaves_a_self_describing_forward_result_alone(self, monkeypatch):
+        from cortex_training import wire
+
+        payload = wire.dumps(
+            {"job_id": "j1", "logprobs": torch.tensor([0.5], dtype=torch.float32)}
+        )
+        c = _make_client(
+            get_json={
+                "status": "done",
+                "result": {
+                    "content_type": "application/octet-stream",
+                    "encoding": "base64",
+                    "wire_format": "DSSST1",
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                },
+            }
+        )
+        c._forward_request_ids.add("r-forward")
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+
+        result = c.poll_request("j1", "r-forward")
+        assert torch.equal(result["logprobs"], torch.tensor([0.5]))
+        assert "r-forward" not in c._forward_request_ids
+
+    def test_poll_request_forgets_a_forward_id_on_failure(self, monkeypatch):
+        c = _make_client(get_json={"status": "failed", "error": "boom"})
+        c._forward_request_ids.add("r-forward")
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            c.poll_request("j1", "r-forward")
+        assert "r-forward" not in c._forward_request_ids
+
     def test_poll_request_decodes_chunked_dssst1_result(self, monkeypatch):
         from cortex_training import wire
 
@@ -2398,14 +4635,23 @@ class TestRequestPolling:
             }
             body = {"status": "running", "events": [event], "next_cursor": str(idx + 1)}
             if idx == len(chunks) - 1:
-                body = {"status": "done", "events": [event]}
+                body = {
+                    "status": "done",
+                    "events": [event],
+                    "result": {
+                        "metrics": {"router_replay/tx_max_bytes": 4096.0},
+                    },
+                }
             responses.append(_make_response(body))
 
         c = _make_client()
         c._session.get.side_effect = responses
         monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
 
-        assert c.poll_request("j1", "r1") == {"text": "x" * 20_000}
+        assert c.poll_request("j1", "r1") == {
+            "text": "x" * 20_000,
+            "metrics": {"router_replay/tx_max_bytes": 4096.0},
+        }
         assert c._session.get.call_args_list[1].kwargs["params"] == {"cursor": "1"}
 
     def test_poll_request_failed(self, monkeypatch):
@@ -2553,11 +4799,14 @@ class TestEvents:
 
 class TestExecutionLogDownload:
     class FakeArtifactConnection:
-        def __init__(self, list_rows=None, content_by_uri=None):
+        def __init__(self, list_rows=None, content_by_uri=None, on_get=None):
             self.list_rows = list_rows or {}
             self.content_by_uri = content_by_uri or {}
             self.commands = []
             self.closed = False
+            self.close_count = 0
+            self.on_get = on_get
+            self.raise_on_close = False
 
         class Cursor:
             def __init__(self, connection):
@@ -2581,6 +4830,8 @@ class TestExecutionLogDownload:
                     target = Path(unquote(urlparse(target_uri).path))
                     target.mkdir(parents=True, exist_ok=True)
                     assert not list(target.iterdir())
+                    if self.connection.on_get is not None:
+                        self.connection.on_get(source)
                     (target / PurePosixPath(source).name).write_bytes(
                         self.connection.content_by_uri[source]
                     )
@@ -2599,7 +4850,10 @@ class TestExecutionLogDownload:
             return self.Cursor(self)
 
         def close(self):
+            self.close_count += 1
             self.closed = True
+            if self.raise_on_close:
+                raise RuntimeError("close failed")
 
     def test_sql_literal_and_artifact_path_validation(self):
         assert nc._sql_string_literal("snow://exp/O'Brien") == "'snow://exp/O''Brien'"
@@ -2608,9 +4862,58 @@ class TestExecutionLogDownload:
             with pytest.raises(ValueError, match="unsafe"):
                 nc._validate_artifact_relative_path(path)
 
-    def test_artifact_connection_requires_pat_client(self):
-        with pytest.raises(RuntimeError, match="PAT-authenticated"):
+    def test_artifact_connection_requires_snowflake_client(self):
+        with pytest.raises(RuntimeError, match="Snowflake-authenticated"):
             _make_client()._open_experiment_artifact_connection()
+
+    def test_artifact_connection_uses_profile_factory(self):
+        c = _make_client()
+        connected = object()
+        c._artifact_connection_factory = MagicMock(return_value=connected)
+
+        assert c._open_experiment_artifact_connection() is connected
+        c._artifact_connection_factory.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        ("host", "account"),
+        [
+            ("locatorhost.snowflakecomputing.com", "locatorhost"),
+            ("myorg-myaccount.snowflakecomputing.com", "myorg-myaccount"),
+            ("account.qa6.us-west-2.aws.snowflakecomputing.com", "account"),
+            ("testaccount-12345.global.snowflakecomputing.com", "testaccount"),
+        ],
+    )
+    def test_connection_kwargs_use_pat_host_as_account(self, monkeypatch, host, account):
+        monkeypatch.setenv(nc.DISABLE_TELEMETRY_ENV, "1")
+        c = CortexTrainingClient.from_pat(
+            host=host,
+            pat="tok-xyz",
+            database="DB",
+            schema="SCH",
+        )
+        identity_queries = []
+
+        def identity(statement):
+            identity_queries.append(statement)
+            return ["USER1", "ROLE1"]
+
+        monkeypatch.setattr(c, "_query_sql_row", identity)
+        kwargs = c._snowflake_connection_kwargs()
+        assert identity_queries == ["SELECT CURRENT_USER(), CURRENT_ROLE()"]
+        assert importlib.import_module("snowflake.connector.util_text").parse_account(host) == account
+        assert kwargs["host"] == host
+        assert kwargs["account"] == host
+        assert kwargs["user"] == "USER1"
+        assert kwargs["role"] == "ROLE1"
+        assert kwargs["authenticator"] == "PROGRAMMATIC_ACCESS_TOKEN"
+        assert kwargs["token"] == "tok-xyz"
+
+        connector = importlib.import_module("snowflake.connector")
+        connected = object()
+        connect = MagicMock(return_value=connected)
+        monkeypatch.setattr(connector, "connect", connect)
+        assert c._open_experiment_artifact_connection() is connected
+        connect.assert_called_once_with(**kwargs)
 
     def test_get_experiment_run_calls_endpoint(self):
         c = _make_client(
@@ -2815,7 +5118,1130 @@ class TestExecutionLogDownload:
         assert not any(command.startswith("GET ") for command in connection.commands)
         assert connection.closed
 
+    def _gzip_download(self, monkeypatch, tmp_path, artifact_name, listed, bodies):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        root = f"_{artifact_name}"
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + root + "/": [(f"/versions/RUN_ABC/{path}",) for path in listed],
+                run_uri + "checkpoints/" + root + "/": [],
+            },
+            {run_uri + path: gzip.compress(body) for path, body in bodies.items()},
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
+        return c, connection, run_uri
+
+    @pytest.mark.parametrize(
+        ("artifact_name", "chunk_name", "destination_name", "method_name"),
+        [
+            ("stdout", "console", "stdout.log", "download_stdout_logs"),
+            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+        ],
+    )
+    def test_download_resume_appends_suffix_and_writes_manifest(
+        self, artifact_name, chunk_name, destination_name, method_name, tmp_path, monkeypatch
+    ):
+        root = f"_{artifact_name}"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/{chunk_name}.20260904-120001.first.gz"
+        later = f"{root}/{sub}/{chunk_name}.20260904-120002.zulu.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch, tmp_path, artifact_name, [first], {first: b"first\n"}
+        )
+        download = getattr(c, method_name)
+        download("job-1", tmp_path)
+        destination = tmp_path / sub / destination_name
+        manifest = destination.with_name("." + destination.name + ".manifest.json")
+        assert json.loads(manifest.read_text())["names"] == [first]
+        gets_before = [cmd for cmd in connection.commands if cmd.startswith("GET ")]
+        connection.list_rows[run_uri + root + "/"] = [
+            (f"/versions/RUN_ABC/{first}",),
+            (f"/versions/RUN_ABC/{later}",),
+        ]
+        connection.content_by_uri[run_uri + later] = gzip.compress(b"second\n")
+        result = download("job-1", tmp_path, resume=True)
+        new_gets = [cmd for cmd in connection.commands if cmd.startswith("GET ")][len(gets_before) :]
+        assert len(new_gets) == 1
+        assert later in new_gets[0]
+        assert destination.read_bytes() == b"first\nsecond\n"
+        assert result[0]["chunk_count"] == 2
+        assert result[0]["first_artifact_uri"] == run_uri + first
+        assert result[0]["last_artifact_uri"] == run_uri + later
+
+    @pytest.mark.parametrize(
+        ("artifact_name", "chunk_name", "destination_name", "method_name"),
+        [
+            ("stdout", "console", "stdout.log", "download_stdout_logs"),
+            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+        ],
+    )
+    def test_download_resume_rebuilds_when_new_name_sorts_earlier(
+        self, artifact_name, chunk_name, destination_name, method_name, tmp_path, monkeypatch
+    ):
+        root = f"_{artifact_name}"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/{chunk_name}.20260904-120001.first.gz"
+        zulu = f"{root}/{sub}/{chunk_name}.20260904-120002.zulu.gz"
+        alpha = f"{root}/{sub}/{chunk_name}.20260904-120002.alpha.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch,
+            tmp_path,
+            artifact_name,
+            [first, zulu],
+            {first: b"first\n", zulu: b"third\n"},
+        )
+        download = getattr(c, method_name)
+        download("job-1", tmp_path)
+        connection.list_rows[run_uri + root + "/"].append((f"/versions/RUN_ABC/{alpha}",))
+        connection.content_by_uri[run_uri + alpha] = gzip.compress(b"second\n")
+        download("job-1", tmp_path, resume=True)
+        destination = tmp_path / sub / destination_name
+        assert destination.read_bytes() == b"first\nsecond\nthird\n"
+
+    @pytest.mark.parametrize(
+        ("artifact_name", "chunk_name", "destination_name", "method_name"),
+        [
+            ("stdout", "console", "stdout.log", "download_stdout_logs"),
+            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+        ],
+    )
+    def test_download_resume_truncates_torn_tail(
+        self, artifact_name, chunk_name, destination_name, method_name, tmp_path, monkeypatch
+    ):
+        root = f"_{artifact_name}"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/{chunk_name}.20260904-120001.first.gz"
+        c, connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, artifact_name, [first], {first: b"first\n"}
+        )
+        download = getattr(c, method_name)
+        download("job-1", tmp_path)
+        destination = tmp_path / sub / destination_name
+        committed = destination.read_bytes()
+        destination.write_bytes(committed + b"TORN")
+        gets_before = [cmd for cmd in connection.commands if cmd.startswith("GET ")]
+        download("job-1", tmp_path, resume=True)
+        assert destination.read_bytes() == committed
+        assert [cmd for cmd in connection.commands if cmd.startswith("GET ")] == gets_before
+
+    @pytest.mark.parametrize("manifest_setup", ["missing", "malformed", "version", "short"])
+    def test_download_resume_unusable_manifest_rebuilds(self, manifest_setup, tmp_path, monkeypatch):
+        root = "_stdout"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/console.20260904-120001.first.gz"
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [first], {first: b"first\n"}
+        )
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / sub / "stdout.log"
+        manifest = destination.with_name(".stdout.log.manifest.json")
+        if manifest_setup == "missing":
+            manifest.unlink()
+        elif manifest_setup == "malformed":
+            manifest.write_text("not-json", encoding="utf-8")
+        elif manifest_setup == "version":
+            doc = json.loads(manifest.read_text())
+            doc["version"] = 2
+            manifest.write_text(json.dumps(doc), encoding="utf-8")
+        else:
+            destination.write_bytes(b"x")
+        c.download_stdout_logs("job-1", tmp_path, resume=True)
+        assert destination.read_bytes() == b"first\n"
+        assert json.loads(manifest.read_text())["version"] == 1
+
+    def test_download_resume_rebuilds_when_manifest_was_removed(self, tmp_path, monkeypatch):
+        root = "_stdout"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/console.20260904-120001.first.gz"
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [first], {first: b"first\n"}
+        )
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / sub / "stdout.log"
+        destination.with_name(".stdout.log.manifest.json").unlink()
+        destination.write_bytes(b"replaced\n")
+        c.download_stdout_logs("job-1", tmp_path, resume=True)
+        assert destination.read_bytes() == b"first\n"
+
+    def test_download_resume_failed_chunk_keeps_prefix(self, tmp_path, monkeypatch):
+        root = "_stdout"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/console.20260904-120001.first.gz"
+        bad = f"{root}/{sub}/console.20260904-120002.bad.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [first], {first: b"first\n"}
+        )
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / sub / "stdout.log"
+        connection.list_rows[run_uri + root + "/"].append((f"/versions/RUN_ABC/{bad}",))
+        connection.content_by_uri[run_uri + bad] = b"not gzip"
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_stdout_logs("job-1", tmp_path, resume=True)
+        assert destination.read_bytes() == b"first\n"
+        manifest = json.loads(destination.with_name(".stdout.log.manifest.json").read_text())
+        assert manifest["names"] == [first]
+
+    def test_download_resume_keeps_committed_sub_job_when_later_one_fails(
+        self, tmp_path, monkeypatch
+    ):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        first_sub = "job-1:training:0"
+        second_sub = "job-1:training:1"
+        good = f"_stdout/{first_sub}/console.20260904-120001.first.gz"
+        bad = f"_stdout/{second_sub}/console.20260904-120001.bad.gz"
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + "_stdout/": [
+                    (f"/versions/RUN_ABC/{good}",),
+                    (f"/versions/RUN_ABC/{bad}",),
+                ],
+                run_uri + "checkpoints/_stdout/": [],
+            },
+            {run_uri + good: gzip.compress(b"ok\n"), run_uri + bad: b"not gzip"},
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_stdout_logs("job-1", tmp_path)
+        committed = tmp_path / first_sub / "stdout.log"
+        assert committed.read_bytes() == b"ok\n"
+        connection.content_by_uri[run_uri + bad] = gzip.compress(b"later\n")
+        gets_before = [cmd for cmd in connection.commands if cmd.startswith("GET ") and good in cmd]
+        c.download_stdout_logs("job-1", tmp_path, resume=True)
+        gets_after = [cmd for cmd in connection.commands if cmd.startswith("GET ") and good in cmd]
+        assert gets_after == gets_before
+        assert (tmp_path / second_sub / "stdout.log").read_bytes() == b"later\n"
+
+    def _parallel_stdout(self, monkeypatch, count, *, bodies=None, on_get=None):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        sub = "job-1:training:0"
+        paths = [
+            f"_stdout/{sub}/console.20260904-{index:06d}.part.gz"
+            for index in range(count)
+        ]
+        if bodies is None:
+            bodies = {
+                run_uri + path: gzip.compress(f"{index}\n".encode())
+                for index, path in enumerate(paths)
+            }
+        list_rows = {
+            run_uri + "_stdout/": [(f"/versions/RUN_ABC/{path}",) for path in paths],
+            run_uri + "checkpoints/_stdout/": [],
+        }
+        opened = []
+
+        def opener():
+            conn = self.FakeArtifactConnection(list_rows, bodies, on_get=on_get)
+            opened.append(conn)
+            return conn
+
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        monkeypatch.setattr(nc, "_ARTIFACT_GET_MIN_CHUNKS", 2)
+        return c, opened, run_uri, paths
+
+    def test_parallel_download_overlaps_and_keeps_sorted_order(
+        self, tmp_path, monkeypatch
+    ):
+        started = {"n": 0}
+        lock = threading.Lock()
+        released = {}
+        workers = nc._ARTIFACT_GET_WORKERS
+
+        def note_release():
+            released["n"] = started["n"]
+
+        barrier = threading.Barrier(workers, action=note_release, timeout=5)
+
+        def on_get(_source):
+            with lock:
+                started["n"] += 1
+                current = started["n"]
+            if current <= workers:
+                barrier.wait()
+
+        c, opened, _run_uri, _paths = self._parallel_stdout(
+            monkeypatch, 20, on_get=on_get
+        )
+        c.download_stdout_logs("job-1", tmp_path)
+        assert released["n"] == workers
+        expected = b"".join(f"{index}\n".encode() for index in range(20))
+        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == expected
+        assert len(opened) == workers
+        assert [conn.close_count for conn in opened] == [1] * workers
+
+    def test_parallel_progress_reports_on_caller_after_each_copy(
+        self, tmp_path, monkeypatch
+    ):
+        c, opened, _run_uri, _paths = self._parallel_stdout(monkeypatch, 20)
+        sub = "job-1:training:0"
+        caller = threading.get_ident()
+        copied = []
+        real_copy = c._copy_gzip_member
+
+        def copy(downloaded, output):
+            real_copy(downloaded, output)
+            copied.append(output.tell())
+
+        c._copy_gzip_member = copy
+        calls = []
+
+        def progress(message):
+            assert threading.get_ident() == caller
+            calls.append(message)
+            if message == "\n":
+                return
+            done = int(message.split("] ", 1)[1].split("/", 1)[0])
+            assert len(copied) == done
+
+        c.download_stdout_logs("job-1", tmp_path, progress=progress)
+        assert len(opened) > 1
+        status = c._artifact_progress_status
+        assert calls == [status("stdout", index, 20, sub) for index in range(21)] + ["\n"]
+        expected = b"".join(f"{index}\n".encode() for index in range(20))
+        assert (tmp_path / sub / "stdout.log").read_bytes() == expected
+
+    def test_parallel_progress_callback_error_cleans_up(self, tmp_path, monkeypatch):
+        c, opened, run_uri, paths = self._parallel_stdout(monkeypatch, 4)
+        sub = "job-1:training:0"
+        destination = tmp_path / sub / "stdout.log"
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"previous\n")
+        calls = []
+
+        def stop(message):
+            calls.append(message)
+            if " 2/" in message:
+                raise RuntimeError("stop")
+
+        with pytest.raises(RuntimeError, match="stop"):
+            c.download_stdout_logs("job-1", tmp_path, progress=stop)
+        assert calls[-1] == "\n"
+        assert destination.read_bytes() == b"previous\n"
+        assert not list(destination.parent.glob(".*.tmp"))
+        assert [conn.close_count for conn in opened] == [1] * len(opened)
+
+        c.download_stdout_logs("job-1", tmp_path)
+        committed = destination.read_bytes()
+        manifest = destination.with_name(".stdout.log.manifest.json")
+        manifest_before = manifest.read_text(encoding="utf-8")
+        listed = opened[0].list_rows[run_uri + "_stdout/"]
+        for index in range(4):
+            path = f"_stdout/{sub}/console.20260904-{index + 4:06d}.part.gz"
+            listed.append((f"/versions/RUN_ABC/{path}",))
+            opened[0].content_by_uri[run_uri + path] = gzip.compress(
+                f"{index + 4}\n".encode()
+            )
+        before = len(opened)
+        calls.clear()
+        with pytest.raises(RuntimeError, match="stop"):
+            c.download_stdout_logs("job-1", tmp_path, resume=True, progress=stop)
+        assert calls[0] == c._artifact_progress_status("stdout", 0, 4, sub)
+        assert calls[-1] == "\n"
+        assert destination.read_bytes() == committed
+        assert manifest.read_text(encoding="utf-8") == manifest_before
+        resume_connections = opened[before:]
+        assert resume_connections
+        assert [conn.close_count for conn in resume_connections] == [1] * len(resume_connections)
+
+    def test_parallel_download_stays_serial_when_opener_returns_one_connection(
+        self, tmp_path, monkeypatch
+    ):
+        inflight = {"n": 0, "max": 0}
+        lock = threading.Lock()
+
+        def on_get(source):
+            with lock:
+                inflight["n"] += 1
+                inflight["max"] = max(inflight["max"], inflight["n"])
+            try:
+                if source.endswith("000000.part.gz"):
+                    time.sleep(0.2)
+            finally:
+                with lock:
+                    inflight["n"] -= 1
+
+        c, _opened, _run_uri, paths = self._parallel_stdout(
+            monkeypatch, 4, on_get=on_get
+        )
+        primary = self.FakeArtifactConnection(
+            {
+                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
+                    (f"/versions/RUN_ABC/{path}",) for path in paths
+                ],
+                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
+            },
+            {
+                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
+                    f"{index}\n".encode()
+                )
+                for index, path in enumerate(paths)
+            },
+            on_get=on_get,
+        )
+        monkeypatch.setattr(
+            c, "_open_experiment_artifact_connection", lambda: primary
+        )
+        c.download_stdout_logs("job-1", tmp_path)
+        assert inflight["max"] == 1
+        assert primary.close_count == 1
+        assert primary.closed
+        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n3\n"
+
+    def test_parallel_get_failure_keeps_previous_file(self, tmp_path, monkeypatch):
+        def on_get(source):
+            if source.endswith("000001.part.gz"):
+                raise RuntimeError("get failed")
+
+        c, opened, _run_uri, _paths = self._parallel_stdout(
+            monkeypatch, 4, on_get=on_get
+        )
+        destination = tmp_path / "job-1:training:0" / "stdout.log"
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"previous\n")
+        with pytest.raises(RuntimeError, match="get failed"):
+            c.download_stdout_logs("job-1", tmp_path)
+        assert destination.read_bytes() == b"previous\n"
+        assert opened
+        assert [conn.close_count for conn in opened] == [1] * len(opened)
+
+    def test_parallel_bad_gzip_on_resume_keeps_committed_prefix(
+        self, tmp_path, monkeypatch
+    ):
+        c, opened, run_uri, paths = self._parallel_stdout(monkeypatch, 1)
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / "job-1:training:0" / "stdout.log"
+        committed = destination.read_bytes()
+        manifest = destination.with_name(".stdout.log.manifest.json")
+        names = json.loads(manifest.read_text())["names"]
+        later = [
+            f"_stdout/job-1:training:0/console.20260904-{index:06d}.part.gz"
+            for index in (1, 2)
+        ]
+        bodies = opened[0].content_by_uri
+        bodies[run_uri + later[0]] = gzip.compress(b"new\n")
+        bodies[run_uri + later[1]] = b"not gzip"
+        listed = opened[0].list_rows[run_uri + "_stdout/"]
+        listed.extend((f"/versions/RUN_ABC/{path}",) for path in later)
+        resume_opened = []
+
+        def opener():
+            conn = self.FakeArtifactConnection(
+                opened[0].list_rows, bodies
+            )
+            resume_opened.append(conn)
+            return conn
+
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_stdout_logs("job-1", tmp_path, resume=True)
+        assert destination.read_bytes() == committed
+        assert json.loads(manifest.read_text())["names"] == names
+        assert len(resume_opened) > 1
+        assert [conn.close_count for conn in resume_opened] == [1] * len(resume_opened)
+
+    def test_parallel_download_continues_when_a_later_session_open_fails(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        c, _opened, _run_uri, paths = self._parallel_stdout(monkeypatch, 3)
+        created = []
+
+        def opener():
+            if len(created) >= 2:
+                raise RuntimeError("open failed")
+            conn = self.FakeArtifactConnection(
+                {
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
+                        (f"/versions/RUN_ABC/{path}",) for path in paths
+                    ],
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
+                },
+                {
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
+                        f"{index}\n".encode()
+                    )
+                    for index, path in enumerate(paths)
+                },
+            )
+            created.append(conn)
+            return conn
+
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        with caplog.at_level(logging.WARNING, logger=nc.__name__):
+            c.download_stdout_logs("job-1", tmp_path)
+        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n"
+        assert len(created) == 2
+        assert [conn.close_count for conn in created] == [1, 1]
+
+    def test_parallel_download_warns_when_the_first_extra_session_fails(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        c, _opened, _run_uri, paths = self._parallel_stdout(monkeypatch, 3)
+        primary = self.FakeArtifactConnection(
+            {
+                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
+                    (f"/versions/RUN_ABC/{path}",) for path in paths
+                ],
+                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
+            },
+            {
+                "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
+                    f"{index}\n".encode()
+                )
+                for index, path in enumerate(paths)
+            },
+        )
+        calls = {"n": 0}
+
+        def opener():
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("open failed")
+            return primary
+
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        with caplog.at_level(logging.WARNING, logger=nc.__name__):
+            c.download_stdout_logs("job-1", tmp_path)
+        assert any(
+            "could not open an extra session" in record.message
+            for record in caplog.records
+        )
+        assert primary.close_count == 1
+        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n"
+
+    def test_parallel_close_failure_does_not_fail_the_download(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        c, _opened, _run_uri, paths = self._parallel_stdout(monkeypatch, 3)
+        created = []
+
+        def opener():
+            conn = self.FakeArtifactConnection(
+                {
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
+                        (f"/versions/RUN_ABC/{path}",) for path in paths
+                    ],
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
+                },
+                {
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
+                        f"{index}\n".encode()
+                    )
+                    for index, path in enumerate(paths)
+                },
+            )
+            if len(created) == 1:
+                conn.raise_on_close = True
+            created.append(conn)
+            return conn
+
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        with caplog.at_level(logging.WARNING, logger=nc.__name__):
+            c.download_stdout_logs("job-1", tmp_path)
+        assert (tmp_path / "job-1:training:0" / "stdout.log").read_bytes() == b"0\n1\n2\n"
+        assert [conn.close_count for conn in created] == [1, 1, 1]
+        assert any("failed to close" in record.message for record in caplog.records)
+
+    def test_parallel_get_error_survives_a_close_error(self, tmp_path, monkeypatch):
+        def on_get(source):
+            if source.endswith("000001.part.gz"):
+                raise RuntimeError("get failed")
+
+        c, _opened, _run_uri, paths = self._parallel_stdout(
+            monkeypatch, 3, on_get=on_get
+        )
+        created = []
+
+        def opener():
+            conn = self.FakeArtifactConnection(
+                {
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/_stdout/": [
+                        (f"/versions/RUN_ABC/{path}",) for path in paths
+                    ],
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/checkpoints/_stdout/": [],
+                },
+                {
+                    "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/" + path: gzip.compress(
+                        f"{index}\n".encode()
+                    )
+                    for index, path in enumerate(paths)
+                },
+                on_get=on_get,
+            )
+            if created:
+                conn.raise_on_close = True
+            created.append(conn)
+            return conn
+
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", opener)
+        with pytest.raises(RuntimeError, match="get failed"):
+            c.download_stdout_logs("job-1", tmp_path)
+        assert [conn.close_count for conn in created] == [1] * len(created)
+
     def test_fetch_execution_logs_errors_when_experiment_run_missing_fields(self):
         c = _make_client(get_json={"experiment_name": "DB.SCH.EXP"})
         with pytest.raises(ValueError, match="experiment_run_name"):
             c.fetch_execution_logs("job-1")
+
+    @pytest.mark.parametrize(
+        ("artifact_name", "chunk_name", "destination_name", "method_name"),
+        [
+            ("stdout", "console", "stdout.log", "download_stdout_logs"),
+            ("metrics", "gpu", "gpu.jsonl", "download_metrics"),
+        ],
+    )
+    def test_download_progress_reports_each_chunk(
+        self, artifact_name, chunk_name, destination_name, method_name, tmp_path, monkeypatch
+    ):
+        root = f"_{artifact_name}"
+        sub = "job-1:training:0"
+        paths = [
+            f"{root}/{sub}/{chunk_name}.20260904-120001.a.gz",
+            f"{root}/{sub}/{chunk_name}.20260904-120002.b.gz",
+            f"{root}/{sub}/{chunk_name}.20260904-120003.c.gz",
+        ]
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch,
+            tmp_path,
+            artifact_name,
+            paths,
+            {paths[0]: b"a\n", paths[1]: b"b\n", paths[2]: b"c\n"},
+        )
+        calls = []
+        getattr(c, method_name)("job-1", tmp_path, progress=calls.append)
+        quiet = getattr(c, method_name)("job-1", tmp_path / "quiet")
+        assert quiet[0]["chunk_count"] == 3
+        status = c._artifact_progress_status
+        assert calls == [
+            status(artifact_name, 0, 3, sub),
+            status(artifact_name, 1, 3, sub),
+            status(artifact_name, 2, 3, sub),
+            status(artifact_name, 3, 3, sub),
+            "\n",
+        ]
+        assert (tmp_path / sub / destination_name).read_bytes() == (
+            tmp_path / "quiet" / sub / destination_name
+        ).read_bytes()
+
+    def test_download_progress_two_sub_jobs(self, tmp_path, monkeypatch):
+        c = _make_client()
+        run_uri = "snow://experiment/DB.SCH.EXP/versions/RUN_ABC/"
+        first = "_stdout/job-1:training:0/console.20260904-120001.a.gz"
+        second = "_stdout/job-1:training:1/console.20260904-120001.a.gz"
+        connection = self.FakeArtifactConnection(
+            {
+                run_uri + "_stdout/": [
+                    (f"/versions/RUN_ABC/{first}",),
+                    (f"/versions/RUN_ABC/{second}",),
+                ],
+                run_uri + "checkpoints/_stdout/": [],
+            },
+            {
+                run_uri + first: gzip.compress(b"one\n"),
+                run_uri + second: gzip.compress(b"two\n"),
+            },
+        )
+        monkeypatch.setattr(c, "_experiment_run_uri", lambda _: (run_uri, "RUN_ABC"))
+        monkeypatch.setattr(c, "_open_experiment_artifact_connection", lambda: connection)
+        calls = []
+        c.download_stdout_logs("job-1", tmp_path, progress=calls.append)
+        status = c._artifact_progress_status
+        assert calls == [
+            status("stdout", 0, 1, "job-1:training:0"),
+            status("stdout", 1, 1, "job-1:training:0"),
+            "\n",
+            status("stdout", 0, 1, "job-1:training:1"),
+            status("stdout", 1, 1, "job-1:training:1"),
+            "\n",
+        ]
+
+    def test_download_progress_status_format(self):
+        status = CortexTrainingClient._artifact_progress_status
+        assert status("metrics", 0, 3, "job:s:0") == (
+            "metrics: [--------------------] 0/3 job:s:0"
+        )
+        assert status("metrics", 1, 3, "job:s:0") == (
+            "metrics: [######--------------] 1/3 job:s:0"
+        )
+        assert status("metrics", 3, 3, "job:s:0") == (
+            "metrics: [####################] 3/3 job:s:0"
+        )
+
+    def test_download_progress_resume_counts_new_chunks_only(self, tmp_path, monkeypatch):
+        root = "_metrics"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/gpu.20260904-120001.a.gz"
+        second = f"{root}/{sub}/gpu.20260904-120002.b.gz"
+        third = f"{root}/{sub}/gpu.20260904-120003.c.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "metrics", [first], {first: b"a\n"}
+        )
+        c.download_metrics("job-1", tmp_path)
+        connection.list_rows[run_uri + root + "/"] = [
+            (f"/versions/RUN_ABC/{path}",) for path in (first, second, third)
+        ]
+        connection.content_by_uri[run_uri + second] = gzip.compress(b"b\n")
+        connection.content_by_uri[run_uri + third] = gzip.compress(b"c\n")
+        calls = []
+        c.download_metrics("job-1", tmp_path, resume=True, progress=calls.append)
+        status = c._artifact_progress_status
+        assert calls == [
+            status("metrics", 0, 2, sub),
+            status("metrics", 1, 2, sub),
+            status("metrics", 2, 2, sub),
+            "\n",
+        ]
+
+    def test_download_progress_resume_nothing_new(self, tmp_path, monkeypatch):
+        root = "_stdout"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/console.20260904-120001.a.gz"
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [first], {first: b"first\n"}
+        )
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / sub / "stdout.log"
+        committed = destination.read_bytes()
+        calls = []
+        c.download_stdout_logs("job-1", tmp_path, resume=True, progress=calls.append)
+        assert calls == [f"stdout: no new chunks for {sub}\n"]
+        assert destination.read_bytes() == committed
+        destination.write_bytes(committed + b"TORN")
+        calls.clear()
+        c.download_stdout_logs("job-1", tmp_path, resume=True, progress=calls.append)
+        assert calls == [f"stdout: no new chunks for {sub}\n"]
+        assert destination.read_bytes() == committed
+
+    def test_download_progress_callback_error_skips_side_effects(self, tmp_path, monkeypatch):
+        root = "_stdout"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/console.20260904-120001.a.gz"
+        second = f"{root}/{sub}/console.20260904-120002.b.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [first], {first: b"first\n"}
+        )
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / sub / "stdout.log"
+        committed = destination.read_bytes()
+        destination.write_bytes(committed + b"TORN")
+
+        calls = []
+
+        def stop(message):
+            calls.append(message)
+            raise RuntimeError("stop")
+
+        with pytest.raises(RuntimeError, match="stop"):
+            c.download_stdout_logs("job-1", tmp_path / "fresh", progress=stop)
+        assert calls == [c._artifact_progress_status("stdout", 0, 1, sub), "\n"]
+        assert not (tmp_path / "fresh" / sub).exists()
+
+        connection.list_rows[run_uri + root + "/"].append((f"/versions/RUN_ABC/{second}",))
+        connection.content_by_uri[run_uri + second] = gzip.compress(b"second\n")
+        with pytest.raises(RuntimeError, match="stop"):
+            c.download_stdout_logs("job-1", tmp_path, resume=True, progress=stop)
+        assert destination.read_bytes() == committed + b"TORN"
+
+        connection.list_rows[run_uri + root + "/"] = [(f"/versions/RUN_ABC/{first}",)]
+        with pytest.raises(RuntimeError, match="stop"):
+            c.download_stdout_logs("job-1", tmp_path, resume=True, progress=stop)
+        assert destination.read_bytes() == committed + b"TORN"
+
+    def test_download_progress_chunk_failure_and_callback_failure(self, tmp_path, monkeypatch):
+        root = "_metrics"
+        sub = "job-1:training:0"
+        names = [
+            f"{root}/{sub}/gpu.20260904-12000{index}.c.gz" for index in (1, 2, 3)
+        ]
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch,
+            tmp_path,
+            "metrics",
+            names[:1],
+            {names[0]: b"a\n"},
+        )
+        c.download_metrics("job-1", tmp_path)
+        destination = tmp_path / sub / "gpu.jsonl"
+        committed = destination.read_bytes()
+        connection.list_rows[run_uri + root + "/"] = [
+            (f"/versions/RUN_ABC/{path}",) for path in names
+        ]
+        connection.content_by_uri[run_uri + names[1]] = gzip.compress(b"b\n")
+        connection.content_by_uri[run_uri + names[2]] = b"not gzip"
+        calls = []
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_metrics("job-1", tmp_path, resume=True, progress=calls.append)
+        assert c._artifact_progress_status("metrics", 1, 2, sub) in calls
+        assert c._artifact_progress_status("metrics", 2, 2, sub) not in calls
+        assert calls[-1] == "\n"
+        assert destination.read_bytes() == committed
+
+        connection.content_by_uri[run_uri + names[2]] = gzip.compress(b"c\n")
+
+        def stop_on_second(message):
+            calls.append(message)
+            if " 2/" in message:
+                raise RuntimeError("stop")
+
+        calls.clear()
+        with pytest.raises(RuntimeError, match="stop"):
+            c.download_metrics("job-1", tmp_path, resume=True, progress=stop_on_second)
+        assert calls[-1] == "\n"
+        assert destination.read_bytes() == committed
+
+        fresh = tmp_path / "fresh"
+        calls.clear()
+        with pytest.raises(RuntimeError, match="stop"):
+            c.download_metrics("job-1", fresh, progress=stop_on_second)
+        assert calls[-1] == "\n"
+        assert not list((fresh / sub).glob(".*.tmp"))
+        assert not (fresh / sub / "gpu.jsonl").exists()
+
+    def test_download_progress_setup_failures_close_line(self, tmp_path, monkeypatch):
+        root = "_stdout"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/console.20260904-120001.a.gz"
+        second = f"{root}/{sub}/console.20260904-120002.b.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [first], {first: b"first\n"}
+        )
+        not_a_dir = tmp_path / "file"
+        not_a_dir.write_text("x")
+        calls = []
+        with pytest.raises(OSError):
+            c.download_stdout_logs("job-1", not_a_dir, progress=calls.append)
+        assert calls == [c._artifact_progress_status("stdout", 0, 1, sub), "\n"]
+
+        if os.geteuid() == 0:
+            pytest.skip("root ignores the read-only destination")
+        c.download_stdout_logs("job-1", tmp_path)
+        destination = tmp_path / sub / "stdout.log"
+        manifest = destination.with_name(".stdout.log.manifest.json")
+        before = manifest.read_text(encoding="utf-8")
+        connection.list_rows[run_uri + root + "/"].append((f"/versions/RUN_ABC/{second}",))
+        connection.content_by_uri[run_uri + second] = gzip.compress(b"second\n")
+        destination.chmod(0o444)
+        calls.clear()
+        try:
+            with pytest.raises(PermissionError):
+                c.download_stdout_logs("job-1", tmp_path, resume=True, progress=calls.append)
+        finally:
+            destination.chmod(0o644)
+        assert calls == [c._artifact_progress_status("stdout", 0, 1, sub), "\n"]
+        assert manifest.read_text(encoding="utf-8") == before
+        assert destination.read_bytes() == b"first\n"
+
+    def test_download_progress_success_newline_error_keeps_commit(self, tmp_path, monkeypatch):
+        root = "_metrics"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/gpu.20260904-120001.a.gz"
+        second = f"{root}/{sub}/gpu.20260904-120002.b.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "metrics", [first], {first: b"a\n"}
+        )
+
+        destination = tmp_path / sub / "gpu.jsonl"
+        manifest = destination.with_name(".gpu.jsonl.manifest.json")
+        seen = []
+
+        def fail_on_newline(message):
+            if message == "\n":
+                seen.append(json.loads(manifest.read_text(encoding="utf-8"))["names"])
+                raise RuntimeError("newline")
+
+        with pytest.raises(RuntimeError, match="newline"):
+            c.download_metrics("job-1", tmp_path, progress=fail_on_newline)
+        assert seen == [[first]]
+        assert destination.read_bytes() == b"a\n"
+        assert json.loads(manifest.read_text(encoding="utf-8"))["names"] == [first]
+
+        connection.list_rows[run_uri + root + "/"].append((f"/versions/RUN_ABC/{second}",))
+        connection.content_by_uri[run_uri + second] = gzip.compress(b"b\n")
+        with pytest.raises(RuntimeError, match="newline"):
+            c.download_metrics("job-1", tmp_path, resume=True, progress=fail_on_newline)
+        assert seen == [[first], [first, second]]
+        assert destination.read_bytes() == b"a\nb\n"
+        assert json.loads(manifest.read_text(encoding="utf-8"))["names"] == [first, second]
+        calls = []
+        c.download_metrics("job-1", tmp_path, resume=True, progress=calls.append)
+        assert calls == [f"metrics: no new chunks for {sub}\n"]
+
+    @pytest.mark.parametrize("newline_error", [RuntimeError, KeyboardInterrupt])
+    def test_download_progress_failure_newline_error_keeps_download_error(
+        self, newline_error, tmp_path, monkeypatch
+    ):
+        root = "_stdout"
+        sub = "job-1:training:0"
+        good = f"{root}/{sub}/console.20260904-120001.a.gz"
+        later = f"{root}/{sub}/console.20260904-120002.b.gz"
+        bad = f"{root}/{sub}/console.20260904-120003.c.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [good], {good: b"good\n"}
+        )
+        destination = tmp_path / sub / "stdout.log"
+        fresh = tmp_path / "fresh"
+        seen = []
+
+        def fail_on_newline(message):
+            if message == "\n":
+                fresh_temps = list((fresh / sub).glob(".*.tmp"))
+                seen.append((destination.read_bytes(), fresh_temps))
+                raise newline_error("newline")
+
+        c.download_stdout_logs("job-1", tmp_path)
+        connection.list_rows[run_uri + root + "/"] += [
+            (f"/versions/RUN_ABC/{later}",),
+            (f"/versions/RUN_ABC/{bad}",),
+        ]
+        connection.content_by_uri[run_uri + later] = gzip.compress(b"later\n")
+        connection.content_by_uri[run_uri + bad] = b"not gzip"
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_stdout_logs("job-1", tmp_path, resume=True, progress=fail_on_newline)
+        assert seen == [(b"good\n", [])]
+        assert destination.read_bytes() == b"good\n"
+
+        seen.clear()
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_stdout_logs("job-1", fresh, progress=fail_on_newline)
+        assert [fresh_temps for _bytes, fresh_temps in seen] == [[]]
+        assert not list((fresh / sub).glob(".*.tmp"))
+        assert not (fresh / sub / "stdout.log").exists()
+
+    def test_download_progress_interrupt_closes_line(self, tmp_path, monkeypatch):
+        sub = "job-1:training:0"
+        first = f"_stdout/{sub}/console.20260904-120001.a.gz"
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [first], {first: b"first\n"}
+        )
+
+        def interrupt(*_args):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(c, "_download_gzip_member", interrupt)
+        calls = []
+        with pytest.raises(KeyboardInterrupt):
+            c.download_stdout_logs("job-1", tmp_path, progress=calls.append)
+        assert calls == [c._artifact_progress_status("stdout", 0, 1, sub), "\n"]
+        assert not list((tmp_path / sub).glob(".*.tmp"))
+
+    def test_download_progress_empty_and_directory_destination(self, tmp_path, monkeypatch):
+        c, _connection, _run_uri = self._gzip_download(monkeypatch, tmp_path, "stdout", [], {})
+        calls = []
+        assert c.download_stdout_logs("job-1", tmp_path, progress=calls.append) == []
+        assert calls == ["stdout: found 0 chunks\n"]
+        calls.clear()
+        assert c.download_stdout_logs("job-1", tmp_path, resume=True, progress=calls.append) == []
+        assert calls == ["stdout: found 0 chunks\n"]
+
+        root = "_stdout"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/console.20260904-120001.a.gz"
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [first], {first: b"first\n"}
+        )
+        destination = tmp_path / "dir-case" / sub / "stdout.log"
+        destination.mkdir(parents=True)
+        manifest = destination.with_name(".stdout.log.manifest.json")
+        manifest.write_text(
+            json.dumps({"version": 1, "names": [first], "bytes": 0}),
+            encoding="utf-8",
+        )
+        calls.clear()
+        with pytest.raises(OSError):
+            c.download_stdout_logs(
+                "job-1", tmp_path / "dir-case", resume=True, progress=calls.append
+            )
+        assert calls == [
+            c._artifact_progress_status("stdout", 0, 1, sub),
+            c._artifact_progress_status("stdout", 1, 1, sub),
+            "\n",
+        ]
+        assert destination.is_dir()
+        assert not list(destination.parent.glob(".*.tmp"))
+
+    def test_download_progress_non_prefix_reports_full_list(self, tmp_path, monkeypatch):
+        root = "_stdout"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/console.20260904-120002.b.gz"
+        earlier = f"{root}/{sub}/console.20260904-120001.a.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch, tmp_path, "stdout", [first], {first: b"b\n"}
+        )
+        c.download_stdout_logs("job-1", tmp_path)
+        connection.list_rows[run_uri + root + "/"].insert(0, (f"/versions/RUN_ABC/{earlier}",))
+        connection.content_by_uri[run_uri + earlier] = gzip.compress(b"a\n")
+        calls = []
+        c.download_stdout_logs("job-1", tmp_path, resume=True, progress=calls.append)
+        assert calls[0] == c._artifact_progress_status("stdout", 0, 2, sub)
+        assert calls.count(calls[0]) == 1
+
+    def test_download_progress_rebuild_chunk_failure_keeps_previous(self, tmp_path, monkeypatch):
+        root = "_stdout"
+        sub = "job-1:training:0"
+        good = f"{root}/{sub}/console.20260904-120001.a.gz"
+        bad = f"{root}/{sub}/console.20260904-120002.b.gz"
+        c, connection, run_uri = self._gzip_download(
+            monkeypatch,
+            tmp_path,
+            "stdout",
+            [good, bad],
+            {good: b"new\n", bad: b"ignored\n"},
+        )
+        connection.content_by_uri[run_uri + bad] = b"not gzip"
+        destination = tmp_path / sub / "stdout.log"
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"previous\n")
+        calls = []
+        with pytest.raises(gzip.BadGzipFile):
+            c.download_stdout_logs("job-1", tmp_path, progress=calls.append)
+        assert c._artifact_progress_status("stdout", 1, 2, sub) in calls
+        assert c._artifact_progress_status("stdout", 2, 2, sub) not in calls
+        assert calls[-1] == "\n"
+        assert destination.read_bytes() == b"previous\n"
+        assert not list(destination.parent.glob(".*.tmp"))
+
+    def test_download_progress_shorter_file_rebuilds_full_list(self, tmp_path, monkeypatch):
+        root = "_metrics"
+        sub = "job-1:training:0"
+        first = f"{root}/{sub}/gpu.20260904-120001.a.gz"
+        second = f"{root}/{sub}/gpu.20260904-120002.b.gz"
+        c, _connection, _run_uri = self._gzip_download(
+            monkeypatch,
+            tmp_path,
+            "metrics",
+            [first, second],
+            {first: b"a\n", second: b"b\n"},
+        )
+        c.download_metrics("job-1", tmp_path)
+        destination = tmp_path / sub / "gpu.jsonl"
+        destination.write_bytes(b"x")
+        calls = []
+        c.download_metrics("job-1", tmp_path, resume=True, progress=calls.append)
+        assert calls[0] == c._artifact_progress_status("metrics", 0, 2, sub)
+        assert calls.count(calls[0]) == 1
+        assert destination.read_bytes() == b"a\nb\n"
+
+
+# ─── _ensure_database ──────────────────────────────────────────────────
+
+
+class TestEnsureDatabase:
+    def test_skipped_for_http_base_url(self):
+        """Mock/test mode: no DB check at all."""
+        c = CortexTrainingClient(base_url="http://test.local", database="DB", schema="SCH")
+        c._session = MagicMock()
+        c._session.get.return_value = _make_response({"jobs": []})
+        c._send("GET", f"{c.base_url}/test")
+        c._session.post.assert_not_called()
+
+    def test_no_extra_call_when_db_exists(self):
+        """Happy path: DB exists, no CREATE DATABASE call made."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
+        c._session = MagicMock()
+        api_resp = _make_response({"jobs": []})
+        c._session.get.return_value = api_resp
+        c._send("GET", f"{c.base_url}/api/v2/databases/MY_DB/schemas/SCH/cortex-training/jobs")
+        # Only the GET was made, no POST to /statements
+        c._session.post.assert_not_called()
+
+    def test_creates_db_on_not_found_then_retries(self):
+        """DB missing: first request fails, CREATE DATABASE, retry succeeds."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
+        c._session = MagicMock()
+        not_found_resp = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
+        )
+        create_resp = _make_response({"data": [["Database MY_DB successfully created."]]})
+        ok_resp = _make_response({"jobs": []})
+        c._session.get.side_effect = [not_found_resp, ok_resp]
+        c._session.post.return_value = create_resp
+        c._send("GET", f"{c.base_url}/test")
+        assert c._db_ensured is True
+        create_call = c._session.post.call_args_list[0]
+        assert "/api/v2/statements" in create_call.args[0]
+        assert "CREATE DATABASE IF NOT EXISTS MY_DB" in create_call.kwargs["json"]["statement"]
+        assert c._session.get.call_count == 2
+
+    def test_only_retries_once(self):
+        """If DB is still missing after CREATE, don't loop — raise the error."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
+        c._session = MagicMock()
+        not_found_resp = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
+        )
+        create_resp = _make_response({"data": [["OK"]]})
+        c._session.get.return_value = not_found_resp
+        c._session.post.return_value = create_resp
+        with pytest.raises(RuntimeError, match="CREATE DATABASE IF NOT EXISTS"):
+            c._send("GET", f"{c.base_url}/test")
+        assert c._db_ensured is True
+
+    def test_raises_when_create_fails_permission(self):
+        """CREATE DATABASE fails with 403: raise with actionable message."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="SCH")
+        c._session = MagicMock()
+        not_found_resp = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
+        )
+        perm_resp = _make_error_response({"message": "Insufficient privileges"}, status_code=403)
+        c._session.get.return_value = not_found_resp
+        c._session.post.return_value = perm_resp
+        with pytest.raises(RuntimeError, match="CREATE DATABASE IF NOT EXISTS"):
+            c._send("GET", f"{c.base_url}/test")
+
+    def test_lowercase_database_name_not_quoted(self):
+        """Lowercase DB names are NOT quoted — SQL resolves the same as the URL path."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="my_db", schema="SCH")
+        c._session = MagicMock()
+        not_found_resp = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.SCH is not found or not authorized"}, status_code=400
+        )
+        create_resp = _make_response({"data": [["OK"]]})
+        ok_resp = _make_response({"jobs": []})
+        c._session.get.side_effect = [not_found_resp, ok_resp]
+        c._session.post.return_value = create_resp
+        c._send("GET", f"{c.base_url}/test")
+        create_call = c._session.post.call_args_list[0]
+        stmt = create_call.kwargs["json"]["statement"]
+        assert stmt == "CREATE DATABASE IF NOT EXISTS my_db"
+        assert '"' not in stmt
+
+    def test_creates_schema_when_not_public(self):
+        """Non-PUBLIC schema triggers CREATE SCHEMA after CREATE DATABASE."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="CUSTOM")
+        c._session = MagicMock()
+        not_found_resp = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.CUSTOM is not found or not authorized"}, status_code=400
+        )
+        create_db_resp = _make_response({"data": [["Database MY_DB successfully created."]]})
+        create_schema_resp = _make_response({"data": [["Schema CUSTOM successfully created."]]})
+        ok_resp = _make_response({"jobs": []})
+        c._session.get.side_effect = [not_found_resp, ok_resp]
+        c._session.post.side_effect = [create_db_resp, create_schema_resp]
+        c._send("GET", f"{c.base_url}/test")
+        assert c._db_ensured is True
+        assert c._session.post.call_count == 2
+        db_call = c._session.post.call_args_list[0]
+        assert "CREATE DATABASE IF NOT EXISTS MY_DB" in db_call.kwargs["json"]["statement"]
+        schema_call = c._session.post.call_args_list[1]
+        assert "CREATE SCHEMA IF NOT EXISTS MY_DB.CUSTOM" in schema_call.kwargs["json"]["statement"]
+
+    def test_skips_schema_creation_for_public(self):
+        """PUBLIC schema does not trigger CREATE SCHEMA."""
+        c = CortexTrainingClient(base_url="https://test.snowflakecomputing.com", database="MY_DB", schema="PUBLIC")
+        c._session = MagicMock()
+        not_found_resp = _make_error_response(
+            {"code": "517602", "message": "Schema MY_DB.PUBLIC is not found or not authorized"}, status_code=400
+        )
+        create_db_resp = _make_response({"data": [["Database MY_DB successfully created."]]})
+        ok_resp = _make_response({"jobs": []})
+        c._session.get.side_effect = [not_found_resp, ok_resp]
+        c._session.post.return_value = create_db_resp
+        c._send("GET", f"{c.base_url}/test")
+        assert c._db_ensured is True
+        # Only one POST for CREATE DATABASE, no schema creation
+        assert c._session.post.call_count == 1

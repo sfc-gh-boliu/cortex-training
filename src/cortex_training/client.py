@@ -17,7 +17,10 @@
 
 Single-purpose, production-shaped client:
 
-- One auth path: Programmatic Access Token (PAT) — see ``CortexTrainingClient.from_pat``.
+- Snowflake connection profiles — see
+  ``CortexTrainingClient.from_connection_name``.
+- Direct Programmatic Access Token (PAT) compatibility — see
+  ``CortexTrainingClient.from_pat``.
 - One CreateJob shape: a list of typed :class:`SubJobConfig` (each carries either
   a :class:`TrainingConfig` or an :class:`InferenceConfig`). The client-side
   validators mirror the server's own required-field checks so an invalid job
@@ -34,26 +37,41 @@ use the ``extra`` fields for anything the typed layer does not model yet.
 from __future__ import annotations
 
 import base64
+import contextlib
 import functools
 import gzip
 import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import tempfile
 import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
+from datetime import date
+from datetime import datetime
+from datetime import timezone
 from enum import Enum
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
+from typing import TypeVar
+from urllib.parse import quote
+
+from pydantic import BaseModel
+from pydantic import ConfigDict
+from pydantic import Field as PydanticField
+from pydantic import model_validator
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -64,6 +82,10 @@ from tenacity import wait_exponential_jitter
 from urllib3.exceptions import NewConnectionError
 
 from cortex_training import wire
+from cortex_training.optimizer import normalize_optimizer_config
+from cortex_training.peft import normalize_lora_peft_config
+from cortex_training.snowflake_auth import SnowflakeProfileAuth
+from cortex_training.snowflake_auth import SnowflakeTelemetryTokenProvider
 from cortex_training.telemetry import CachedSessionTokenProvider
 from cortex_training.telemetry import OtlpMetricEmitter
 
@@ -76,6 +98,8 @@ _GPU_METRICS_CHUNK_RE = re.compile(
     r"^gpu\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
 )
 _STREAM_COPY_BUFFER_BYTES = 1024 * 1024
+_ARTIFACT_GET_WORKERS = 8
+_ARTIFACT_GET_MIN_CHUNKS = 128
 
 # Env var that unlocks create-job debug options. These are an internal-only
 # capability and are deliberately not documented for external use: the client
@@ -84,6 +108,12 @@ _STREAM_COPY_BUFFER_BYTES = 1024 * 1024
 DEBUG_OPTIONS_ENV = "CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS"
 DISABLE_TELEMETRY_ENV = "CORTEX_TRAINING_DISABLE_TELEMETRY"
 ENABLE_SUCCESS_TELEMETRY_ENV = "CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY"
+
+# Escape hatch for the tensor encoding of pre-tokenized prompts. Prompts are
+# packed as tensors by default because every server accepts both encodings.
+# Setting this puts the token ids back in the frame's JSON header; it does not
+# change the request body, which is a DSSST1 frame either way.
+DISABLE_TENSOR_PROMPTS_ENV = "CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS"
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -118,18 +148,87 @@ def _success_telemetry_enabled() -> bool:
 #   503 Service Unavailable - server temporarily overloaded or restarting
 #   504 Gateway Timeout     - upstream didn't respond in time
 #   409 Conflict            - the target zone is restarting
+#   307/308 Redirect        - a leaked internal redirect; retried on the original
+#                             URL, and `Location` is never followed.
 #   404 Not Found           - a just-created job may not be visible yet, so a
 #                             valid id can 404 briefly and succeed on retry.
 # Note the trade-off on 404: a *mistyped* job id is also retried (up to
 # `max_retries`, with backoff) before the error surfaces. Every other 4xx is
 # excluded because it signals a client/config error that won't fix itself.
-_TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409}
+_TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409, 307, 308}
+_SESSION_EXPIRED_CODES = frozenset({"390111", "390112", "390114"})
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {
     _CHUNK_GROUP_RESTART_REQUIRED,
     "chunk_group_conflict",
     "chunk_group_missing_chunks",
 }
+
+# Ceiling on one ``/operation`` JSON request body. A binary payload is
+# base64-encoded and inflated 4/3, so this default is conservative relative
+# to the 60 MiB octet-stream budget. Raise it via the env var once the real
+# ceiling is measured.
+_OPERATION_MAX_JSON_BYTES_ENV = "CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES"
+_DEFAULT_OPERATION_MAX_JSON_BYTES = 16 * 1024 * 1024
+_MIN_OPERATION_MAX_JSON_BYTES = 16 * 1024
+
+# Headroom for everything in the envelope that is not the base64 payload:
+# ``operation_type``, the routing hints, the JSON punctuation and key names.
+_OPERATION_ENVELOPE_OVERHEAD_BYTES = 4096
+
+
+def _operation_max_json_bytes() -> int:
+    """Read the per-request ``/operation`` JSON body ceiling from the env."""
+    raw = os.environ.get(_OPERATION_MAX_JSON_BYTES_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_OPERATION_MAX_JSON_BYTES
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_OPERATION_MAX_JSON_BYTES_ENV} must be an integer, got {raw!r}"
+        ) from exc
+    if value < _MIN_OPERATION_MAX_JSON_BYTES:
+        raise ValueError(
+            f"{_OPERATION_MAX_JSON_BYTES_ENV} must be at least "
+            f"{_MIN_OPERATION_MAX_JSON_BYTES} bytes"
+        )
+    return value
+
+
+def _operation_chunk_max_bytes(max_json_bytes: int) -> int:
+    """Raw frame bytes that fit one ``/operation`` body once base64-inflated."""
+    return max(1, (max_json_bytes - _OPERATION_ENVELOPE_OVERHEAD_BYTES) * 3 // 4)
+
+
+def _operation_body_json_bytes(body: dict) -> int:
+    """Encoded size of an operation body without re-serializing its payload.
+
+    ``json.dumps`` on a body holding a multi-megabyte base64 string copies that
+    string. The base64 alphabet needs no JSON escaping and is single-byte in
+    UTF-8, so the payload's encoded length is its character count: measure the
+    envelope around an empty placeholder and add that count back.
+    """
+    payload = body.get("payload")
+    raw = payload.get("payload_b64") if isinstance(payload, dict) else None
+    if not isinstance(raw, str):
+        return len(json.dumps(body).encode("utf-8"))
+    skeleton = {**body, "payload": {**payload, "payload_b64": ""}}
+    return len(json.dumps(skeleton).encode("utf-8")) + len(raw)
+
+
+def _log_safe_operation_body(body: dict) -> dict:
+    """Replace an operation body's base64 payload with its length for logging."""
+    payload = body.get("payload")
+    if not isinstance(payload, dict) or not isinstance(payload.get("payload_b64"), str):
+        return body
+    return {
+        **body,
+        "payload": {
+            **payload,
+            "payload_b64": f"<{len(payload['payload_b64'])} base64 chars>",
+        },
+    }
 
 
 class ChunkGroupError(requests.exceptions.HTTPError):
@@ -150,6 +249,61 @@ class ChunkGroupRestartError(ChunkGroupError):
 
 class ChunkGroupConflictError(ChunkGroupError):
     """The same chunk-group identity was reused inconsistently."""
+
+
+# Default per-request HTTP timeout, as a (connect, read) pair in seconds. The
+# read leg accommodates long-running data-plane calls; fast control-plane calls
+# such as GetCapacity apply a smaller bound explicitly.
+_DEFAULT_REQUEST_TIMEOUT = (30.0, 600.0)
+_CAPACITY_REQUEST_TIMEOUT = (10.0, 30.0)
+
+
+def _validated_request_timeout(
+    request_timeout: float | tuple[float, float],
+) -> tuple[float, float]:
+    values = (
+        request_timeout
+        if isinstance(request_timeout, tuple)
+        else (request_timeout, request_timeout)
+    )
+    if len(values) != 2 or any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+        for value in values
+    ):
+        raise ValueError(
+            "request_timeout must be a positive finite number of seconds, or a "
+            f"(connect, read) pair of them; got {request_timeout!r}"
+        )
+    return float(values[0]), float(values[1])
+
+
+class _DefaultTimeoutSession(requests.Session):
+    """Apply a default timeout to every request that does not provide one.
+
+    Redirects are never followed: a leaked internal redirect points at an
+    address the client cannot reach, so the original URL is retried instead.
+    """
+
+    def __init__(self, default_timeout: tuple[float, float]):
+        super().__init__()
+        self.default_timeout = default_timeout
+
+    def request(
+        self,
+        *args: Any,
+        timeout: Any = None,
+        **kwargs: Any,
+    ) -> requests.Response:  # type: ignore[override]
+        # Session.get() injects allow_redirects=True before it calls request().
+        kwargs["allow_redirects"] = False
+        return super().request(
+            *args,
+            timeout=self.default_timeout if timeout is None else timeout,
+            **kwargs,
+        )
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -186,6 +340,25 @@ def _iter_error_dicts(value: Any, *, depth: int = 0) -> Iterator[dict]:
         except (TypeError, ValueError):
             continue
         yield from _iter_error_dicts(decoded, depth=depth + 1)
+
+
+def _is_session_auth_expired_response(response: requests.Response) -> bool:
+    """Return whether the API explicitly rejected an expired session token."""
+    structured_code_seen = False
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    for candidate in _iter_error_dicts(body):
+        code = candidate.get("code") or candidate.get("error_code")
+        if code is None:
+            continue
+        structured_code_seen = True
+        if str(code) in _SESSION_EXPIRED_CODES:
+            return True
+    # A bare 401 is an authentication rejection, but a structured non-expiry
+    # code must not be turned into a reconnect loop.
+    return response.status_code == 401 and not structured_code_seen
 
 
 def _chunk_group_error_detail(response: requests.Response | None) -> dict | None:
@@ -251,6 +424,130 @@ def _safe_metric_error_message(exc: BaseException) -> str:
     return message[:_METRIC_ERROR_MESSAGE_LIMIT]
 
 
+_SNOWFLAKE_REQUEST_ID_HEADER = "x-snowflake-request-id"
+# Bound per-operation history so long polls (wait_for_job) stay cheap.
+_MAX_TRACKED_SNOWFLAKE_REQUEST_IDS = 10
+
+
+def _response_snowflake_request_id(response: Any) -> str | None:
+    headers = getattr(response, "headers", None) or {}
+    request_id = headers.get(_SNOWFLAKE_REQUEST_ID_HEADER)
+    return request_id if isinstance(request_id, str) and request_id else None
+
+
+def _add_snowflake_request_id_to_error(
+    exc: BaseException, request_id: str | None
+) -> None:
+    """Prefix the Snowflake request id to an error message so tracebacks carry it.
+
+    The id goes first so it survives truncation of long messages, e.g. the
+    512-character telemetry ``error_message``.
+    """
+    if not request_id or not exc.args or not isinstance(exc.args[0], str):
+        return
+    if request_id in exc.args[0]:
+        return
+    exc.args = (
+        f"[snowflake request id: {request_id}] {exc.args[0]}",
+        *exc.args[1:],
+    )
+
+
+def _snowflake_request_attributes(
+    error: BaseException | None,
+    request_ids: list[str],
+) -> dict[str, Any]:
+    """Snowflake request id attributes for an operation outcome.
+
+    ``error.snowflake_request_id`` is the failing response's id, set only when
+    that response carried the header. ``snowflake.request_ids`` is the
+    operation's recent Snowflake request ids, newest last; no entry in it is
+    implied to have failed.
+    """
+    attributes: dict[str, Any] = {}
+    if error is not None:
+        request_id = _response_snowflake_request_id(getattr(error, "response", None))
+        if request_id is not None:
+            attributes["error.snowflake_request_id"] = request_id
+            # Deprecated name for the same value; remove after one release.
+            attributes["snowflake.request_id"] = request_id
+    if request_ids:
+        attributes["snowflake.request_ids"] = list(request_ids)
+    return attributes
+
+
+_E = TypeVar("_E", bound=BaseException)
+_SERVER_FAILURE_ATTR = "_snowflake_server_failure"
+
+
+def _server_failure(exc: _E, failed: bool = True) -> _E:
+    """Mark ``exc`` as caused by a server outcome when ``failed`` is true.
+
+    Marked errors (a request or job that ended ``failed``, a poll that timed
+    out, a response payload that could not be decoded) carry no response of
+    their own, so :func:`_log_untagged_request_id` names the operation's last
+    Snowflake request id for them.
+    """
+    if failed:
+        try:
+            setattr(exc, _SERVER_FAILURE_ATTR, True)
+        except Exception:
+            pass
+    return exc
+
+
+@contextlib.contextmanager
+def _server_payload() -> Iterator[None]:
+    """Treat decode errors in the enclosed code as server failures."""
+    try:
+        yield
+    except ValueError as exc:
+        raise _server_failure(exc)
+
+
+def _log_untagged_request_id(
+    operation: str,
+    exc: BaseException,
+    request_ids: list[str],
+) -> None:
+    """Log the last Snowflake request id for a server-side failure with no response.
+
+    This is the fallback for :func:`_add_snowflake_request_id_to_error`, which
+    tags any error that has a response. It covers:
+
+    - transport errors with no response, such as a connection error or
+      timeout after retries;
+    - errors marked by :func:`_server_failure`: a request or job that ended
+      ``failed``, a poll that timed out, or an undecodable response payload.
+
+    It logs ``request_ids[-1]`` labeled "last" because that request did not
+    necessarily fail. It logs nothing when the operation made no Snowflake
+    requests, when the error has a response (already tagged, or the response
+    lacked the header), or for any other error, such as client-side
+    validation or a job that reached ``done`` or ``cancelled``. Telemetry
+    still records ``snowflake.request_ids`` for those.
+    """
+    try:
+        if getattr(exc, "response", None) is not None or not request_ids:
+            return
+        if not (
+            isinstance(exc, requests.exceptions.RequestException)
+            or getattr(exc, _SERVER_FAILURE_ATTR, False)
+        ):
+            return
+        request_id = request_ids[-1]
+        if request_id in str(exc):
+            return
+        logger.warning(
+            "[last snowflake request id: %s] %s failed: %s",
+            request_id,
+            operation,
+            _safe_metric_error_message(exc),
+        )
+    except Exception:
+        logger.debug("client operation request id logging failed", exc_info=True)
+
+
 def _metric_error_attributes(exc: BaseException) -> dict[str, Any]:
     attributes: dict[str, Any] = {"error.type": type(exc).__name__}
     response = getattr(exc, "response", None)
@@ -259,10 +556,6 @@ def _metric_error_attributes(exc: BaseException) -> dict[str, Any]:
     status_code = getattr(response, "status_code", None)
     if isinstance(status_code, int):
         attributes["error.http_status"] = status_code
-    headers = getattr(response, "headers", {}) or {}
-    request_id = headers.get("x-snowflake-request-id")
-    if isinstance(request_id, str) and request_id:
-        attributes["snowflake.request_id"] = request_id
     try:
         body = response.json()
     except Exception:
@@ -308,50 +601,64 @@ def _track_operation(operation: str):
 
         @functools.wraps(method)
         def wrapped(self, *args, **kwargs):
-            if getattr(self, "_metric_emitter", None) is None:
-                return method(self, *args, **kwargs)
             state = getattr(self, "_operation_metric_state", None)
             if state is None:
                 return method(self, *args, **kwargs)
             active = getattr(state, "active", set())
             if active:
                 return method(self, *args, **kwargs)
-            try:
-                bound = signature.bind(self, *args, **kwargs)
-                bound.apply_defaults()
-            except TypeError:
-                return method(self, *args, **kwargs)
-            except Exception:
-                logger.debug("client operation metric setup failed", exc_info=True)
-                return method(self, *args, **kwargs)
+            # Snowflake request ids are tracked even with telemetry off so a
+            # failure can still be logged with the id; only metrics need the
+            # arguments.
+            arguments = None
+            if getattr(self, "_metric_emitter", None) is not None:
+                try:
+                    bound = signature.bind(self, *args, **kwargs)
+                    bound.apply_defaults()
+                    arguments = bound.arguments
+                except TypeError:
+                    return method(self, *args, **kwargs)
+                except Exception:
+                    logger.debug("client operation metric setup failed", exc_info=True)
+                    return method(self, *args, **kwargs)
             active = set()
             active.add(operation)
             state.active = active
             state.attempt_count = 0
             state.request_count = 0
+            state.snowflake_request_ids = []
             started = time.monotonic()
             try:
                 result = method(self, *args, **kwargs)
             except Exception as exc:
-                self._emit_operation_outcome(
-                    operation,
-                    started,
-                    bound.arguments,
-                    error=exc,
+                # Errors wrapped after _send (e.g. chunk-group errors) still
+                # carry the failing response.
+                _add_snowflake_request_id_to_error(
+                    exc, _response_snowflake_request_id(getattr(exc, "response", None))
                 )
+                _log_untagged_request_id(operation, exc, state.snowflake_request_ids)
+                if arguments is not None:
+                    self._emit_operation_outcome(
+                        operation,
+                        started,
+                        arguments,
+                        error=exc,
+                    )
                 raise
             else:
-                self._emit_operation_outcome(
-                    operation,
-                    started,
-                    bound.arguments,
-                    result=result,
-                )
+                if arguments is not None:
+                    self._emit_operation_outcome(
+                        operation,
+                        started,
+                        arguments,
+                        result=result,
+                    )
                 return result
             finally:
                 state.active = set()
                 state.attempt_count = 0
                 state.request_count = 0
+                state.snowflake_request_ids = []
 
         return wrapped
 
@@ -361,6 +668,15 @@ def _track_operation(operation: str):
 def _is_chunk_post_transient(exc: BaseException) -> bool:
     if isinstance(exc, requests.exceptions.HTTPError):
         if _chunk_group_error_detail(exc.response) is not None:
+            return False
+    return _is_transient(exc)
+
+
+def _is_account_list_transient(exc: BaseException) -> bool:
+    # The account-level job list answers 404 when it is not enabled for the
+    # account, which no retry fixes.
+    if isinstance(exc, requests.exceptions.HTTPError):
+        if exc.response is not None and exc.response.status_code == 404:
             return False
     return _is_transient(exc)
 
@@ -380,15 +696,39 @@ def _is_connect_error(exc: BaseException) -> bool:
 
 
 class JobType(str, Enum):
-    """Sub-job types supported by Cortex Training.
+    """Sub-job types defined by the Cortex Training schema.
 
     Matches the ``job_type`` enum in the REST schema; see
-    ``docs/reference/rest-api.md`` section 8.1.
+    ``docs/reference/rest-api.md`` section 8.1. Not every schema value can
+    currently be submitted: ``LOG_PROBABILITY`` configs still validate and
+    serialize, but the client and CLI reject them at submission.
     """
 
     TRAINING = "training"
     SAMPLING = "sampling"
-    LOG_PROBABILITY = "log_probability"
+    LOG_PROBABILITY = "log_probability"  # Schema value; submission is unsupported.
+
+
+_LOG_PROBABILITY_JOB_TYPE_ALIASES = frozenset({"log_probability", "log_prob"})
+_UNSUPPORTED_LOG_PROBABILITY_MESSAGE = (
+    "log_probability sub-jobs are not currently supported"
+)
+
+
+def _normalized_job_type(job_type: Any) -> str:
+    """Short-form ``job_type`` for raw bodies, which may use the enum spelling."""
+    if not isinstance(job_type, str):
+        return ""
+    return job_type.strip().lower().removeprefix("job_type_")
+
+
+def _is_log_probability_job_type(job_type: Any) -> bool:
+    return _normalized_job_type(job_type) in _LOG_PROBABILITY_JOB_TYPE_ALIASES
+
+
+def _reject_log_probability_sub_job(job_type: Any, *, location: str) -> None:
+    if _is_log_probability_job_type(job_type):
+        raise ValueError(f"{location}: {_UNSUPPORTED_LOG_PROBABILITY_MESSAGE}")
 
 
 class Hardware(str, Enum):
@@ -413,6 +753,113 @@ def _hardware_wire(hardware: Hardware | str) -> str:
     except ValueError as exc:
         allowed = ", ".join(member.value for member in Hardware)
         raise ValueError(f"hardware must be one of {allowed}, got {hardware!r}") from exc
+
+
+# ``get_capacity_breakdown`` dimensions, statuses, and the job types always
+# reported under ``job_type``, in order.
+_CAPACITY_BREAKDOWN_DIMENSIONS = ("job_type", "submitted_by")
+_CAPACITY_BREAKDOWN_JOB_TYPES = ("TRAINING", "SAMPLING", "LOG_PROBABILITY")
+
+
+def _capacity_totals(body: Mapping[str, Any]) -> dict:
+    """Return the six ``/capacity`` totals, filling proto3-omitted defaults."""
+    return {
+        "has_reservation": bool(body.get("has_reservation", False)),
+        "max_total_gpus": int(body.get("max_total_gpus", 0)),
+        "reserved_gpus": int(body.get("reserved_gpus", 0)),
+        "in_use_gpus": int(body.get("in_use_gpus", 0)),
+        "pending_gpus": int(body.get("pending_gpus", 0)),
+        "available_gpus": int(body.get("available_gpus", 0)),
+    }
+
+
+def _capacity_breakdown_dimensions(dimensions: Any) -> tuple[str, ...]:
+    """Validate ``get_capacity_breakdown(dimensions=...)`` before any request."""
+    try:
+        names = tuple(dimensions)
+    except TypeError:
+        names = ()
+    if not names or not all(
+        isinstance(name, str) and name in _CAPACITY_BREAKDOWN_DIMENSIONS
+        for name in names
+    ):
+        allowed = ", ".join(_CAPACITY_BREAKDOWN_DIMENSIONS)
+        raise ValueError(
+            f"dimensions must be a non-empty iterable of {allowed} "
+            f"(not a string), got {dimensions!r}"
+        )
+    # Use our own strings: a str Enum member equal to a name formats differently.
+    return tuple(
+        _CAPACITY_BREAKDOWN_DIMENSIONS[_CAPACITY_BREAKDOWN_DIMENSIONS.index(name)]
+        for name in names
+    )
+
+
+def _capacity_breakdown(
+    body: Mapping[str, Any], dimensions: tuple[str, ...]
+) -> dict[str, Any]:
+    """Normalize ``breakdown``, trusting the data over the status label:
+    groups are kept whenever the server sends them, and ``status`` is passed
+    through as sent. Only a missing status is derived: ``OK`` with groups,
+    ``UNAVAILABLE`` without (also for a dimension the server left out)."""
+    raw = body.get("breakdown")
+    if not isinstance(raw, dict):
+        raw = {}
+    breakdown: dict[str, Any] = {
+        "job_count": int(raw.get("job_count", 0)),
+        "truncated": bool(raw.get("truncated", False)),
+        "unsupported_dimensions": list(raw.get("unsupported_dimensions") or []),
+    }
+    for dimension in dict.fromkeys(dimensions):
+        section = raw.get(f"by_{dimension}")
+        if not isinstance(section, dict):
+            section = {}
+        groups = section.get("groups")
+        has_groups = isinstance(groups, list) and bool(groups)
+        status = section.get("status") or ("OK" if has_groups else "UNAVAILABLE")
+        if not has_groups:
+            rendered_groups = []
+        elif dimension == "job_type":
+            rendered_groups = _capacity_job_type_groups(groups)
+        else:
+            rendered_groups = [_capacity_submitted_by_group(group) for group in groups]
+        breakdown[f"by_{dimension}"] = {"status": status, "groups": rendered_groups}
+    return breakdown
+
+
+def _capacity_job_type_groups(groups: list[Mapping[str, Any]]) -> list[dict]:
+    """Known job types first, zero-filled and in order, then any others as sent."""
+    counts = ("in_use_gpus", "pending_gpus", "sub_job_count")
+    known: dict[str, dict[str, Any]] = {
+        job_type: {"job_type": job_type, **dict.fromkeys(counts, 0)}
+        for job_type in _CAPACITY_BREAKDOWN_JOB_TYPES
+    }
+    others = []
+    for group in groups:
+        job_type = group.get("job_type")
+        row: dict[str, Any] | None = None
+        if isinstance(job_type, str):
+            job_type = job_type.removeprefix("JOB_TYPE_")
+            row = known.get(job_type)
+        if row is None:
+            row = {"job_type": job_type, **dict.fromkeys(counts, 0)}
+            others.append(row)
+        for key in counts:
+            row[key] += int(group.get(key, 0))
+    return [*known.values(), *others]
+
+
+def _capacity_submitted_by_group(group: Mapping[str, Any]) -> dict:
+    """Normalize one ``by_submitted_by`` group; only a ``USER`` row names anyone."""
+    user = group.get("kind") == "USER"
+    return {
+        "kind": group.get("kind"),
+        "submitted_by": group.get("submitted_by") if user else None,
+        "is_caller": bool(group.get("is_caller", False)) if user else False,
+        "in_use_gpus": int(group.get("in_use_gpus", 0)),
+        "pending_gpus": int(group.get("pending_gpus", 0)),
+        "job_count": int(group.get("job_count", 0)),
+    }
 
 
 def _effective_primerl_config(extra: dict) -> dict:
@@ -441,43 +888,70 @@ def _validate_primerl_lm_head_config(extra: dict, *, location: str) -> None:
         )
 
 
-@dataclass
-class TrainingConfig:
+class TrainingConfig(BaseModel):
     """Training hyperparameters for a training sub-job.
 
     Required fields mirror the server-side validator: ``max_seq_len > 0``,
-    ``train_batch_size > 0``, ``n_gpus > 0``, and a non-empty ``optimizer``.
+    ``train_batch_size > 0``, ``n_gpus > 0``, and an ``optimizer`` that carries
+    at least one setting. ``optimizer`` is canonicalized on construction (see
+    :func:`cortex_training.optimizer.normalize_optimizer_config`), so a block
+    holding only ``gradient_clipping`` is hoisted onto the typed field and
+    leaves ``optimizer`` empty.
 
-    ``extra`` carries any additional fields the training worker consumes. The
-    server keeps this block open (additionalProperties), so unknown keys flow
-    through unchanged. See ``docs/reference/rest-api.md`` section 8.2.
+    Unknown fields are passed through to the server unchanged
+    (accessible via ``model_extra``). See ``docs/reference/rest-api.md`` section 8.2.
     """
 
-    optimizer: dict
-    max_seq_len: int
-    train_batch_size: int
-    n_gpus: int
-    gradient_clipping: float | None = None
-    multiplex_job_id: str | None = None
-    # When False, resuming from a checkpoint loads weights only and starts the
-    # optimizer fresh. Required to change DP size (the DP-sharded optimizer
-    # cannot be resized); None leaves the server default (True).
-    load_optimizer_states: bool | None = None
-    extra: dict = field(default_factory=dict)
+    optimizer: dict = PydanticField(description="Optimizer config dict (e.g. {name: AdamW, lr: 1e-4}).")
+    max_seq_len: int = PydanticField(gt=0, description="Maximum sequence length for training.")
+    train_batch_size: int = PydanticField(gt=0, description="Global batch size across all GPUs.")
+    n_gpus: int = PydanticField(gt=0, description="Number of GPUs (data-parallel size).")
+    gradient_clipping: float | None = PydanticField(default=None, description="Optional gradient clipping threshold.")
+    multiplex_job_id: str | None = PydanticField(default=None, description="Optional multiplex job identifier.")
+    load_optimizer_states: bool | None = PydanticField(default=None, description="Whether to load optimizer states from checkpoints. Set to False when changing DP size.")
 
-    def validate(self) -> None:
-        if not isinstance(self.optimizer, dict) or not self.optimizer:
+    model_config = ConfigDict(extra="allow", validate_assignment=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_legacy_extra(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "extra" in data:
+            extra = data.pop("extra")
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    data.setdefault(k, v)
+        return data
+
+    @model_validator(mode="after")
+    def _check_optimizer(self) -> "TrainingConfig":
+        # object.__setattr__ writes the already-normalized values without
+        # re-entering assignment validation. create_job posts to_wire() of this
+        # instance, so the rewrite has to land here.
+        optimizer, hoisted_gradient_clipping = normalize_optimizer_config(
+            self.optimizer, location="training.optimizer"
+        )
+        object.__setattr__(self, "optimizer", optimizer)
+        if self.gradient_clipping is None and hoisted_gradient_clipping is not None:
+            object.__setattr__(self, "gradient_clipping", hoisted_gradient_clipping)
+        # Checked after the hoist: a clip-only block canonicalizes to ``{}`` and
+        # is still a complete config, so only a block that says nothing at all
+        # is an error.
+        if not self.optimizer and self.gradient_clipping is None:
             raise ValueError("training.optimizer is required and must be a non-empty dict")
-        if self.max_seq_len <= 0:
-            raise ValueError("training.max_seq_len must be > 0")
-        if self.train_batch_size <= 0:
-            raise ValueError("training.train_batch_size must be > 0")
-        if self.n_gpus <= 0:
-            raise ValueError("training.n_gpus must be > 0")
-        _validate_primerl_lm_head_config(self.extra, location="training.extra")
-        prime_rl = self.extra.get("prime_rl")
+        extra = self.model_extra or {}
+        _validate_primerl_lm_head_config(extra, location="training.extra")
+        prime_rl = extra.get("prime_rl")
         if isinstance(prime_rl, dict):
             _validate_primerl_lm_head_config(prime_rl, location="training.extra.prime_rl")
+        if "peft_config" in extra:
+            extra["peft_config"] = normalize_lora_peft_config(
+                extra["peft_config"], location="training.extra.peft_config"
+            )
+        return self
+
+    def validate(self) -> None:
+        """Re-validate the current state. Backward-compatible with the old dataclass API."""
+        self.__class__.model_validate(self.model_dump(by_alias=True))
 
     def to_wire(self) -> dict:
         out: dict = {
@@ -492,60 +966,90 @@ class TrainingConfig:
             out["multiplex_job_id"] = self.multiplex_job_id
         if self.load_optimizer_states is not None:
             out["load_optimizer_states"] = self.load_optimizer_states
-        for k, v in self.extra.items():
+        for k, v in (self.model_extra or {}).items():
             out.setdefault(k, v)
         return out
 
 
-@dataclass
-class InferenceConfig:
+class InferenceConfig(BaseModel):
     """Sampling/log-probability config for an inference sub-job.
 
     Required fields mirror the server-side validator: ``max_seq_len > 0`` and
-    ``n_gpus > 0``. ``extra`` carries vLLM-style passthrough keys (e.g.
-    ``gpu_memory_utilization``). See ``docs/reference/rest-api.md`` section 8.3.
+    ``n_gpus > 0``. Unknown fields are passed through to the server unchanged
+    (accessible via ``model_extra``). See ``docs/reference/rest-api.md`` section 8.3.
     """
 
-    max_seq_len: int
-    n_gpus: int
-    multiplex_job_id: str | None = None
-    extra: dict = field(default_factory=dict)
+    max_seq_len: int = PydanticField(gt=0, description="Maximum sequence length for inference.")
+    n_gpus: int = PydanticField(gt=0, description="Number of GPUs for inference.")
+    multiplex_job_id: str | None = PydanticField(default=None, description="Optional multiplex job identifier.")
+
+    model_config = ConfigDict(extra="allow", validate_assignment=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_legacy_extra(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "extra" in data:
+            extra = data.pop("extra")
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    data.setdefault(k, v)
+        return data
+
+    @model_validator(mode="after")
+    def _check_peft_config(self) -> "InferenceConfig":
+        extra = self.model_extra or {}
+        if "peft_config" in extra:
+            extra["peft_config"] = normalize_lora_peft_config(
+                extra["peft_config"], location="sampling.extra.peft_config"
+            )
+        return self
 
     def validate(self) -> None:
-        if self.max_seq_len <= 0:
-            raise ValueError("sampling.max_seq_len must be > 0")
-        if self.n_gpus <= 0:
-            raise ValueError("sampling.n_gpus must be > 0")
+        """Re-validate the current state. Backward-compatible with the old dataclass API."""
+        self.__class__.model_validate(self.model_dump(by_alias=True))
 
     def to_wire(self) -> dict:
         out: dict = {"max_seq_len": self.max_seq_len, "n_gpus": self.n_gpus}
         if self.multiplex_job_id is not None:
             out["multiplex_job_id"] = self.multiplex_job_id
-        for k, v in self.extra.items():
+        for k, v in (self.model_extra or {}).items():
             out.setdefault(k, v)
         return out
 
 
-@dataclass
-class SubJobConfig:
+class SubJobConfig(BaseModel):
     """One sub-job within a CreateJob request.
 
     Matches the ``SubJobConfig`` schema in ``docs/reference/rest-api.md``
     section 8.1.
 
     Exactly one of ``training`` or ``sampling`` must be set, matching the
-    sub-job's ``job_type`` (see :meth:`validate`).
+    sub-job's ``job_type``.
     """
 
-    job_type: JobType
-    model_name: str
-    training: TrainingConfig | None = None
-    sampling: InferenceConfig | None = None
-    global_batch_size: int | None = None
-    dtype: str | None = None
-    seed: int | None = None
-    model_post_init: list[str] | None = None
-    source_checkpoint_info: dict | None = None
+    job_type: JobType = PydanticField(description="Sub-job type (training, sampling, or log_probability).")
+    model_name: str = PydanticField(min_length=1, description="Model identifier (e.g. Qwen/Qwen3-8B).")
+    training: TrainingConfig | None = PydanticField(default=None, description="Training config; required for training sub-jobs.")
+    sampling: InferenceConfig | None = PydanticField(default=None, description="Inference config; required for sampling/log-prob sub-jobs.")
+    global_batch_size: int | None = PydanticField(default=None, description="Global batch size across all GPUs.")
+    dtype: str | None = PydanticField(default=None, description="Model dtype (e.g. bfloat16).")
+    seed: int | None = PydanticField(default=None, description="Random seed.")
+    model_post_init_ops: list[str] | None = PydanticField(default=None, alias="model_post_init", description="List of post-initialization operations.")
+    source_checkpoint_info: dict | None = PydanticField(default=None, description="Checkpoint to resume from at creation time.")
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True, validate_assignment=True)
+
+    @model_validator(mode="after")
+    def _check_job_type(self) -> "SubJobConfig":
+        if self.training is not None and self.sampling is not None:
+            raise ValueError("sub_job.training and sub_job.sampling are mutually exclusive")
+        if self.job_type == JobType.TRAINING:
+            if self.training is None:
+                raise ValueError("training sub-job requires a `training` block")
+        elif self.job_type in (JobType.SAMPLING, JobType.LOG_PROBABILITY):
+            if self.sampling is None:
+                raise ValueError(f"{self.job_type.value} sub-job requires a `sampling` block")
+        return self
 
     @classmethod
     def training_job(
@@ -589,6 +1093,8 @@ class SubJobConfig:
             source_checkpoint_info: Optional checkpoint to resume from at
                 creation time (use ``{"checkpoint_id": "...", "source_job_id": "..."}`).
         """
+        _typed_training = set(TrainingConfig.model_fields.keys())
+        passthrough_training = {k: v for k, v in (extra_training or {}).items() if k not in _typed_training}
         return cls(
             job_type=JobType.TRAINING,
             model_name=model_name,
@@ -600,7 +1106,7 @@ class SubJobConfig:
                 gradient_clipping=gradient_clipping,
                 multiplex_job_id=multiplex_job_id,
                 load_optimizer_states=load_optimizer_states,
-                extra=dict(extra_training) if extra_training else {},
+                **passthrough_training,
             ),
             global_batch_size=global_batch_size,
             dtype=dtype,
@@ -625,9 +1131,16 @@ class SubJobConfig:
         model_post_init: list[str] | None = None,
         source_checkpoint_info: dict | None = None,
     ) -> "SubJobConfig":
-        """Build a sampling/log-probability :class:`SubJobConfig`."""
-        if job_type not in (JobType.SAMPLING, JobType.LOG_PROBABILITY):
-            raise ValueError(f"sampling_job() only accepts SAMPLING or LOG_PROBABILITY, got {job_type!r}")
+        """Build a sampling :class:`SubJobConfig`.
+
+        ``job_type`` remains for source compatibility, but only ``SAMPLING`` is
+        currently accepted.
+        """
+        _reject_log_probability_sub_job(job_type, location="sampling_job().job_type")
+        if job_type != JobType.SAMPLING:
+            raise ValueError(f"sampling_job() only accepts SAMPLING, got {job_type!r}")
+        _typed_sampling = set(InferenceConfig.model_fields.keys())
+        passthrough_sampling = {k: v for k, v in (extra_sampling or {}).items() if k not in _typed_sampling}
         return cls(
             job_type=job_type,
             model_name=model_name,
@@ -635,7 +1148,7 @@ class SubJobConfig:
                 max_seq_len=max_seq_len,
                 n_gpus=n_gpus,
                 multiplex_job_id=multiplex_job_id,
-                extra=dict(extra_sampling) if extra_sampling else {},
+                **passthrough_sampling,
             ),
             global_batch_size=global_batch_size,
             dtype=dtype,
@@ -645,21 +1158,8 @@ class SubJobConfig:
         )
 
     def validate(self) -> None:
-        # Mirrors the server-side CreateJob validation.
-        if not self.model_name:
-            raise ValueError("sub_job.model_name is required")
-        if self.training is not None and self.sampling is not None:
-            raise ValueError("sub_job.training and sub_job.sampling are mutually exclusive")
-        if self.job_type == JobType.TRAINING:
-            if self.training is None:
-                raise ValueError("training sub-job requires a `training` block")
-            self.training.validate()
-        elif self.job_type in (JobType.SAMPLING, JobType.LOG_PROBABILITY):
-            if self.sampling is None:
-                raise ValueError(f"{self.job_type.value} sub-job requires a `sampling` block")
-            self.sampling.validate()
-        else:  # pragma: no cover - JobType enum is closed
-            raise ValueError(f"unknown job_type: {self.job_type!r}")
+        """Re-validate the current state. Backward-compatible with the old dataclass API."""
+        self.__class__.model_validate(self.model_dump(by_alias=True))
 
     def to_wire(self) -> dict:
         wire: dict = {
@@ -672,8 +1172,8 @@ class SubJobConfig:
             wire["dtype"] = self.dtype
         if self.seed is not None:
             wire["seed"] = self.seed
-        if self.model_post_init is not None:
-            wire["model_post_init"] = list(self.model_post_init)
+        if self.model_post_init_ops is not None:
+            wire["model_post_init"] = list(self.model_post_init_ops)
         if self.training is not None:
             wire["training_config"] = self.training.to_wire()
         if self.sampling is not None:
@@ -681,6 +1181,30 @@ class SubJobConfig:
         if self.source_checkpoint_info is not None:
             wire["source_checkpoint_info"] = self.source_checkpoint_info
         return wire
+
+
+def _validate_raw_sub_job_configs(sub_job_configs: list) -> None:
+    """Canonicalize every ``peft_config`` in a raw create-job body, in place.
+
+    The typed path validates LoRA through :class:`TrainingConfig` /
+    :class:`InferenceConfig`; this gives raw bodies the same guarantee so an
+    adapter that weight sync cannot carry is rejected before the request is
+    sent. Everything else in the body, including ``optimizer``, is forwarded as
+    given.
+    """
+    for index, sub_job in enumerate(sub_job_configs):
+        if not isinstance(sub_job, dict):
+            continue
+        job_type = _normalized_job_type(sub_job.get("job_type"))
+        config_key = "training_config" if job_type == JobType.TRAINING.value else "inference_config"
+        job_config = sub_job.get(config_key)
+        peft_config = job_config.get("peft_config") if isinstance(job_config, dict) else None
+        if peft_config is None:
+            continue
+        job_config["peft_config"] = normalize_lora_peft_config(
+            peft_config,
+            location=f"sub_job_configs[{index}].{config_key}.peft_config",
+        )
 
 
 # ─── Forward-backward payload helpers ────────────────────────────────────
@@ -995,9 +1519,119 @@ def build_forward_backward_payload(spec: dict[str, Any]) -> bytes:
     return serialize_forward_backward_args(args, kwargs)
 
 
+# ─── Generate prompt helpers ─────────────────────────────────────────────
+
+# Wire dtype for pre-tokenized prompts. int32, not int64: a token id needs 18
+# bits for today's vocabularies, and the frame size is the thing being cut.
+# Measured on 8 prompts x 32,768 tokens, int32 gives 4.00 B/token and a 1.05 MB
+# frame; int64 gives 8.00 B/token and 2.10 MB, which is larger than the
+# 7.00 B/token of the JSON encoding it replaces.
+_PROMPT_TOKEN_DTYPE_NAME = "int32"
+
+
+def _tensor_prompts_disabled() -> bool:
+    """True when tensor packing of pre-tokenized prompts is disabled via env var."""
+    return _env_flag_enabled(DISABLE_TENSOR_PROMPTS_ENV)
+
+
+def _as_token_tensor(prompt: list[int]):
+    """One pre-tokenized prompt as a wire-dtype tensor.
+
+    Falls back to int64 rather than failing. A token id outside int32 means a
+    vocabulary of over two billion, so this should never fire -- but torch
+    raises on overflow instead of wrapping, and turning a working request into
+    an exception is a worse trade than sending a larger frame.
+    """
+    torch = _load_torch()
+    try:
+        return torch.tensor(prompt, dtype=_tensor_dtype(torch, _PROMPT_TOKEN_DTYPE_NAME))
+    except (RuntimeError, OverflowError):
+        logger.warning(
+            "token id outside %s; sending this prompt as int64, which doubles its wire size",
+            _PROMPT_TOKEN_DTYPE_NAME,
+        )
+        return torch.tensor(prompt, dtype=torch.int64)
+
+
+def _is_token_id(value: object) -> bool:
+    """True for an integer token id. ``bool`` is an ``int`` subclass and is not one."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _require_token_ids(prompt: list, *, location: str) -> None:
+    for index, value in enumerate(prompt):
+        if not _is_token_id(value):
+            raise ValueError(f"{location}[{index}] must be an integer token id, got {value!r}")
+
+
+def _pack_token_prompts(prompts):
+    """Move pre-tokenized prompts into the frame's tensor section.
+
+    ``wire`` routes a tensor to the safetensors tensor section and everything
+    else into the header as JSON, so a ``list[int]`` prompt travels as JSON
+    text inside what is nominally a binary frame: roughly 7 bytes per token,
+    plus a per-token encode cost paid inside the caller's submit latency.
+    Handing ``wire`` tensors instead puts the token ids in the section built
+    for them.
+
+    Strings are left alone -- they are not token ids and the server tokenizes
+    them. Empty lists are left alone so the server's own non-empty check is
+    the one that rejects them, rather than this becoming a second, differently
+    worded validation.
+    """
+    if _tensor_prompts_disabled():
+        return prompts
+    torch = _load_torch()
+    if torch.is_tensor(prompts) or not isinstance(prompts, list) or not prompts:
+        return prompts
+    # A flat list of token ids is one prompt. Every element has to be an int;
+    # a later float or bool would otherwise be truncated into the tensor.
+    if _is_token_id(prompts[0]):
+        _require_token_ids(prompts, location="prompts")
+        return _as_token_tensor(prompts)
+    packed = []
+    for index, prompt in enumerate(prompts):
+        if isinstance(prompt, list) and prompt and _is_token_id(prompt[0]):
+            _require_token_ids(prompt, location=f"prompts[{index}]")
+            packed.append(_as_token_tensor(prompt))
+        else:
+            packed.append(prompt)
+    return packed
+
+
 def _sql_string_literal(value: str) -> str:
     """Return ``value`` as a single-quoted Snowflake SQL string."""
     return "'" + value.replace("'", "''") + "'"
+
+
+_PLAIN_IDENTIFIER_RE = re.compile(r"[A-Z_][A-Z0-9_$]*")
+
+
+def _sql_identifier(name: str) -> str:
+    """Return ``name`` as a Snowflake identifier that resolves to exactly ``name``.
+
+    A plain uppercase name stays bare; any other is double-quoted, with embedded
+    quotes doubled, so its case and characters survive identifier resolution.
+    """
+    if _PLAIN_IDENTIFIER_RE.fullmatch(name):
+        return name
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _created_param(value: date | datetime | str | None) -> str | None:
+    """Render a ``created_after`` / ``created_before`` query value.
+
+    A ``datetime`` becomes UTC RFC 3339 (a naive one is taken as UTC), a
+    ``date`` stays ``YYYY-MM-DD`` (UTC midnight on the server), and a string is
+    sent as given.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if isinstance(value, date):
+        return value.isoformat()
+    return value
 
 
 def _validate_artifact_relative_path(path: str) -> str:
@@ -1020,7 +1654,11 @@ def _validate_artifact_relative_path(path: str) -> str:
 class CortexTrainingClient:
     """HTTP client for the Cortex Training REST API (``cortex-training``).
 
-    Construct with :meth:`from_pat`::
+    Construct with a named Snowflake connection profile::
+
+        client = CortexTrainingClient.from_connection_name("training")
+
+    Direct PAT authentication remains available through :meth:`from_pat`::
 
         client = CortexTrainingClient.from_pat(
             host="ACCOUNT.snowflakecomputing.com",
@@ -1062,6 +1700,7 @@ class CortexTrainingClient:
         poll_max_interval: float = 6.0,
         pool_maxsize: int = 1024,
         max_retries: int = 10,
+        request_timeout: float | tuple[float, float] = _DEFAULT_REQUEST_TIMEOUT,
     ):
         if poll_interval <= 0:
             raise ValueError("poll_interval must be > 0")
@@ -1075,6 +1714,7 @@ class CortexTrainingClient:
             raise ValueError("pool_maxsize must be > 0")
         if max_retries < 0:
             raise ValueError("max_retries must be >= 0")
+        self.request_timeout = _validated_request_timeout(request_timeout)
         self.base_url = base_url.rstrip("/")
         self.database = database
         self.schema = schema
@@ -1087,6 +1727,9 @@ class CortexTrainingClient:
         self._fwd_bwd_send_count = 0
         self._fwd_bwd_request_debug: dict[str, dict[str, Any]] = {}
         self._generate_request_ids: set[str] = set()
+        # Forward request ids awaiting poll, so a result that is only
+        # ``{"job_id", "payload_b64"}`` (no ``wire_format``) can still be decoded.
+        self._forward_request_ids: set[str] = set()
         # Per-job cache of the sampling sub-job's ``inference_config.max_seq_len``
         # (the value the backend launches vLLM with as ``max_model_len``). Used
         # to validate generate prompt lengths client-side. A cached ``None``
@@ -1095,9 +1738,16 @@ class CortexTrainingClient:
         # transient get_job failure), so a later call will retry.
         self._sampling_max_seq_len: dict[str, int | None] = {}
         self._artifact_connection_config: dict[str, str] | None = None
+        self._artifact_connection_factory: Callable[[], Any] | None = None
+        self._auth_provider: SnowflakeProfileAuth | None = None
+        self._db_ensured = False
+        self._db_creating = False
+        # Both are cleared on a for_job() child; see for_job().
+        self._owns_session = True
+        self._auto_create_database = True
         self._metric_emitter: OtlpMetricEmitter | None = None
         self._operation_metric_state = threading.local()
-        self._session = requests.Session()
+        self._session = _DefaultTimeoutSession(self.request_timeout)
         adapter = HTTPAdapter(pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
@@ -1147,9 +1797,64 @@ class CortexTrainingClient:
             )
         return client
 
+    @classmethod
+    def from_connection_name(
+        cls,
+        connection_name: str | None = None,
+        *,
+        database: str | None = None,
+        schema: str | None = None,
+        endpoint: str = "cortex-training",
+        verify_ssl: bool = True,
+        telemetry_timeout: float = 3.0,
+        **kwargs: Any,
+    ) -> "CortexTrainingClient":
+        """Authenticate through a named or configured-default Snowflake profile.
+
+        Profile discovery and authentication are delegated to
+        ``snowflake-connector-python``. The live Connector session token is sent
+        to the Cortex Training API, and the Connector session is recreated once
+        if the API reports token expiry.
+        """
+        auth = SnowflakeProfileAuth(connection_name)
+        resolved_database = database or auth.database
+        if not resolved_database:
+            auth.close()
+            raise ValueError(
+                "Snowflake connection profile must set database, or pass --database"
+            )
+        resolved_schema = schema or auth.schema or "PUBLIC"
+        try:
+            client = cls(
+                base_url=auth.base_url,
+                database=resolved_database,
+                schema=resolved_schema,
+                endpoint=endpoint,
+                **kwargs,
+            )
+        except Exception:
+            auth.close()
+            raise
+        client._auth_provider = auth
+        client._artifact_connection_factory = auth.open_artifact_connection
+        client._session.verify = verify_ssl
+        if not _telemetry_disabled():
+            client._metric_emitter = OtlpMetricEmitter(
+                client.base_url,
+                SnowflakeTelemetryTokenProvider(auth),
+                verify_ssl=verify_ssl,
+                timeout=telemetry_timeout,
+            )
+        return client
+
     @property
     def _prefix(self) -> str:
-        return f"{self.base_url}/api/v2/databases/{self.database}/schemas/{self.schema}/{self.endpoint}"
+        # "$" is legal in a path segment and common in plain identifiers, so it
+        # stays bare; anything else that could end or split the segment is encoded.
+        return (
+            f"{self.base_url}/api/v2/databases/{quote(self.database, safe='$')}"
+            f"/schemas/{quote(self.schema, safe='$')}/{self.endpoint}"
+        )
 
     def emit_metric(
         self,
@@ -1160,8 +1865,9 @@ class CortexTrainingClient:
     ) -> None:
         """Emit a best-effort OTLP log record used as a client metric.
 
-        PAT clients lazily exchange the PAT for a cached session token on the
-        first call. Local/mock clients, or clients constructed with
+        Profile clients reuse their live Snowflake session token. PAT clients
+        lazily exchange the PAT for a cached session token on the first call.
+        Local/mock clients, or clients constructed with
         ``CORTEX_TRAINING_DISABLE_TELEMETRY`` set, treat this method as a no-op.
         All authentication, discovery, and export errors are ignored.
         """
@@ -1172,14 +1878,23 @@ class CortexTrainingClient:
             return
 
     def close(self) -> None:
-        """Flush telemetry briefly and close this client's HTTP sessions."""
+        """Flush telemetry briefly and close this client's HTTP sessions.
+
+        A client from :meth:`for_job` borrows these, so closing it is a no-op.
+        """
+        if not self._owns_session:
+            return
         try:
             if self._metric_emitter is not None:
                 self._metric_emitter.close()
         except Exception:
             logger.debug("client telemetry close failed", exc_info=True)
         finally:
-            self._session.close()
+            try:
+                self._session.close()
+            finally:
+                if self._auth_provider is not None:
+                    self._auth_provider.close()
 
     def __enter__(self) -> "CortexTrainingClient":
         return self
@@ -1219,6 +1934,14 @@ class CortexTrainingClient:
             if error is not None:
                 value["error_message"] = _safe_metric_error_message(error)
                 attributes.update(_metric_error_attributes(error))
+            attributes.update(
+                _snowflake_request_attributes(
+                    error,
+                    list(
+                        getattr(self._operation_metric_state, "snowflake_request_ids", [])
+                    ),
+                )
+            )
             self.emit_metric(operation, value, attributes=attributes)
         except Exception:
             logger.debug("client operation metric construction failed", exc_info=True)
@@ -1255,12 +1978,103 @@ class CortexTrainingClient:
                 parts.append(f"{key}={value}")
         return " ".join(parts)
 
-    def _send(self, method: str, url: str, *, retry_on=_is_transient, **kwargs) -> requests.Response:
+    def _create_database(self) -> None:
+        """Attempt to create the configured database (and schema if non-PUBLIC).
+
+        Called only when an API request fails with a database-not-found error.
+        Routes through ``_send`` so auth works for both PAT and connection
+        profile users. Raises on failure with an actionable error message.
+        """
+        db_stmt = f"CREATE DATABASE IF NOT EXISTS {self.database}"
+        manual_hint = (
+            f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {self.database}; "
+            "— or if the database already exists, check that your role has USAGE on it."
+        )
+        self._db_creating = True  # prevent recursion from inner _send call
+        try:
+            logger.info("Database '%s' not found. Attempting to create it...", self.database)
+            resp = self._send(
+                "POST",
+                f"{self.base_url}/api/v2/statements",
+                json={"statement": db_stmt, "timeout": 60},
+                max_retries=1,
+            )
+            if resp.status_code == 202:
+                raise RuntimeError(
+                    f"Database creation for '{self.database}' was accepted but has not "
+                    f"completed yet. {manual_hint}"
+                )
+            logger.info("Database '%s' created successfully.", self.database)
+
+            if self.schema.upper() != "PUBLIC":
+                schema_stmt = f"CREATE SCHEMA IF NOT EXISTS {self.database}.{self.schema}"
+                logger.info("Schema '%s' does not exist. Attempting to create it...", self.schema)
+                schema_resp = self._send(
+                    "POST",
+                    f"{self.base_url}/api/v2/statements",
+                    json={"statement": schema_stmt, "timeout": 60},
+                    max_retries=1,
+                )
+                if schema_resp.status_code == 202:
+                    raise RuntimeError(
+                        f"Schema creation for '{self.database}.{self.schema}' was accepted but has not "
+                        f"completed yet. Create it manually: CREATE SCHEMA IF NOT EXISTS {self.database}.{self.schema};"
+                    )
+                logger.info("Schema '%s' created successfully.", self.schema)
+
+            self._db_ensured = True
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not create database '{self.database}': {exc}. {manual_hint}"
+            ) from exc
+        finally:
+            self._db_creating = False
+
+    @staticmethod
+    def _is_database_not_found(resp: requests.Response) -> bool:
+        """Return True if the response indicates the configured database does not exist.
+
+        The Cortex Training API returns 400 with error code 517602 and a message
+        like ``Schema MY_DB.PUBLIC is not found or not authorized`` when the
+        database in the URL path does not exist.
+        """
+        if resp.status_code not in (400, 404, 422):
+            return False
+        try:
+            text = resp.text.lower()
+        except Exception:
+            return False
+        return "not found or not authorized" in text or "does not exist or not authorized" in text
+
+    def _send(
+        self,
+        method: str,
+        url: str,
+        *,
+        retry_on=_is_transient,
+        max_retries: int | None = None,
+        ensure_database: bool = True,
+        **kwargs,
+    ) -> requests.Response:
+        """Send one request with retries.
+
+        ``ensure_database=False`` skips creating the configured database on a
+        not-found error, for routes whose path names no database. A client from
+        :meth:`for_job` never creates one, whatever the caller passes.
+        """
+        auto_create = ensure_database and self._auto_create_database
         fn = getattr(self._session, method.lower())
         debug_context = kwargs.pop("debug_context", None)
         debug_label = self._debug_context_label(debug_context) if debug_context is not None else None
         attempt_no = 0
-        max_attempts = 1 + self.max_retries
+        auth_retry_used = False
+        retry_limit = self.max_retries if max_retries is None else max_retries
+        max_attempts = 1 + retry_limit
+        displayed_max_attempts = max_attempts + (
+            1 if self._auth_provider is not None else 0
+        )
         try:
             state = self._operation_metric_state
             if getattr(state, "active", set()):
@@ -1269,79 +2083,149 @@ class CortexTrainingClient:
             logger.debug("client operation request counting failed", exc_info=True)
 
         def attempt() -> requests.Response:
-            nonlocal attempt_no
-            attempt_no += 1
-            try:
-                state = self._operation_metric_state
-                if getattr(state, "active", set()):
-                    state.attempt_count = getattr(state, "attempt_count", 0) + 1
-            except Exception:
-                logger.debug("client operation attempt counting failed", exc_info=True)
-            if debug_label is not None:
-                logger.debug(
-                    "%s sending %s %s attempt=%d/%d",
-                    debug_label,
-                    method.upper(),
-                    url,
-                    attempt_no,
-                    max_attempts,
-                )
-            try:
-                resp = fn(url, **kwargs)
-            except Exception as exc:
+            nonlocal attempt_no, auth_retry_used
+            while True:
+                attempt_no += 1
+                try:
+                    state = self._operation_metric_state
+                    if getattr(state, "active", set()):
+                        state.attempt_count = getattr(state, "attempt_count", 0) + 1
+                except Exception:
+                    logger.debug(
+                        "client operation attempt counting failed", exc_info=True
+                    )
                 if debug_label is not None:
                     logger.debug(
-                        "%s request exception %s %s attempt=%d/%d: %s: %s",
+                        "%s sending %s %s attempt=%d/%d",
                         debug_label,
                         method.upper(),
                         url,
                         attempt_no,
-                        max_attempts,
-                        type(exc).__name__,
-                        exc,
+                        displayed_max_attempts,
                     )
-                raise
-            status_code = getattr(resp, "status_code", None)
-            headers = getattr(resp, "headers", {}) or {}
-            sf_request_id = headers.get("x-snowflake-request-id")
-            if not isinstance(sf_request_id, str) or not sf_request_id:
-                sf_request_id = None
-            if sf_request_id:
-                req = getattr(resp, "request", None)
-                logger.debug(
-                    "snowflake request_id=%s  %s %s  status=%d",
-                    sf_request_id,
-                    getattr(req, "method", method.upper()),
-                    getattr(req, "path_url", url),
-                    status_code,
-                )
-            if debug_label is not None:
+
+                request_kwargs = kwargs
+                observed_token: str | None = None
+                if self._auth_provider is not None:
+                    observed_token = self._auth_provider.get_token()
+                    request_headers = dict(kwargs.get("headers") or {})
+                    request_headers["Authorization"] = (
+                        f'Snowflake Token="{observed_token}"'
+                    )
+                    request_kwargs = {**kwargs, "headers": request_headers}
                 try:
-                    status_int = int(status_code)
-                except (TypeError, ValueError):
-                    status_int = None
-                outcome = (
-                    "successful response" if status_int is not None and 200 <= status_int < 400 else "failed response"
-                )
-                snowflake = f" snowflake_request_id={sf_request_id}" if sf_request_id else ""
-                logger.debug(
-                    "%s %s %s %s attempt=%d/%d status=%s%s body=%s",
-                    debug_label,
-                    outcome,
-                    method.upper(),
-                    url,
-                    attempt_no,
-                    max_attempts,
-                    status_code,
-                    snowflake,
-                    self._debug_response_summary(resp),
-                )
-            resp.raise_for_status()
-            return resp
+                    resp = fn(url, **request_kwargs)
+                except Exception as exc:
+                    if debug_label is not None:
+                        logger.debug(
+                            "%s request exception %s %s attempt=%d/%d: %s: %s",
+                            debug_label,
+                            method.upper(),
+                            url,
+                            attempt_no,
+                            displayed_max_attempts,
+                            type(exc).__name__,
+                            exc,
+                        )
+                    raise
+
+                status_code = getattr(resp, "status_code", None)
+                sf_request_id = _response_snowflake_request_id(resp)
+                if sf_request_id:
+                    req = getattr(resp, "request", None)
+                    logger.debug(
+                        "snowflake request_id=%s  %s %s  status=%d",
+                        sf_request_id,
+                        getattr(req, "method", method.upper()),
+                        getattr(req, "path_url", url),
+                        status_code,
+                    )
+                    try:
+                        state = self._operation_metric_state
+                        if getattr(state, "active", set()):
+                            seen = state.snowflake_request_ids
+                            seen.append(sf_request_id)
+                            del seen[:-_MAX_TRACKED_SNOWFLAKE_REQUEST_IDS]
+                    except Exception:
+                        logger.debug(
+                            "client operation request id tracking failed",
+                            exc_info=True,
+                        )
+
+                if (
+                    self._auth_provider is not None
+                    and not auth_retry_used
+                    and _is_session_auth_expired_response(resp)
+                ):
+                    auth_retry_used = True
+                    resp.close()
+                    self._auth_provider.refresh(observed_token)
+                    continue
+
+                if debug_label is not None:
+                    try:
+                        status_int = int(status_code)
+                    except (TypeError, ValueError):
+                        status_int = None
+                    outcome = (
+                        "successful response"
+                        if status_int is not None and 200 <= status_int < 300
+                        else "failed response"
+                    )
+                    snowflake = (
+                        f" snowflake_request_id={sf_request_id}"
+                        if sf_request_id
+                        else ""
+                    )
+                    logger.debug(
+                        "%s %s %s %s attempt=%d/%d status=%s%s body=%s",
+                        debug_label,
+                        outcome,
+                        method.upper(),
+                        url,
+                        attempt_no,
+                        displayed_max_attempts,
+                        status_code,
+                        snowflake,
+                        self._debug_response_summary(resp),
+                    )
+                if (
+                    auto_create
+                    and not self._db_ensured
+                    and not self._db_creating
+                    and self._is_database_not_found(resp)
+                ):
+                    resp.close()
+                    self._create_database()
+                    # Retry the original request once after creating the DB.
+                    continue
+                if (
+                    auto_create
+                    and self._db_ensured
+                    and self._is_database_not_found(resp)
+                ):
+                    raise RuntimeError(
+                        f"Database '{self.database}' still not found after creation attempt. "
+                        f"The database may already exist but your role lacks USAGE on it. "
+                        f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {self.database};"
+                    )
+                try:
+                    # requests.Response.raise_for_status() intentionally ignores 3xx.
+                    if 300 <= resp.status_code < 400:
+                        raise requests.exceptions.HTTPError(
+                            f"Unexpected redirect {resp.status_code} for url: {url}",
+                            response=resp,
+                            request=getattr(resp, "request", None),
+                        )
+                    resp.raise_for_status()
+                except requests.exceptions.HTTPError as exc:
+                    _add_snowflake_request_id_to_error(exc, sf_request_id)
+                    raise
+                return resp
 
         retryer = Retrying(
             retry=retry_if_exception(retry_on),
-            stop=stop_after_attempt(1 + self.max_retries),
+            stop=stop_after_attempt(max_attempts),
             wait=wait_exponential_jitter(initial=0.5, max=10.0),
             reraise=True,
         )
@@ -1363,8 +2247,8 @@ class CortexTrainingClient:
 
         Each :class:`SubJobConfig` is validated client-side before the request
         is sent (see :meth:`SubJobConfig.validate`). A job supports zero or one
-        ``training`` sub-job and any number of ``sampling`` /
-        ``log_probability`` sub-jobs. ``job_id`` is optional;
+        ``training`` sub-job and any number of ``sampling`` sub-jobs;
+        ``log_probability`` sub-jobs are rejected here. ``job_id`` is optional;
         when omitted the server generates one. ``experiment_name`` is optional;
         when omitted the server auto-creates an experiment for the job.
         ``hardware`` is optional (:class:`Hardware`.H200 / .B200 / .B300); when
@@ -1399,8 +2283,11 @@ class CortexTrainingClient:
                 raise ValueError(
                     "pending_timeout_seconds must be between 300 and 604800"
                 )
-        for sj in sub_jobs:
-            sj.validate()
+        for index, sj in enumerate(sub_jobs):
+            _reject_log_probability_sub_job(
+                sj.job_type, location=f"sub_jobs[{index}].job_type"
+            )
+            SubJobConfig.model_validate(sj.model_dump(by_alias=True))
         body: dict = {"sub_job_configs": [sj.to_wire() for sj in sub_jobs]}
         if job_id is not None:
             body["job_id"] = job_id
@@ -1422,22 +2309,32 @@ class CortexTrainingClient:
         while :meth:`create_job` remains the typed path for Python callers.
 
         A job supports zero or one ``training`` sub-job and any number of
-        ``sampling`` / ``log_probability`` sub-jobs; a second training sub-job
-        raises :class:`ValueError` before the request is sent.
+        ``sampling`` sub-jobs; a second training sub-job or any
+        ``log_probability`` sub-job raises :class:`ValueError` before the
+        request is sent.
+
+        Every ``peft_config`` present in the body is canonicalized in place and
+        an invalid one raises :class:`ValueError` before the request is sent.
+        The rest of the body, including ``optimizer``, is forwarded as given.
         """
         if not isinstance(body, dict):
             raise ValueError("create_job_from_body requires a JSON object")
         sub_job_configs = body.get("sub_job_configs")
         if not isinstance(sub_job_configs, list) or not sub_job_configs:
             raise ValueError("create_job_from_body requires a non-empty sub_job_configs list")
-        training_sub_jobs = sum(
-            1
-            for cfg in sub_job_configs
-            if isinstance(cfg, dict)
-            and str(cfg.get("job_type") or "").strip().lower() == JobType.TRAINING.value
-        )
-        if training_sub_jobs > 1:
-            raise ValueError("at most one training sub-job is supported per job")
+        training_sub_jobs = 0
+        for index, cfg in enumerate(sub_job_configs):
+            if not isinstance(cfg, dict):
+                continue
+            job_type = cfg.get("job_type")
+            _reject_log_probability_sub_job(
+                job_type, location=f"sub_job_configs[{index}].job_type"
+            )
+            if str(job_type or "").strip().lower() == JobType.TRAINING.value:
+                training_sub_jobs += 1
+                if training_sub_jobs > 1:
+                    raise ValueError("at most one training sub-job is supported per job")
+        _validate_raw_sub_job_configs(sub_job_configs)
         if body.get("debug") and not _debug_options_enabled():
             raise ValueError(
                 "create-job debug options are an internal-only capability; set "
@@ -1478,9 +2375,14 @@ class CortexTrainingClient:
                 return job
             if status in ("failed", "done", "cancelled", "canceled"):
                 reason = job.get("reason", "")
-                raise RuntimeError(f"Job {job_id} reached terminal state '{status}': {reason}")
+                raise _server_failure(
+                    RuntimeError(f"Job {job_id} reached terminal state '{status}': {reason}"),
+                    failed=status == "failed",
+                )
             delay = self._sleep_with_backoff(delay, deadline)
-        raise TimeoutError(f"Job {job_id} did not become running within {self.poll_timeout}s")
+        raise _server_failure(
+            TimeoutError(f"Job {job_id} did not become running within {self.poll_timeout}s")
+        )
 
     @_track_operation("get_job")
     def get_job(self, job_id: str) -> dict:
@@ -1500,6 +2402,121 @@ class CortexTrainingClient:
         """Return active models configured for new jobs."""
         resp = self._send("GET", f"{self._prefix}/models")
         return resp.json().get("models", [])
+
+    def iter_jobs(
+        self,
+        *,
+        database: str | None = None,
+        schema: str | None = None,
+        status: str | list[str] | None = None,
+        submitted_by: str | None = None,
+        created_after: date | datetime | str | None = None,
+        created_before: date | datetime | str | None = None,
+        page_size: int = 100,
+    ) -> Iterator[dict]:
+        """Yield the jobs the caller can see across the account, newest first.
+
+        Reads the account-level ``GET /api/v2/{endpoint}`` route rather than
+        this client's schema, and follows ``next_page_token`` until the server
+        returns none; a page may hold fewer than ``page_size`` rows, even none.
+        Arguments are checked on the call, pages fetched as you iterate:
+        ``page_size`` is 1 to 1000, and ``schema`` needs ``database`` with it.
+        The server applies every filter: ``database`` / ``schema`` narrow the
+        scope, ``status`` is one status or a list of them (``active`` and
+        ``done`` name groups), ``submitted_by`` takes a user name, and
+        ``created_after`` (inclusive) / ``created_before`` (exclusive) take a
+        ``date``, a ``datetime`` (sent in UTC; naive is taken as UTC) or a
+        string sent as-is. Rows also carry ``database_name`` and
+        ``schema_name``; use :meth:`for_job` for per-job calls on one.
+
+        A 404 means account-level listing is not enabled for this account, and
+        is raised at once rather than retried.
+        """
+        if not 1 <= page_size <= 1000:
+            raise ValueError(f"page_size must be between 1 and 1000, got {page_size}")
+        if schema is not None and database is None:
+            raise ValueError(
+                "iter_jobs(schema=...) needs database=... with it: a schema name "
+                "alone does not name one schema."
+            )
+        if status is not None and not isinstance(status, str):
+            status = ",".join(status)
+        query = {
+            "database": database,
+            "schema": schema,
+            "status": status,
+            "submitted_by": submitted_by,
+            "created_after": _created_param(created_after),
+            "created_before": _created_param(created_before),
+            "limit": page_size,
+        }
+        params = {key: value for key, value in query.items() if value is not None}
+        return self._iter_account_jobs(params)
+
+    def _iter_account_jobs(self, params: dict) -> Iterator[dict]:
+        while True:
+            page = self._list_account_jobs_page(params)
+            yield from page.get("jobs", [])
+            token = page.get("next_page_token")
+            if not token:
+                return
+            params = {**params, "page_token": token}
+
+    # Tracked per page: around the generator, _track_operation would record
+    # iter_jobs as finished before its first request.
+    @_track_operation("iter_jobs")
+    def _list_account_jobs_page(self, params: dict) -> dict:
+        try:
+            resp = self._send(
+                "GET",
+                f"{self.base_url}/api/v2/{self.endpoint}",
+                params=params,
+                retry_on=_is_account_list_transient,
+                # The path names no database, so a not-found error here is not
+                # about the configured one.
+                ensure_database=False,
+            )
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is None or exc.response.status_code != 404:
+                raise
+            raise requests.exceptions.HTTPError(
+                "account-level job listing is not enabled for this account",
+                request=exc.request,
+                response=exc.response,
+            ) from exc
+        return resp.json()
+
+    def for_job(self, job: dict) -> "CortexTrainingClient":
+        """Return a client bound to ``job``'s schema, for per-job calls on a
+        row from :meth:`iter_jobs`.
+
+        The new client borrows this client's session, auth and telemetry, so
+        keep this one open and close it rather than the new one. It never
+        creates the job's database, which exists and may be another role's: a
+        not-found answer surfaces as the HTTP error it is.
+        """
+        client = type(self)(
+            base_url=self.base_url,
+            database=_sql_identifier(job["database_name"]),
+            schema=_sql_identifier(job["schema_name"]),
+            endpoint=self.endpoint,
+            poll_interval=self.poll_interval,
+            poll_timeout=self.poll_timeout,
+            poll_backoff_multiplier=self.poll_backoff_multiplier,
+            poll_max_interval=self.poll_max_interval,
+            max_retries=self.max_retries,
+            request_timeout=self.request_timeout,
+        )
+        # Release the session and pool the constructor just opened.
+        client._session.close()
+        client._session = self._session
+        client._owns_session = False
+        client._auto_create_database = False
+        client._auth_provider = self._auth_provider
+        client._metric_emitter = self._metric_emitter
+        client._artifact_connection_config = self._artifact_connection_config
+        client._artifact_connection_factory = self._artifact_connection_factory
+        return client
 
     @_track_operation("cancel_job")
     def cancel_job(self, job_id: str) -> None:
@@ -1543,25 +2560,62 @@ class CortexTrainingClient:
           blocked: a submit within the ceiling is still accepted and queued.
 
         See ``docs/reference/rest-api.md`` section 5.5 for the authoritative
-        field list.
+        field list, and :meth:`get_capacity_breakdown` to split ``in_use_gpus``
+        and ``pending_gpus`` by sub-job type or by submitting user.
         """
         params = {}
         if hardware is not None:
             params["hardware"] = _hardware_wire(hardware)
+        return _capacity_totals(self._fetch_capacity(params))
+
+    @_track_operation("get_capacity_breakdown")
+    def get_capacity_breakdown(
+        self,
+        hardware: Hardware | str | None = None,
+        *,
+        dimensions: Iterable[str] = _CAPACITY_BREAKDOWN_DIMENSIONS,
+    ) -> dict:
+        """Return :meth:`get_capacity` plus a ``"breakdown"`` of its GPU usage.
+
+        Sends the same single request as :meth:`get_capacity` with
+        ``?breakdown=`` naming ``dimensions``: ``"job_type"``,
+        ``"submitted_by"``, or both (the default). Any other value raises
+        ``ValueError`` before sending.
+
+        ``breakdown`` holds ``job_count``, ``truncated``,
+        ``unsupported_dimensions``, and ``by_job_type`` / ``by_submitted_by``
+        for the requested dimensions. Each has a ``status`` (``OK``,
+        ``DISABLED``, ``UNAVAILABLE``, or any newer value the server sends)
+        and ``groups``; under ``OK`` the groups add up to ``in_use_gpus`` and
+        ``pending_gpus``. Missing counts are 0; on non-``USER`` groups
+        ``submitted_by`` is ``None`` and ``is_caller`` is ``False``.
+
+        See ``docs/reference/rest-api.md`` section 5.4 for every field.
+        """
+        dimensions = _capacity_breakdown_dimensions(dimensions)
+        params = {}
+        if hardware is not None:
+            params["hardware"] = _hardware_wire(hardware)
+        params["breakdown"] = ",".join(dimensions)
+        body = self._fetch_capacity(params)
+        return {
+            **_capacity_totals(body),
+            "breakdown": _capacity_breakdown(body, dimensions),
+        }
+
+    def _fetch_capacity(self, params: Mapping[str, str]) -> Any:
+        """``GET /capacity`` once, under the capacity timeout bound; return its JSON."""
         resp = self._send(
             "GET",
             f"{self._prefix}/capacity",
+            timeout=(
+                min(self.request_timeout[0], _CAPACITY_REQUEST_TIMEOUT[0]),
+                min(self.request_timeout[1], _CAPACITY_REQUEST_TIMEOUT[1]),
+            ),
+            max_retries=0,
             **({"params": params} if params else {}),
         )
-        body = resp.json()
-        return {
-            "has_reservation": bool(body.get("has_reservation", False)),
-            "max_total_gpus": int(body.get("max_total_gpus", 0)),
-            "reserved_gpus": int(body.get("reserved_gpus", 0)),
-            "in_use_gpus": int(body.get("in_use_gpus", 0)),
-            "pending_gpus": int(body.get("pending_gpus", 0)),
-            "available_gpus": int(body.get("available_gpus", 0)),
-        }
+        return resp.json()
 
     @_track_operation("get_experiment_run")
     def get_experiment_run(self, job_id: str) -> dict[str, str]:
@@ -1606,16 +2660,16 @@ class CortexTrainingClient:
         config = self._artifact_connection_config
         if config is None:
             raise RuntimeError("requires a PAT-authenticated client")
-        user, account, role = self._query_sql_row(
-            "SELECT CURRENT_USER(), CURRENT_ACCOUNT_NAME(), CURRENT_ROLE()"
-        )
+        user, role = self._query_sql_row("SELECT CURRENT_USER(), CURRENT_ROLE()")
         if not isinstance(user, str) or not user:
             raise ValueError("SQL identity response missing current user")
-        if not isinstance(account, str) or not account:
-            raise ValueError("SQL identity response missing current account")
         kwargs: dict[str, Any] = {
             "host": config["host"],
-            "account": account,
+            # The login must name the account this host addresses; given the host,
+            # the connector's parse_account derives it (first label, or a .global
+            # host without its external id). CURRENT_ACCOUNT_NAME() is not that
+            # on a locator host and that pairing returns 404.
+            "account": config["host"],
             "user": user,
             "authenticator": "PROGRAMMATIC_ACCESS_TOKEN",
             "token": config["pat"],
@@ -1628,6 +2682,12 @@ class CortexTrainingClient:
 
     def _open_experiment_artifact_connection(self) -> Any:
         """Open a connector session for Snowflake experiment artifact LIST/GET."""
+        if self._artifact_connection_factory is not None:
+            return self._artifact_connection_factory()
+        if self._artifact_connection_config is None:
+            raise RuntimeError(
+                "experiment artifact download requires a Snowflake-authenticated client"
+            )
         import snowflake.connector
 
         return snowflake.connector.connect(**self._snowflake_connection_kwargs())
@@ -1772,6 +2832,376 @@ class CortexTrainingClient:
         finally:
             connection.close()
 
+    @staticmethod
+    def _resume_manifest_path(destination: Path) -> Path:
+        return destination.with_name("." + destination.name + ".manifest.json")
+
+    @classmethod
+    def _read_resume_manifest(cls, destination: Path) -> tuple[list[str], int] | None:
+        path = cls._resume_manifest_path(destination)
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(doc, dict) or doc.get("version") != 1:
+            return None
+        names = doc.get("names")
+        nbytes = doc.get("bytes")
+        if (
+            not isinstance(names, list)
+            or not names
+            or not all(isinstance(name, str) and name for name in names)
+            or isinstance(nbytes, bool)
+            or not isinstance(nbytes, int)
+            or nbytes < 0
+        ):
+            return None
+        return list(names), nbytes
+
+    @classmethod
+    def _write_resume_manifest(cls, destination: Path, names: list[str], nbytes: int) -> None:
+        path = cls._resume_manifest_path(destination)
+        payload = json.dumps({"bytes": nbytes, "names": names, "version": 1}) + "\n"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".manifest-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _copy_gzip_member(downloaded: Path, output) -> None:
+        with downloaded.open("rb") as compressed:
+            with gzip.GzipFile(fileobj=compressed, mode="rb") as source:
+                shutil.copyfileobj(source, output, length=_STREAM_COPY_BUFFER_BYTES)
+
+    @staticmethod
+    def _artifact_result(
+        destination: Path,
+        run_uri: str,
+        names: list[str],
+    ) -> dict[str, Any]:
+        return {
+            "sub_job_id": destination.parent.name,
+            "filename": destination.name,
+            "saved_path": str(destination),
+            "chunk_count": len(names),
+            "first_artifact_uri": run_uri + names[0],
+            "last_artifact_uri": run_uri + names[-1],
+        }
+
+    def _download_gzip_member(
+        self,
+        connection: Any,
+        run_uri: str,
+        relative_path: str,
+        artifact_temp: Path,
+        output,
+    ) -> None:
+        downloaded = self._download_experiment_artifact(
+            connection,
+            run_uri,
+            relative_path,
+            artifact_temp,
+        )
+        try:
+            self._copy_gzip_member(downloaded, output)
+        finally:
+            downloaded.unlink(missing_ok=True)
+
+    @staticmethod
+    def _artifact_progress_status(
+        artifact_name: str, done: int, total: int, sub_job_id: str
+    ) -> str:
+        width = 20
+        filled = (width * done) // total
+        bar = "#" * filled + "-" * (width - filled)
+        return f"{artifact_name}: [{bar}] {done}/{total} {sub_job_id}"
+
+    @staticmethod
+    def _report_artifact_progress(progress: Callable[[str], None] | None, message: str) -> None:
+        if progress is not None:
+            progress(message)
+
+    @contextlib.contextmanager
+    def _artifact_progress_line(
+        self, progress: Callable[[str], None] | None
+    ) -> Iterator[None]:
+        """Close the status line with ``"\\n"`` whether the body succeeds or fails.
+
+        On failure the download error wins over any error from the newline.
+        """
+        try:
+            yield
+        except BaseException:
+            try:
+                self._report_artifact_progress(progress, "\n")
+            except BaseException:
+                pass
+            raise
+        self._report_artifact_progress(progress, "\n")
+
+    def _write_ordered_gzip_chunks(
+        self,
+        connection: Any,
+        run_uri: str,
+        artifact_temp: Path,
+        paths: list[str],
+        output,
+        on_chunk: Callable[[int], None] | None = None,
+    ) -> None:
+        """GET sessions are not shared across workers; bytes append in path order."""
+        if len(paths) < _ARTIFACT_GET_MIN_CHUNKS:
+            for index, relative_path in enumerate(paths, start=1):
+                self._download_gzip_member(
+                    connection,
+                    run_uri,
+                    relative_path,
+                    artifact_temp,
+                    output,
+                )
+                if on_chunk is not None:
+                    on_chunk(index)
+            return
+        pool = [connection]
+        try:
+            limit = min(_ARTIFACT_GET_WORKERS, len(paths))
+            warned = False
+            while len(pool) < limit:
+                try:
+                    extra = self._open_experiment_artifact_connection()
+                except Exception:
+                    if not warned:
+                        logger.warning(
+                            "could not open an extra session for artifact download; "
+                            "continuing with %d",
+                            len(pool),
+                        )
+                        warned = True
+                    break
+                if any(extra is existing for existing in pool):
+                    break
+                pool.append(extra)
+            self._write_gzip_chunk_batches(
+                pool, run_uri, artifact_temp, paths, output, on_chunk
+            )
+        finally:
+            for extra in pool[1:]:
+                try:
+                    extra.close()
+                except Exception:
+                    logger.warning("failed to close an extra artifact-download session")
+
+    def _write_gzip_chunk_batches(
+        self,
+        pool: list[Any],
+        run_uri: str,
+        artifact_temp: Path,
+        paths: list[str],
+        output,
+        on_chunk: Callable[[int], None] | None,
+    ) -> None:
+        batch_size = len(pool)
+        for start in range(0, len(paths), batch_size):
+            batch = paths[start : start + batch_size]
+            chunk_dirs = []
+            for offset, _relative_path in enumerate(batch):
+                chunk_dir = artifact_temp / f"chunk-{start + offset}"
+                chunk_dir.mkdir()
+                chunk_dirs.append(chunk_dir)
+            try:
+                with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                    futures = [
+                        executor.submit(
+                            self._download_experiment_artifact,
+                            pool[index],
+                            run_uri,
+                            relative_path,
+                            chunk_dir,
+                        )
+                        for index, (relative_path, chunk_dir) in enumerate(
+                            zip(batch, chunk_dirs)
+                        )
+                    ]
+                    for offset, (future, chunk_dir) in enumerate(
+                        zip(futures, chunk_dirs), start=1
+                    ):
+                        downloaded = future.result()
+                        self._copy_gzip_member(downloaded, output)
+                        shutil.rmtree(chunk_dir, ignore_errors=True)
+                        if on_chunk is not None:
+                            on_chunk(start + offset)
+            finally:
+                for chunk_dir in chunk_dirs:
+                    shutil.rmtree(chunk_dir, ignore_errors=True)
+
+    def _rebuild_gzip_file(
+        self,
+        connection: Any,
+        run_uri: str,
+        artifact_temp: Path,
+        destination: Path,
+        chunk_paths: list[str],
+        *,
+        temporary_prefix: str,
+        artifact_name: str,
+        progress: Callable[[str], None] | None,
+    ) -> dict[str, Any]:
+        """Write every chunk to a temp file, then replace the destination.
+
+        The manifest is removed only after the temp file is fsynced, so a failed
+        chunk download leaves the previous manifest and destination in place.
+        """
+        sub_job_id = destination.parent.name
+        chunk_count = len(chunk_paths)
+
+        def report_chunk(index: int) -> None:
+            self._report_artifact_progress(
+                progress,
+                self._artifact_progress_status(
+                    artifact_name, index, chunk_count, sub_job_id
+                ),
+            )
+
+        with self._artifact_progress_line(progress):
+            self._report_artifact_progress(
+                progress,
+                self._artifact_progress_status(artifact_name, 0, chunk_count, sub_job_id),
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            output = tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=str(destination.parent),
+                prefix=temporary_prefix,
+                suffix=".tmp",
+                delete=False,
+            )
+            temporary = Path(output.name)
+            try:
+                self._write_ordered_gzip_chunks(
+                    connection,
+                    run_uri,
+                    artifact_temp,
+                    chunk_paths,
+                    output,
+                    report_chunk,
+                )
+                output.flush()
+                os.fsync(output.fileno())
+                output.close()
+                self._resume_manifest_path(destination).unlink(missing_ok=True)
+                os.replace(temporary, destination)
+                nbytes = destination.stat().st_size
+                self._write_resume_manifest(destination, chunk_paths, nbytes)
+            except BaseException:
+                if not output.closed:
+                    output.close()
+                temporary.unlink(missing_ok=True)
+                raise
+        return self._artifact_result(destination, run_uri, chunk_paths)
+
+    def _append_gzip_chunks(
+        self,
+        connection: Any,
+        run_uri: str,
+        artifact_temp: Path,
+        destination: Path,
+        chunk_paths: list[str],
+        known: list[str],
+        committed: int,
+        *,
+        temporary_prefix: str,
+        artifact_name: str,
+        progress: Callable[[str], None] | None,
+    ) -> dict[str, Any]:
+        """Append chunk paths that sort after ``known``, or rebuild."""
+        sub_job_id = destination.parent.name
+        if known != chunk_paths[: len(known)]:
+            return self._rebuild_gzip_file(
+                connection,
+                run_uri,
+                artifact_temp,
+                destination,
+                chunk_paths,
+                temporary_prefix=temporary_prefix,
+                artifact_name=artifact_name,
+                progress=progress,
+            )
+        new_paths = chunk_paths[len(known) :]
+        try:
+            size = destination.stat().st_size
+        except OSError:
+            size = -1
+        if not destination.is_file() or size < committed:
+            return self._rebuild_gzip_file(
+                connection,
+                run_uri,
+                artifact_temp,
+                destination,
+                chunk_paths,
+                temporary_prefix=temporary_prefix,
+                artifact_name=artifact_name,
+                progress=progress,
+            )
+        if not new_paths:
+            self._report_artifact_progress(
+                progress,
+                f"{artifact_name}: no new chunks for {sub_job_id}\n",
+            )
+            if size > committed:
+                with destination.open("r+b") as output:
+                    output.truncate(committed)
+                    output.flush()
+                    os.fsync(output.fileno())
+            return self._artifact_result(destination, run_uri, known)
+        names = list(known) + new_paths
+
+        def report_chunk(index: int) -> None:
+            self._report_artifact_progress(
+                progress,
+                self._artifact_progress_status(
+                    artifact_name, index, len(new_paths), sub_job_id
+                ),
+            )
+
+        with self._artifact_progress_line(progress):
+            self._report_artifact_progress(
+                progress,
+                self._artifact_progress_status(
+                    artifact_name, 0, len(new_paths), sub_job_id
+                ),
+            )
+            with destination.open("r+b") as output:
+                output.seek(committed)
+                output.truncate(committed)
+                try:
+                    self._write_ordered_gzip_chunks(
+                        connection,
+                        run_uri,
+                        artifact_temp,
+                        new_paths,
+                        output,
+                        report_chunk,
+                    )
+                    output.flush()
+                    os.fsync(output.fileno())
+                    end = output.tell()
+                except BaseException:
+                    output.truncate(committed)
+                    output.flush()
+                    os.fsync(output.fileno())
+                    raise
+            self._write_resume_manifest(destination, names, end)
+        return self._artifact_result(destination, run_uri, names)
+
     def _download_gzip_artifacts(
         self,
         job_id: str,
@@ -1781,12 +3211,17 @@ class CortexTrainingClient:
         chunk_pattern: re.Pattern[str],
         destination_name: str,
         temporary_prefix: str,
+        resume: bool = False,
+        progress: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]:
-        """Reconstruct staged gzip chunks into one atomic file per sub-job."""
+        """Reconstruct staged gzip chunks into one file per sub-job.
+
+        Each sub-job is committed before the next one starts. ``resume=True``
+        appends when the manifest names are a prefix of the sorted chunk list.
+        """
         run_uri, run_name = self._experiment_run_uri(job_id)
         connection = self._open_experiment_artifact_connection()
         root = Path(output_dir).expanduser()
-        downloads: dict[str, dict[str, Any]] = {}
         artifact_roots = (f"_{artifact_name}", f"checkpoints/_{artifact_name}")
         try:
             paths_by_root = {
@@ -1824,6 +3259,13 @@ class CortexTrainingClient:
                         )
                     chunks["paths"].append(relative_path)
 
+            if not chunks_by_sub_job:
+                self._report_artifact_progress(
+                    progress, f"{artifact_name}: found 0 chunks\n"
+                )
+                return []
+
+            results: list[dict[str, Any]] = []
             with tempfile.TemporaryDirectory(
                 prefix=f"cortex-training-{artifact_name}-artifacts-"
             ) as temp:
@@ -1831,75 +3273,58 @@ class CortexTrainingClient:
                 for sub_job_id in sorted(chunks_by_sub_job):
                     chunk_paths = sorted(chunks_by_sub_job[sub_job_id]["paths"])
                     destination = root / sub_job_id / destination_name
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    output = tempfile.NamedTemporaryFile(
-                        mode="wb",
-                        dir=str(destination.parent),
-                        prefix=temporary_prefix,
-                        suffix=".tmp",
-                        delete=False,
-                    )
-                    state = {
-                        "destination": destination,
-                        "temporary": Path(output.name),
-                        "output": output,
-                        "chunk_count": 0,
-                        "first_path": chunk_paths[0],
-                        "last_path": chunk_paths[-1],
-                    }
-                    downloads[sub_job_id] = state
-                    for relative_path in chunk_paths:
-                        downloaded = self._download_experiment_artifact(
+                    prior = self._read_resume_manifest(destination) if resume else None
+                    if prior is None:
+                        results.append(
+                            self._rebuild_gzip_file(
+                                connection,
+                                run_uri,
+                                artifact_temp,
+                                destination,
+                                chunk_paths,
+                                temporary_prefix=temporary_prefix,
+                                artifact_name=artifact_name,
+                                progress=progress,
+                            )
+                        )
+                        continue
+                    known, committed = prior
+                    results.append(
+                        self._append_gzip_chunks(
                             connection,
                             run_uri,
-                            relative_path,
                             artifact_temp,
+                            destination,
+                            chunk_paths,
+                            known,
+                            committed,
+                            temporary_prefix=temporary_prefix,
+                            artifact_name=artifact_name,
+                            progress=progress,
                         )
-                        try:
-                            with downloaded.open("rb") as compressed:
-                                with gzip.GzipFile(fileobj=compressed, mode="rb") as source:
-                                    shutil.copyfileobj(
-                                        source,
-                                        output,
-                                        length=_STREAM_COPY_BUFFER_BYTES,
-                                    )
-                        finally:
-                            downloaded.unlink(missing_ok=True)
-                        state["chunk_count"] += 1
-
-            results: list[dict[str, Any]] = []
-            for sub_job_id in sorted(downloads):
-                state = downloads[sub_job_id]
-                output = state["output"]
-                output.flush()
-                os.fsync(output.fileno())
-                output.close()
-                os.replace(state["temporary"], state["destination"])
-                results.append(
-                    {
-                        "sub_job_id": sub_job_id,
-                        "filename": state["destination"].name,
-                        "saved_path": str(state["destination"]),
-                        "chunk_count": state["chunk_count"],
-                        "first_artifact_uri": run_uri + state["first_path"],
-                        "last_artifact_uri": run_uri + state["last_path"],
-                    }
-                )
+                    )
             return results
-        except BaseException:
-            for state in downloads.values():
-                output = state["output"]
-                if not output.closed:
-                    output.close()
-                state["temporary"].unlink(missing_ok=True)
-            raise
         finally:
             connection.close()
 
     def download_stdout_logs(
-        self, job_id: str, output_dir: str | os.PathLike[str]
+        self,
+        job_id: str,
+        output_dir: str | os.PathLike[str],
+        *,
+        resume: bool = False,
+        progress: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]:
-        """Reconstruct sealed console artifacts into one file per sub-job."""
+        """Reconstruct sealed console artifacts into one file per sub-job.
+
+        ``resume=True`` appends chunks that are not already recorded beside the
+        file. Two downloads of the same output directory at once are unsupported.
+        ``progress`` receives status updates without a trailing newline, then
+        ``"\\n"`` when that sub-job finishes or fails. A status that needs no
+        updating (nothing new, no chunks) arrives as one message ending in a
+        newline. An error raised by ``progress`` stops the download. The return
+        value is unchanged.
+        """
         return self._download_gzip_artifacts(
             job_id,
             output_dir,
@@ -1907,12 +3332,28 @@ class CortexTrainingClient:
             chunk_pattern=_STDOUT_CHUNK_RE,
             destination_name="stdout.log",
             temporary_prefix=".stdout-",
+            resume=resume,
+            progress=progress,
         )
 
     def download_metrics(
-        self, job_id: str, output_dir: str | os.PathLike[str]
+        self,
+        job_id: str,
+        output_dir: str | os.PathLike[str],
+        *,
+        resume: bool = False,
+        progress: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]:
-        """Reconstruct staged GPU metric chunks into one JSONL file per sub-job."""
+        """Reconstruct staged GPU metric chunks into one JSONL file per sub-job.
+
+        ``resume=True`` appends chunks that are not already recorded beside the
+        file. Two downloads of the same output directory at once are unsupported.
+        ``progress`` receives status updates without a trailing newline, then
+        ``"\\n"`` when that sub-job finishes or fails. A status that needs no
+        updating (nothing new, no chunks) arrives as one message ending in a
+        newline. An error raised by ``progress`` stops the download. The return
+        value is unchanged.
+        """
         return self._download_gzip_artifacts(
             job_id,
             output_dir,
@@ -1920,6 +3361,8 @@ class CortexTrainingClient:
             chunk_pattern=_GPU_METRICS_CHUNK_RE,
             destination_name="gpu.jsonl",
             temporary_prefix=".gpu-metrics-",
+            resume=resume,
+            progress=progress,
         )
 
     # ─── Data-plane async operations ─────────────────────────────────────
@@ -1929,9 +3372,45 @@ class CortexTrainingClient:
     _MAX_FWD_BWD_BYTES = 60 * 1024 * 1024  # 60 MB
 
     # Maximum payload size for generate / generate_stream request bodies.
-    # The encoded JSON body must stay under this cap; oversized requests fail
-    # fast client-side with a clear message.
+    # The encoded frame must stay under this cap; generate splits an oversized
+    # frame into request chunks, while generate_stream fails fast client-side
+    # with a clear message.
     _MAX_GENERATE_BYTES = 60 * 1024 * 1024  # 60 MB
+
+    def _build_generate_frame(
+        self,
+        op: str,
+        job_id: str,
+        prompts,
+        sampling_params,
+        routing_key,
+        strict,
+    ) -> bytes:
+        """Encode a generate request body, for both the unary and stream calls.
+
+        The two calls take the same logical fields and the server reads them
+        from the same request model, so any difference in how they encode is a
+        bug waiting to happen -- and was one: ``generate_stream`` built its
+        body with ``json.dumps`` long after ``generate`` had moved token ids
+        into the frame's tensor section, so streaming callers silently kept
+        paying the JSON encoding for every token.
+
+        ``op`` only names the caller in the length-check error message.
+        """
+        self._check_prompt_lengths(op, job_id, prompts)
+        # Packed after validation so the check above still reads plain lists,
+        # and so a rejected prompt is never converted for nothing.
+        payload: dict = {"prompts": _pack_token_prompts(prompts)}
+        if sampling_params is not None:
+            payload["sampling_params"] = sampling_params
+        if routing_key is not None:
+            payload["routing_key"] = routing_key
+        if strict is not None:
+            payload["strict"] = strict
+        return wire.dumps(
+            payload,
+            metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}},
+        )
 
     def _check_generate_payload(self, op: str, body: bytes) -> None:
         if len(body) > self._MAX_GENERATE_BYTES:
@@ -1983,17 +3462,40 @@ class CortexTrainingClient:
         a generation prompt must be strictly shorter than ``max_model_len`` so
         at least one output token fits, i.e. it is rejected when
         ``len(prompt_token_ids) >= max_seq_len``. Only pre-tokenized prompts
-        (``list[int]``) are validated here, since their token count is exact;
-        string prompts would require replicating the server tokenizer and are
-        left to fail server-side.
+        are validated here, since their token count is exact; string prompts
+        would require replicating the server tokenizer and are left to fail
+        server-side.
+
+        Tensors count as pre-tokenized. They are a supported wire shape for
+        token ids, and matching on ``list`` alone let one through unchecked --
+        silently trading a clear client-side error for vLLM's much later
+        ``maximum model length`` failure.
         """
-        if not any(isinstance(p, list) for p in prompts):
+        torch = _load_torch()
+
+        def _pretokenized(p) -> bool:
+            return isinstance(p, list) or torch.is_tensor(p)
+
+        # ``prompts`` is either one prompt or a batch of them. Iterating one
+        # prompt yields its tokens, which the loop below would then read as
+        # prompts: a flat ``list[int]`` lands on ``int``, which is not
+        # pre-tokenized, so the whole check is skipped; a bare tensor lands on
+        # 0-d scalars, which are tensors, so the check proceeds and ``len()``
+        # raises on them. Wrapping first means one prompt is checked as one
+        # prompt in either shape, and reads the argument the same way
+        # ``_pack_token_prompts`` does.
+        if torch.is_tensor(prompts) or (
+            isinstance(prompts, list) and prompts and _is_token_id(prompts[0])
+        ):
+            prompts = [prompts]
+
+        if not any(_pretokenized(p) for p in prompts):
             return
         max_seq_len = self._resolve_sampling_max_seq_len(job_id)
         if max_seq_len is None:
             return
         for i, prompt in enumerate(prompts):
-            if not isinstance(prompt, list):
+            if not _pretokenized(prompt):
                 continue
             n = len(prompt)
             if n >= max_seq_len:
@@ -2139,27 +3641,17 @@ class CortexTrainingClient:
 
         Prompt-length validation is asymmetric by input type:
 
-        * **Pre-tokenized prompts** (``list[int]``) are checked client-side
-          against the sampling sub-job's ``max_seq_len`` and fail fast with a
+        * **Pre-tokenized prompts** are checked client-side against the
+          sampling sub-job's ``max_seq_len`` and fail fast with a
           ``ValueError`` when ``len(prompt) >= max_seq_len`` — the token count
-          is exact, so this never rejects a prompt vLLM would accept.
+          is exact, so this never rejects a prompt vLLM would accept. A flat
+          ``list[int]``, and a bare 1-D tensor, each count as one prompt.
         * **String prompts** are *not* validated here. Counting their tokens
           would require replicating the server tokenizer (including special
           tokens), so an over-long string instead fails server-side in vLLM
           with a ``maximum model length`` error rather than client-side.
         """
-        payload: dict = {"prompts": prompts}
-        if sampling_params is not None:
-            payload["sampling_params"] = sampling_params
-        if routing_key is not None:
-            payload["routing_key"] = routing_key
-        if strict is not None:
-            payload["strict"] = strict
-        self._check_prompt_lengths("generate", job_id, prompts)
-        body = wire.dumps(
-            payload,
-            metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}},
-        )
+        body = self._build_generate_frame("generate", job_id, prompts, sampling_params, routing_key, strict)
         response = self._post_octet_request_chunks(
             job_id=job_id,
             path_suffix="generate",
@@ -2182,23 +3674,20 @@ class CortexTrainingClient:
     ) -> dict:
         """Start a streaming generate request. Returns the response body.
 
+        The body is the same DSSST1 safetensors frame :meth:`generate` sends,
+        under ``application/octet-stream``. Unlike ``generate`` it is never
+        split into request chunks: the frame goes out in one POST and must fit
+        under 60 MiB.
+
         Progress is read with :meth:`get_request_status` using the returned
         ``request_id``. Cancellation uses :meth:`cancel_request`.
 
         Prompt-length validation matches :meth:`generate`: pre-tokenized
-        (``list[int]``) prompts are checked client-side against the sampling
-        sub-job's ``max_seq_len`` and fail fast, while over-long string
-        prompts are left to fail server-side in vLLM (see :meth:`generate`).
+        prompts are checked client-side against the sampling sub-job's
+        ``max_seq_len`` and fail fast, while over-long string prompts are left
+        to fail server-side in vLLM (see :meth:`generate`).
         """
-        payload: dict = {"prompts": prompts}
-        if sampling_params is not None:
-            payload["sampling_params"] = sampling_params
-        if routing_key is not None:
-            payload["routing_key"] = routing_key
-        if strict is not None:
-            payload["strict"] = strict
-        self._check_prompt_lengths("generate_stream", job_id, prompts)
-        body = json.dumps(payload).encode("utf-8")
+        body = self._build_generate_frame("generate_stream", job_id, prompts, sampling_params, routing_key, strict)
         self._check_generate_payload("generate_stream", body)
         resp = self._send(
             "POST",
@@ -2305,8 +3794,15 @@ class CortexTrainingClient:
         payload: dict | bytes | bytearray | memoryview | None = None,
         sub_job_id: str | None = None,
         sub_job_type: str | None = None,
+        max_json_bytes: int | None = None,
+        retry_on: Callable[[BaseException], bool] | None = None,
     ) -> dict:
-        """Submit a generic data-plane operation to the routed sub-job."""
+        """Submit a generic data-plane operation to the routed sub-job.
+
+        ``max_json_bytes``, when set, fails fast if the encoded body exceeds it.
+        ``retry_on`` overrides the retry predicate when passed; chunk posts use
+        one that excludes structured chunk-group conflicts.
+        """
         body: dict = {"operation_type": operation_type}
         if sub_job_id is not None:
             body["sub_job_id"] = sub_job_id
@@ -2319,9 +3815,84 @@ class CortexTrainingClient:
             }
         if payload is not None:
             body["payload"] = payload
-        print(f"***** POST operation {self._prefix}/{job_id}/operation {body=}")
-        resp = self._send("POST", f"{self._prefix}/{job_id}/operation", json=body)
+        if max_json_bytes is not None:
+            encoded_bytes = _operation_body_json_bytes(body)
+            if encoded_bytes > max_json_bytes:
+                raise ValueError(
+                    f"{operation_type} operation body is {encoded_bytes} bytes, which "
+                    f"exceeds the {max_json_bytes}-byte limit for one /operation "
+                    f"request. Lower {_OPERATION_MAX_JSON_BYTES_ENV} so the payload is "
+                    f"split into more chunks, or raise it if the deployment allows "
+                    f"larger JSON bodies."
+                )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "POST operation %s/%s/operation body=%s",
+                self._prefix,
+                job_id,
+                self._debug_json_summary(_log_safe_operation_body(body)),
+            )
+        kwargs: dict[str, Any] = {}
+        if retry_on is not None:
+            kwargs["retry_on"] = retry_on
+        resp = self._send(
+            "POST",
+            f"{self._prefix}/{job_id}/operation",
+            json=body,
+            **kwargs,
+        )
         return resp.json()
+
+    def _post_operation_request_chunks(
+        self,
+        job_id: str,
+        *,
+        operation_type: str,
+        frame: bytes,
+        sub_job_id: str | None = None,
+        sub_job_type: str | None = None,
+    ) -> dict:
+        """Send a DSSST1 frame through ``/operation``, byte-chunked if oversized."""
+        max_json_bytes = _operation_max_json_bytes()
+        # The server assembler rejects total_chunks <= 1, so a fitting frame
+        # is posted raw.
+        chunks = wire.encode_byte_chunks(
+            frame,
+            kind="request",
+            operation=operation_type,
+            max_bytes=_operation_chunk_max_bytes(max_json_bytes),
+        )
+        final_body: dict | None = None
+        for idx, chunk in enumerate(chunks):
+            try:
+                body = self._operation(
+                    job_id,
+                    operation_type,
+                    payload=chunk,
+                    sub_job_id=sub_job_id,
+                    sub_job_type=sub_job_type,
+                    max_json_bytes=max_json_bytes,
+                    retry_on=_is_chunk_post_transient,
+                )
+            except requests.exceptions.HTTPError as exc:
+                detail = _chunk_group_error_detail(exc.response)
+                if detail is None:
+                    raise
+                raise ChunkGroupConflictError(
+                    str(detail.get("message") or detail.get("code")),
+                    response=exc.response,
+                    detail=detail,
+                ) from exc
+            if idx < len(chunks) - 1:
+                if isinstance(body, dict) and body.get("request_id"):
+                    raise RuntimeError(
+                        f"{operation_type} chunk {idx} unexpectedly returned request_id"
+                    )
+            else:
+                final_body = body
+        if final_body is None:
+            raise RuntimeError(f"{operation_type} produced no request body")
+        return final_body
 
     @_track_operation("forward")
     def forward(
@@ -2332,24 +3903,34 @@ class CortexTrainingClient:
         sub_job_id: str | None = None,
         sub_job_type: str | None = None,
     ) -> dict:
-        """Submit a generic forward operation. Returns the response body."""
-        if isinstance(payload, (bytes, bytearray, memoryview)) and len(payload) > self._MAX_FWD_BWD_BYTES:
-            size_mb = len(payload) / (1024 * 1024)
-            raise ValueError(
-                f"forward payload is {size_mb:.1f} MB, which exceeds the "
-                "maximum allowed size of "
-                f"{self._MAX_FWD_BWD_BYTES / (1024 * 1024):.0f} MB. "
-                "Reduce the batch size or sequence length in your training "
-                "configuration to bring the serialized input batch under "
-                "the limit."
+        """Submit a generic forward operation. Returns the response body.
+
+        A ``bytes`` payload is a DSSST1 frame; it is byte-chunked across as many
+        ``/operation`` POSTs as the JSON body ceiling requires and reassembled by
+        the backend. Only the final POST returns the pollable ``request_id``;
+        poll it with :meth:`poll_request`. Dict payloads stay a single plain
+        ``/operation`` POST.
+        """
+        if isinstance(payload, (bytes, bytearray, memoryview)):
+            body = self._post_operation_request_chunks(
+                job_id,
+                operation_type="forward",
+                frame=bytes(payload),
+                sub_job_id=sub_job_id,
+                sub_job_type=sub_job_type,
             )
-        return self._operation(
-            job_id,
-            "forward",
-            payload=payload,
-            sub_job_id=sub_job_id,
-            sub_job_type=sub_job_type,
-        )
+        else:
+            body = self._operation(
+                job_id,
+                "forward",
+                payload=payload,
+                sub_job_id=sub_job_id,
+                sub_job_type=sub_job_type,
+            )
+        request_id = body.get("request_id") if isinstance(body, dict) else None
+        if isinstance(request_id, str) and request_id:
+            self._forward_request_ids.add(request_id)
+        return body
 
     def fwd(
         self,
@@ -2391,6 +3972,7 @@ class CortexTrainingClient:
         target_sub_job_ids: list[str],
         *,
         weight_format: str | None = None,
+        bucket_size: int | None = None,
         sub_job_id: str | None = None,
         sub_job_type: str | None = None,
     ) -> str:
@@ -2409,6 +3991,8 @@ class CortexTrainingClient:
                 ``[f"{job_id}:sampling:0"]``.
             weight_format: ``"vllm"`` (server default) or ``"hf"`` for full
                 weights, or ``"lora"`` to broadcast only the adapter tensors.
+            bucket_size: Optional transfer-bucket size in bytes. Increase this
+                when one model tensor exceeds the server default bucket.
 
         Example::
 
@@ -2427,6 +4011,10 @@ class CortexTrainingClient:
         if weight_format is not None:
             # "lora" broadcasts only the trained adapter tensors.
             body["weight_format"] = weight_format
+        if bucket_size is not None:
+            if bucket_size <= 0:
+                raise ValueError("bucket_size must be positive")
+            body["bucket_size"] = int(bucket_size)
         return self._operation(
             job_id,
             "weight-sync",
@@ -2534,6 +4122,19 @@ class CortexTrainingClient:
         decoded = wire.loads(payload)
         if not isinstance(decoded, dict):
             raise RuntimeError("DSSST1 result payload did not decode to a dict")
+        return CortexTrainingClient._merge_transport_metrics(decoded, result)
+
+    @staticmethod
+    def _merge_transport_metrics(decoded: dict, envelope: dict) -> dict:
+        transport_metrics = envelope.get("metrics")
+        if not isinstance(transport_metrics, dict):
+            return decoded
+        decoded = dict(decoded)
+        payload_metrics = decoded.get("metrics")
+        if isinstance(payload_metrics, dict):
+            decoded["metrics"] = {**payload_metrics, **transport_metrics}
+        else:
+            decoded["metrics"] = dict(transport_metrics)
         return decoded
 
     @staticmethod
@@ -2573,6 +4174,26 @@ class CortexTrainingClient:
             result = dict(result)
             result["results"] = self._restore_generate_result_lists(result["results"])
         return result
+
+    def _normalize_forward_result_if_needed(self, request_id: str, result: dict) -> dict:
+        """Decode a forward result that is only a base64 DSSST1 blob.
+
+        A current backend returns a self-describing envelope that
+        :meth:`_decode_result_payload` already handles. An older backend
+        returns ``{"job_id", "payload_b64"}`` with no ``wire_format``.
+        """
+        if request_id not in self._forward_request_ids:
+            return result
+        self._forward_request_ids.discard(request_id)
+        if not isinstance(result, dict) or result.get("wire_format"):
+            return result
+        raw = result.get("payload_b64")
+        if not isinstance(raw, str) or not raw:
+            return result
+        decoded = wire.loads(base64.b64decode(raw))
+        if not isinstance(decoded, dict):
+            raise RuntimeError("legacy forward payload_b64 did not decode to a dict")
+        return self._merge_transport_metrics(decoded, result)
 
     @staticmethod
     def _decode_stream_result_event(event: Any) -> Any:
@@ -2615,7 +4236,8 @@ class CortexTrainingClient:
             events = status.get("events") or []
             received_chunk = False
             for event in events:
-                chunk = self._decode_result_chunk_event(event)
+                with _server_payload():
+                    chunk = self._decode_result_chunk_event(event)
                 if chunk is not None:
                     result_chunks.append(chunk)
                     received_chunk = True
@@ -2626,13 +4248,20 @@ class CortexTrainingClient:
                 continue
             if state in ("completed", "done", "succeeded"):
                 if result_chunks:
-                    result = wire.decode_result_chunks(result_chunks)
+                    with _server_payload():
+                        result = wire.decode_result_chunks(result_chunks)
+                    result = self._merge_transport_metrics(
+                        result,
+                        status.get("result") or {},
+                    )
                 else:
                     result = status.get("result") or {}
-                    decoded = self._decode_result_payload(result)
+                    with _server_payload():
+                        decoded = self._decode_result_payload(result)
                     if decoded is not None:
                         result = decoded
                 result = self._normalize_generate_result_if_needed(request_id, result)
+                result = self._normalize_forward_result_if_needed(request_id, result)
                 if debug_label is not None:
                     logger.debug(
                         "%s completed state=%s result=%s",
@@ -2654,7 +4283,11 @@ class CortexTrainingClient:
                     )
                     self._fwd_bwd_request_debug.pop(request_id, None)
                 self._generate_request_ids.discard(request_id)
-                raise RuntimeError(f"Request {request_id} ended with state '{state}': {error}")
+                self._forward_request_ids.discard(request_id)
+                raise _server_failure(
+                    RuntimeError(f"Request {request_id} ended with state '{state}': {error}"),
+                    failed=state == "failed",
+                )
             if received_chunk:
                 # Defensive: if the server returns a chunk without next_cursor
                 # before terminal status, poll again immediately rather than
@@ -2665,7 +4298,10 @@ class CortexTrainingClient:
             logger.debug("%s timed out after %ss", debug_label, self.poll_timeout)
             self._fwd_bwd_request_debug.pop(request_id, None)
         self._generate_request_ids.discard(request_id)
-        raise TimeoutError(f"Request {request_id} did not complete within {self.poll_timeout}s")
+        self._forward_request_ids.discard(request_id)
+        raise _server_failure(
+            TimeoutError(f"Request {request_id} did not complete within {self.poll_timeout}s")
+        )
 
     @_track_operation("get_request_status")
     def get_request_status(
@@ -2688,7 +4324,8 @@ class CortexTrainingClient:
             params=params or None,
             debug_context=debug_context,
         )
-        return self._decode_stream_result_events(resp.json())
+        with _server_payload():
+            return self._decode_stream_result_events(resp.json())
 
     @_track_operation("cancel_request")
     def cancel_request(

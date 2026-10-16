@@ -33,6 +33,12 @@ sub-jobs:
 - `sampling`: generation and sampling-side operations.
 - `log_probability`: a log-probability worker configuration.
 
+Only `training` and `sampling` sub-jobs can be submitted. Both the Python
+client and the CLI reject a `log_probability` sub-job before sending the
+request, with the location-prefixed message
+`log_probability sub-jobs are not currently supported`; the short alias
+`log_prob` is rejected the same way.
+
 The common RL layout is one training sub-job and one sampling sub-job in the
 same job.
 
@@ -95,12 +101,7 @@ https://{account_host}/api/v2/databases/{database}/schemas/{schema}/{endpoint}
 `CortexTrainingClient` defaults `endpoint` to `cortex-training`.
 
 ```python
-client = CortexTrainingClient.from_pat(
-    host=HOST,
-    pat=PAT,
-    database=DATABASE,
-    schema=SCHEMA,
-)
+client = CortexTrainingClient.from_connection_name("training")
 ```
 
 The SQL statements API used by execution-log download is outside this prefix:
@@ -109,12 +110,31 @@ The SQL statements API used by execution-log download is outside this prefix:
 https://{account_host}/api/v2/statements
 ```
 
+So is the account-level job list
+([section 5.3](#across-the-account---get-apiv2endpoint)):
+
+```text
+https://{account_host}/api/v2/{endpoint}
+```
+
 If you point the client at a server that exposes the endpoint under a
 different name, pass it explicitly: `endpoint="my-endpoint-name"`.
 
-### 2.2 PAT authentication
+### 2.2 Authentication
 
-`CortexTrainingClient.from_pat(...)` sends:
+`CortexTrainingClient.from_connection_name(...)` uses the Snowflake
+Connector's resolved REST origin and live session token:
+
+```http
+Authorization: Snowflake Token="<session-token>"
+```
+
+The client reconnects once and replays the request when Snowflake explicitly
+reports that the session token expired. Named profiles and the configured
+default profile are supported.
+
+Direct PAT compatibility is available through
+`CortexTrainingClient.from_pat(...)`, which sends:
 
 ```http
 Authorization: Bearer <PAT>
@@ -130,7 +150,7 @@ TLS verification is enabled unless `verify_ssl=False` is passed.
 | Control-plane calls, `step`, `save`, `load`, `operation` | `application/json` | JSON |
 | `forward-backward` | `application/octet-stream` | DSSST1 safetensors frame, optionally split into DSSST1 request chunks |
 | `generate` | `application/octet-stream` | DSSST1 safetensors frame, optionally split into DSSST1 request chunks |
-| `generate-stream` | `application/octet-stream` | JSON encoded as UTF-8 bytes |
+| `generate-stream` | `application/octet-stream` | DSSST1 safetensors frame, sent in one request and capped at 60 MiB |
 
 Raw `torch.save`/pickle is not the current binary protocol. See
 [section 9](#9-dssst1-binary-wire-protocol).
@@ -138,7 +158,8 @@ Raw `torch.save`/pickle is not the current binary protocol. See
 ### 2.4 Snowflake request id
 
 Responses may include `x-snowflake-request-id`. Include it when diagnosing an
-HTTP failure.
+HTTP failure. When the response carries it, the Python client prefixes
+raised HTTP errors with `[snowflake request id: <id>]`.
 
 ---
 
@@ -218,11 +239,20 @@ All values are configurable on `CortexTrainingClient(...)`.
 
 ### 3.5 Retries
 
+Every HTTP request has a default 30-second connect timeout and 600-second read
+timeout. Callers can configure a shorter positive scalar or a `(connect, read)`
+pair with `CortexTrainingClient(request_timeout=...)`.
+
 The general request path retries connection/time-out failures and HTTP:
 
 ```text
-404, 409, 429, 500, 502, 503, 504
+307, 308, 404, 409, 429, 500, 502, 503, 504
 ```
+
+Redirects are never followed; a 307 or 308 is retried on the original URL.
+
+Capacity is the exception: it is attempted once with the shorter bounds
+documented in [section 5.4](#54-capacity---get-capacity).
 
 The default is ten retries after the first attempt, with exponential jitter.
 
@@ -232,7 +262,8 @@ ambiguous response does not accidentally create a second server-assigned job.
 ### 3.6 Errors
 
 Non-2xx responses are raised through `requests.Response.raise_for_status()`.
-Bodies may contain:
+Because that call ignores 3xx, any 3xx response is raised first as an
+`Unexpected redirect <status> for url: <url>` HTTP error. Bodies may contain:
 
 ```json
 {"message": "description", "code": 409}
@@ -262,7 +293,7 @@ Paths are relative to the prefix in [section 2.1](#21-base-url).
 | `/` | `POST` | `create_job`, `create_job_from_body` | Create a job |
 | `/` | `GET` | `list_jobs` | List jobs, optionally filtered by status |
 | `/models` | `GET` | `list_models` | List active configured models |
-| `/capacity` | `GET` | `get_capacity` | Account reservation and GPU usage |
+| `/capacity` | `GET` | `get_capacity`, `get_capacity_breakdown` | Account reservation and GPU usage, optionally broken down |
 | `/{job_id}` | `GET` | `get_job`, `wait_for_job` | Job and sub-job status |
 | `/{job_id}:cancel` | `POST` | `cancel_job` | Cancel a job |
 | `/{job_id}/experiment-run` | `GET` | `get_experiment_run` | Resolve experiment/run metadata |
@@ -281,10 +312,11 @@ Paths are relative to the prefix in [section 2.1](#21-base-url).
 The operation endpoint supports the operation types in
 [section 7](#7-generic-operation-envelope).
 
-One auxiliary call is outside the Cortex Training prefix:
+These calls are outside the Cortex Training prefix:
 
 | REST path | HTTP | Client use | Purpose |
 |---|---|---|---|
+| `/api/v2/{endpoint}` | `GET` | `iter_jobs` | List jobs across the account ([section 5.3](#across-the-account---get-apiv2endpoint)) |
 | `/api/v2/statements` | `POST` | artifact download methods | Resolve the current Snowflake identity |
 
 ---
@@ -327,13 +359,21 @@ REST body:
 ```
 
 `sub_job_configs` must be a non-empty list carrying **zero or one** `training`
-sub-job and any number of `sampling` / `log_probability` sub-jobs. A second
-training sub-job is rejected with `at most one training sub-job is supported per
-job`; the server enforces the same rule for every caller.
+sub-job and any number of `sampling` sub-jobs. A second training sub-job is
+rejected with `at most one training sub-job is supported per job`; the server
+enforces the same rule for every caller. A `log_probability` (or `log_prob`)
+sub-job is rejected client-side with
+`sub_job_configs[INDEX].job_type: log_probability sub-jobs are not currently
+supported`.
 
 The typed path validates each `SubJobConfig`; `create_job_from_body()` checks the
-outer body, the non-empty list, and the training-sub-job count before forwarding
-it.
+outer body, the non-empty list, the training-sub-job count, and each sub-job's
+`job_type` for the unsupported log-probability spellings before forwarding it.
+It also normalizes every `peft_config` the body carries, rewriting it in
+place and rejecting an invalid one before the request is sent (see
+[section 8.2](#82-trainingconfig)). Everything else in a raw body, `optimizer`
+included, is forwarded exactly as given. `cortex-training submit` repeats those
+checks so `--dry-run` fails the same way without a connection.
 
 #### GPU hardware - `hardware`
 
@@ -435,6 +475,59 @@ REST response:
 `CortexTrainingClient.list_jobs()` returns only the `jobs` list, not the outer object.
 The client forwards the status string without validating an enum.
 
+#### Across the account - `GET /api/v2/{endpoint}`
+
+Lists the jobs the caller can see in every database and schema of the account,
+newest first, one page at a time. The path is outside the per-schema prefix:
+`https://{account_host}/api/v2/{endpoint}`. It returns 404 where account-level
+listing is not enabled for the account. Jobs in dropped databases or schemas
+are not listed. Every other job call stays on the per-schema routes.
+
+Optional query parameters:
+
+| Parameter | Value |
+|---|---|
+| `database` | Only jobs in this database. SQL identifier rules apply: an unquoted name is case-insensitive, a `"quoted"` one exact. A database the caller cannot see returns 400. |
+| `schema` | Only jobs in this schema of `database`, by the same rules. Requires `database`: a schema name alone does not name one schema, and sending it without `database` returns 400. A schema the caller cannot see returns 400. |
+| `status` | Comma-separated and case-insensitive: `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, and the groups `active` (`pending` through `running`) and `done` (`cancelled`, `terminated`, and the `done` that older jobs show). `pending` does not include `placing`. Any other value returns 400. |
+| `submitted_by` | Only jobs submitted by this user, by SQL identifier rules. Jobs with no recorded submitter never match, and an unknown user matches no jobs. |
+| `created_after` | Inclusive lower bound on creation time: an RFC 3339 timestamp, or `YYYY-MM-DD` for midnight UTC. Must be earlier than `created_before`. |
+| `created_before` | Exclusive upper bound on creation time, in the same forms. |
+| `limit` | Page size, 1 to 1000. Defaults to 100. |
+| `page_token` | The previous page's `next_page_token`. Send it with the same filters; different filters return 400. |
+
+The creation bounds compare with the time the service recorded the job, which
+can differ slightly from the job's `created_at`.
+
+REST response:
+
+```json
+{
+  "jobs": [
+    {
+      "job_id": "job-id",
+      "database_name": "CORTEX_TRAINING_DB",
+      "schema_name": "PUBLIC",
+      "status": "RUNNING"
+    }
+  ],
+  "next_page_token": "opaque-token"
+}
+```
+
+Each job carries the per-schema list's fields plus `database_name` and
+`schema_name`. A page can hold fewer than `limit` jobs, or none, and still carry
+`next_page_token`; keep requesting until it is absent. The token is opaque:
+pass it back unchanged. A job whose live status cannot be read while `status`
+is set is left out, uncounted, so a page's size is not a count of what matched.
+
+`CortexTrainingClient.iter_jobs(...)` takes the same filters, with `page_size`
+for `limit`, checks its arguments on the call, and yields jobs across pages as
+you iterate. It raises a 404 at once instead of retrying it, and never creates
+the configured database. `for_job(job)` returns a client bound to a listed
+job's `database_name` and `schema_name`; it borrows the parent's session and
+creates no database either.
+
 ### 5.4 List models - `GET /models`
 
 This schema-scoped endpoint returns active models configured for new jobs:
@@ -451,7 +544,9 @@ weight synchronization or enough GPUs for a particular job shape.
 ### 5.5 Capacity - `GET /capacity`
 
 This account-scoped endpoint takes no account id from the caller. The server
-resolves the account from the authenticated session.
+resolves the account from the authenticated session. Besides `hardware`
+(below), an optional `breakdown` query parameter splits the usage numbers; see
+[Breakdown](#breakdown---breakdown).
 
 Optional query:
 
@@ -465,6 +560,24 @@ create-job field: `H200`, `B200`, or `B300`, defaulting to `H200` when omitted.
 unknown value client-side. The CLI `capacity` command, with no `--hardware`
 flag, calls this endpoint once per type and wraps the results in
 `capacity_by_hardware`.
+
+A known type that the account does not support is rejected with `409` and code
+`517604`, for example:
+
+```json
+{
+  "code": "517604",
+  "message": "Cortex training getCapacity failed: unsupported hardware \"B200\": supported hardware is H200, B300"
+}
+```
+
+The CLI lists such types in `unsupported_hardware` instead of failing, and
+fails on any other error.
+
+The SDK attempts each capacity lookup once with at most a 10-second connect
+timeout and a 30-second read timeout; a shorter configured request timeout still
+wins. This endpoint is a fast control-plane read, so a silent network, proxy, or
+service hop fails rather than blocking indefinitely.
 
 ```json
 {
@@ -496,6 +609,111 @@ flag, calls this endpoint once per type and wraps the results in
 Proto3 JSON may omit false or zero fields, so an account holding nothing under a
 zero ceiling responds with literally `{}`. `get_capacity()` fills in the
 documented defaults for all six keys.
+
+#### Breakdown - `breakdown`
+
+Optional. A comma-separated list of dimensions that split `in_use_gpus` and
+`pending_gpus`:
+
+| Dimension | Splits the usage by |
+|---|---|
+| `job_type` | Sub-job type |
+| `submitted_by` | The user who submitted each job |
+
+Names are case-insensitive; blanks and repeats are ignored. More than 8
+names, or a name not matching `[a-z_]{1,32}`, is HTTP `400`. A well-formed
+name the server does not know is listed in `unsupported_dimensions`. Without
+the parameter the response has no `breakdown` key.
+
+The breakdown is enabled per account. Until it is enabled for yours, each
+requested dimension reports `DISABLED`. Example for `?breakdown=job_type,submitted_by`:
+
+```json
+{
+  "has_reservation": true,
+  "max_total_gpus": 64,
+  "reserved_gpus": 64,
+  "in_use_gpus": 44,
+  "pending_gpus": 16,
+  "available_gpus": 4,
+  "breakdown": {
+    "unsupported_dimensions": [],
+    "job_count": 6,
+    "truncated": false,
+    "by_job_type": {
+      "status": "OK",
+      "groups": [
+        {"job_type": "TRAINING", "in_use_gpus": 28, "pending_gpus": 16,
+         "sub_job_count": 5},
+        {"job_type": "SAMPLING", "in_use_gpus": 16, "pending_gpus": 0,
+         "sub_job_count": 2},
+        {"job_type": "LOG_PROBABILITY", "in_use_gpus": 0, "pending_gpus": 0,
+         "sub_job_count": 0}
+      ]
+    },
+    "by_submitted_by": {
+      "status": "OK",
+      "groups": [
+        {"kind": "USER", "submitted_by": "YOUR_USER", "is_caller": true,
+         "in_use_gpus": 24, "pending_gpus": 0, "job_count": 2},
+        {"kind": "USER", "submitted_by": "SOME_USER", "is_caller": false,
+         "in_use_gpus": 8, "pending_gpus": 16, "job_count": 2},
+        {"kind": "OTHER", "in_use_gpus": 8, "pending_gpus": 0,
+         "job_count": 1},
+        {"kind": "UNATTRIBUTED", "in_use_gpus": 4, "pending_gpus": 0,
+         "job_count": 1}
+      ]
+    }
+  }
+}
+```
+
+- `unsupported_dimensions`: always present, possibly empty.
+- `job_count`: jobs behind `in_use_gpus` and `pending_gpus`, including those
+  holding no GPUs. Present only when a dimension is `OK`.
+- `truncated`: the account had more jobs than the server attributes one by
+  one; the rest count as `UNATTRIBUTED`. Present only when a dimension is `OK`.
+- `by_job_type` / `by_submitted_by`: present only when requested.
+
+Each dimension has a `status` and `groups`. Every status comes with HTTP
+`200` and the six totals unchanged:
+
+| `status` | Meaning |
+|---|---|
+| `OK` | `groups` adds up to `in_use_gpus` and `pending_gpus`. |
+| `DISABLED` | Not enabled for the account. `groups` is empty. |
+| `UNAVAILABLE` | Cannot be computed for this request, including when the service does not support it yet. `groups` is empty. |
+
+Read the split from `groups`; a newer service may add statuses.
+
+`by_job_type.groups[]`: `TRAINING`, `SAMPLING` and `LOG_PROBABILITY` first,
+then any other type (`UNSPECIFIED` or `UNKNOWN` when the service cannot name
+it). A job counts under each of its sub-jobs' types. `log_probability`
+sub-jobs and sub-jobs that set `multiplex_job_id` add 0 GPUs but count in
+`sub_job_count`.
+
+`by_submitted_by` names the submitter of every job the caller can see. Each
+job counts in exactly one group:
+
+| `kind` | Jobs |
+|---|---|
+| `USER` | Submitted by `submitted_by`, and visible to the caller. `is_caller` marks the caller's row. |
+| `OTHER` | Not visible to the caller. |
+| `UNATTRIBUTED` | No known submitter: none was recorded, the user no longer exists, or the job is past the `truncated` limit. |
+
+`USER` rows come first, most GPUs (`in_use_gpus + pending_gpus`) first and
+then by name, then `OTHER`, then `UNATTRIBUTED`. Find the caller's row by
+`is_caller`, not position. The breakdown never contains job ids or database
+or schema names.
+
+`get_capacity_breakdown(hardware=None, *, dimensions=("job_type",
+"submitted_by"))` sends this parameter. It keeps `groups` whenever the server
+sends them and passes `status` through as sent. A missing `status` reads as
+`OK` with groups and `UNAVAILABLE` without, and a dimension missing from the
+response (including from a server without this parameter) is `UNAVAILABLE`.
+It fills missing counts with `0` and always lists the three known job types
+when there are groups. The CLI exposes it as
+[`capacity --breakdown`](cli.md#capacity-breakdown).
 
 ### 5.6 Cancel job - `POST /{job_id}:cancel`
 
@@ -651,6 +869,23 @@ forward/backward response assembler intentionally returns
 `post_process_outputs` as an empty object; callers must not assume that
 `compute_logprobs` appears there.
 
+When the training sub-job sets `router_replay.mode = "best_effort"` (see
+[section 8.2](#82-trainingconfig)), `metrics` of a forward/backward request that
+carries router-replay ids also reports how the request's rows were routed. Each row is counted once, however rows are sharded across
+data-parallel and sequence-parallel ranks. A "fresh" row is one whose routing
+no sampling worker held, so the trainer's own MoE gate routed it.
+
+| Key | Meaning |
+|---|---|
+| `router_replay/rows_sent` | Rows in the request that carried a router-replay id |
+| `router_replay/rows_replayed` | Rows routed with the sampler's captured routing |
+| `router_replay/rows_fresh` | Rows routed by the trainer's own gate |
+| `router_replay/replayed_fraction` | `rows_replayed / rows_sent` (`0.0` for a request with no rows) |
+| `router_replay/tokens_replayed` | Valid tokens in replayed rows (attention-mask count; the padded length when the request has no attention mask) |
+| `router_replay/tokens_fresh` | Valid tokens in fresh rows (attention-mask count; the padded length when the request has no attention mask) |
+
+In the default `"strict"` mode these keys are absent.
+
 ### 6.2 Optimizer step - `POST /{job_id}/step`
 
 ```json
@@ -800,7 +1035,8 @@ be changed at runtime. The server will reject incompatible loads.
 ### 6.5 Create-time checkpoint initialization
 
 Create-time initialization is not `resume_from_checkpoint` in the typed
-`cortex-training` API. Use:
+`cortex-training` API. To initialize from a checkpoint saved by Cortex
+Training, use:
 
 ```json
 {
@@ -814,10 +1050,29 @@ Create-time initialization is not `resume_from_checkpoint` in the typed
 This object is a field on `SubJobConfig`. The server stamps scoped `stage_info`
 credentials; clients should not provide credentials themselves.
 
-Sampling initialization requires a `weights-only` checkpoint. The source job no
-longer needs to be running after the checkpoint has been saved.
+To initialize from a complete Hugging Face safetensors directory uploaded to a
+Snowflake stage, use the alternative source field:
 
-For training initialization from a `resumable` checkpoint, set
+```json
+{
+  "source_checkpoint_info": {
+    "external_stage_path": "@MY_DB.MY_SCHEMA.MODEL_IMPORT/qwen-sft-run7"
+  }
+}
+```
+
+`external_stage_path` is mutually exclusive with both `checkpoint_id` and
+`source_job_id`. The service resolves the stage and credentials under the
+submitting role. The source must be an S3-backed stage containing a flat,
+uncompressed Hugging Face safetensors model directory. See
+[Start a Job From Your Own Weights](../guides/training/external-weights.md)
+for the upload workflow and file requirements.
+
+When initializing from a checkpoint saved by Cortex Training, sampling requires
+a `weights-only` checkpoint. The source job no longer needs to be running after
+the checkpoint has been saved.
+
+For training initialization from a Cortex Training `resumable` checkpoint, set
 `training_config.load_optimizer_states=false` (see
 [section 8.2](#82-trainingconfig)) to restore weights only with a fresh
 optimizer. This is required when the new job changes data-parallel size, since
@@ -850,17 +1105,29 @@ Logical request object inside the DSSST1 frame:
 
 Rules:
 
-- `prompts` is a list of string prompts and/or token-id lists. A single
-  tokenized prompt is `[[1, 2, 3]]`, not `[1, 2, 3]`.
+- `prompts` is a list of string prompts and/or token-id lists. A flat list of
+  integers such as `[1, 2, 3]`, and a bare 1-D tensor, are each read as one
+  pre-tokenized prompt rather than as a batch. For a batch of several prompts,
+  use the nested form `[[1, 2, 3], [4, 5]]`.
 - `sampling_params` may be one object or a list of objects/null values aligned
   with `prompts`.
 - `routing_key` may be one string or an aligned list of strings/null values.
 - `strict` controls strict routing-key affinity.
 
+Pre-tokenized prompts travel in the frame's tensor section as `int32` tensors,
+not as JSON numbers in the frame header. A token id that does not fit `int32`
+falls back to `int64` for that prompt, which only doubles its wire size. String
+prompts are not converted — the server tokenizes them. Setting
+`CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS` to a truthy value puts the token ids
+back in the header as JSON lists; the request body is a DSSST1 frame either
+way.
+
 For pre-tokenized prompts, the client fetches and caches the sampling sub-job's
 `inference_config.max_seq_len`. It rejects a prompt when
 `len(prompt) >= max_seq_len`, preserving room for at least one output token.
-String prompts are left for the server tokenizer to validate.
+The check runs before the tensor conversion, so the environment variable above
+does not disable it. String prompts are left for the server tokenizer to
+validate.
 
 Generate uses the same DSSST1 response options as forward/backward, but unlike
 forward/backward it sends the frame unwrapped when it fits, and only splits it
@@ -885,13 +1152,45 @@ The backend can add fields such as log probabilities or action masks. For a
 request submitted by the same `CortexTrainingClient` instance, `poll_request()`
 converts tensor values under `results` back to Python lists.
 
+#### Per-token log probabilities
+
+On server versions that pass vLLM's `logprobs` and `prompt_logprobs` sampling
+options through, two optional `sampling_params` keys add log probabilities to
+each result:
+
+| Key | Result field | Contents |
+|---|---|---|
+| `logprobs: 0` | `logprobs` | One entry per generated token, aligned with `token_ids` |
+| `prompt_logprobs: 0` | `prompt_logprobs` | One entry per prompt token; the first entry is `null` because nothing precedes the first token |
+
+Each entry maps a token id to an object that includes `logprob`: the
+log probability of that token given everything before it. With `0`, the map
+holds only the token that actually appears at that position; a positive value
+`k` also includes the `k` most likely alternatives. The token id is a JSON
+object key, so it can arrive as a string.
+
+`prompt_logprobs` scores a known token sequence without decoding or
+re-tokenizing it: send the sequence as a pre-tokenized prompt with
+`max_tokens: 1` and read `prompt_logprobs[i]` as the log probability of prompt
+token `i`. The prompt must stay shorter than the sampling sub-job's
+`max_seq_len`. The
+[on-policy distillation recipe](../../recipes/distillation/README.md) scores
+student rollouts with a teacher this way.
+
 ### 6.7 Streaming generate - `POST /{job_id}/generate-stream`
 
-`generate_stream()` accepts the same logical fields as `generate()`, but its
-body is UTF-8 JSON under `application/octet-stream`, not DSSST1.
+`generate_stream()` accepts the same logical fields as `generate()` and encodes
+them into the same DSSST1 frame, including the `int32` tensor encoding of
+pre-tokenized prompts described in [section 6.6](#66-generate---post-job_idgenerate).
 
-The encoded body must not exceed 60 MiB. This path is not request-chunked by the
-client.
+Unlike `generate`, this path is not request-chunked: the client sends the frame
+in a single POST, and the encoded body must not exceed 60 MiB.
+
+**Breaking change.** `POST /{job_id}/generate-stream` no longer accepts a
+UTF-8 JSON body. There is no dual encoding and no negotiation — the frame is
+the only accepted request form. `CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS`
+changes how prompts are encoded *inside* the frame; it does not turn the body
+back into JSON. The response is unchanged.
 
 Immediate response:
 
@@ -1026,13 +1325,17 @@ require `running`.
 `forward()`, `fwd()`, and `fwd_no_grad()` all send exactly
 `operation_type="forward"`. The aliases do not add no-gradient semantics.
 
-Byte payloads over 60 MiB are rejected; this operation path is not request
-chunked. Do not treat this route as a portable log-probability API.
+A byte payload is a DSSST1 frame posted as a JSON `/operation` body. A frame
+that fits the JSON ceiling is one POST of the raw frame. A larger frame is
+split with `wire.encode_byte_chunks` (`kind="request"`, `operation="forward"`)
+and each chunk is its own POST whose `payload_b64` is that request chunk. Only
+the last POST returns the pollable `request_id`.
 
-Known limitation: `_operation()` wraps byte payloads in a base64 JSON object,
-while the server's `/forward` route expects raw DSSST1 bytes. Request
-construction is unit-tested, but byte-based `forward()` is not currently
-end-to-end compatible.
+The ceiling is `CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES` (integer
+bytes, default 16 MiB, minimum 16 KiB). Dict payloads stay a single plain
+`/operation` POST.
+
+Do not treat this route as a portable log-probability API.
 
 ### 7.2 Weight sync
 
@@ -1057,6 +1360,24 @@ Optional payload fields:
 - `weight_format`: `"vllm"` (default on server) | `"hf"` for full-model
   weights. For adapter-only synchronization, see
   [section 7.3](#73-lora-adapter-sync).
+
+On server versions that include this behavior, the default weight sync, which
+pauses generation and keeps in-flight requests, also clears the sampling
+sub-job's prefix cache. No request after the sync reads KV computed under the
+old weights. In-flight requests are preempted and recomputed with the new
+weights, and the next turn of each conversation recomputes its history, so
+generation is somewhat slower right after a sync. Syncs that use another mode
+are unchanged. A sampling sub-job can opt out with
+`vllm_config.clear_cache_on_weight_sync` (see
+[section 8.3](#83-inferenceconfig)).
+
+Each sampling target in the result reports `clear_cache`, at
+`targets[].recv.recv.clear_cache`. It is the value the sync sent to the sampling
+workers' pause, so it shows what was requested and is not proof that the cache
+was cleared. It is `false` when no pause was issued. A result without the key
+comes from a server version that predates this behavior. If you set the opt-out
+and the result still shows `clear_cache: true`, check the key's spelling and
+that it is set under `vllm_config`.
 
 ### 7.3 LoRA adapter sync
 
@@ -1218,7 +1539,7 @@ Exactly one type-specific config is set.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `job_type` | `training`, `sampling`, `log_probability` | yes | Typed `JobType` enum |
+| `job_type` | `training`, `sampling`, `log_probability` | yes | Typed `JobType` enum. `log_probability` is a schema value only: the client and CLI reject it at submission |
 | `model_name` | string | yes | Must be non-empty |
 | `training_config` | object | for training | Produced from `TrainingConfig` |
 | `inference_config` | object | for sampling/log probability | Produced from `InferenceConfig` |
@@ -1226,7 +1547,7 @@ Exactly one type-specific config is set.
 | `dtype` | string | no | Example: `bfloat16` |
 | `seed` | integer | no | |
 | `model_post_init` | list of strings | no | Server maps to post-init hooks |
-| `source_checkpoint_info` | object | no | Create-time checkpoint initialization |
+| `source_checkpoint_info` | object | no | Create-time initialization from a saved checkpoint or external weights |
 
 Typed factories:
 
@@ -1244,10 +1565,48 @@ The typed client requires:
 
 | Field | Type | Client validation |
 |---|---|---|
-| `optimizer` | object | Non-empty |
+| `optimizer` | object | Canonicalized; empty only when `gradient_clipping` is set |
 | `max_seq_len` | integer | Greater than zero |
 | `train_batch_size` | integer | Greater than zero |
 | `n_gpus` | integer | Greater than zero |
+
+#### `optimizer` canonicalization
+
+`optimizer` is no longer an opaque non-empty object. The typed `TrainingConfig`
+rewrites it into the canonical flat form on construction and rejects anything it
+cannot place. The canonical keys are `name`, `lr`, `weight_decay`, `betas`,
+`eps`, and `fused`; the wire form is
+
+```json
+{"name": "AdamW", "lr": 1e-5, "weight_decay": 0.0, "betas": [0.9, 0.95], "eps": 1e-8}
+```
+
+The rewrites are:
+
+- `type` becomes `name`. Setting both to different values is an error.
+- `beta1` / `beta2` become `betas`. Supplying only one fills its partner from
+  `[0.9, 0.999]`. `betas` together with a disagreeing `beta1`/`beta2` is an
+  error.
+- A DeepSpeed-style `params` sub-object is flattened onto the top level. A key
+  set in both places with different values is an error.
+- `gradient_clipping` inside `optimizer` is hoisted onto the typed
+  `gradient_clipping` field, which is where the server reads it. When both are
+  set the typed field wins and the nested value is dropped. A block holding only
+  `gradient_clipping` therefore canonicalizes to `{}`, which is valid.
+- Scheduler names (`lr_scheduler`, `lr_scheduler_type`, `warmup_steps`,
+  `warmup_ratio`, `warmup_steps_proportion`, `num_warmup_steps`,
+  `training_horizon`) are rejected rather than accepted and ignored. Drive the
+  learning rate per step from the client, or set a server-side DeepSpeed
+  scheduler under `ds_config`.
+- Any other key is rejected, as are non-numeric, non-finite, or out-of-range
+  values.
+
+Canonicalization never fills defaults — the server owns those, so an explicitly
+submitted value stays distinguishable from a defaulted one. `betas` is the one
+exception, since its canonical form is a pair.
+
+This runs on the typed `TrainingConfig` path only. `create_job_from_body()`
+forwards `optimizer` exactly as given and leaves the rewrite to the server.
 
 Optional typed fields:
 
@@ -1277,11 +1636,51 @@ and these newer long-context/memory knobs:
   to disable). Omitted uses the server default.
 - `ac_config`: activation-checkpointing config, including CPU activation offload
   via `offload_config.enabled=true`. Offload requires `mode="full"`.
+- `router_replay`: `{"enabled", "max_cache_bytes", "mode"}`. `mode` is
+  `"strict"` (default) or `"best_effort"`; values other than `"strict"` and
+  `"best_effort"` are rejected. It applies to the training sub-job
+  only: `"best_effort"` with `enabled` `false`, or any `mode` other than
+  `"strict"` on a sampling sub-job, is rejected. `"strict"` fails a forward/backward
+  request when any of its rows has no routing held by a sampling worker (for
+  example, a row generated before a sampler restart); the request error is
+  `router_replay_preflight_failed` with `stage` `"receive"` and `reason`
+  `"receiver_error"`. `"best_effort"` routes such rows with the trainer's own MoE
+  gate, replays the others, and reports the split in the
+  `router_replay/rows_*` and `router_replay/tokens_*` metrics of
+  [section 6.1](#61-forwardbackward---post-job_idforward-backward). A model
+  whose MoE routers cannot route a row by their own gate, or that has no MoE
+  routers, rejects `"best_effort"` when the training sub-job starts. With whole-block activation
+  checkpointing, `"best_effort"` also requires `ac_config.router_replay_recompute`
+  (default `true`); a training sub-job with it disabled rejects `"best_effort"`
+  at startup. If the service does not yet support `"best_effort"`, router-replay
+  bootstrap fails with a `router replay bootstrap rejected` error; use `"strict"`
+  until the service is upgraded. If only some sampling workers lack support, a
+  request with a missing row fails exactly as in `"strict"`.
+
+`max_cache_bytes` is the per-worker cap in bytes. The service stores each
+expert id as `uint8` when the model has at most 256 experts and as `uint16`
+when it has 257 to 65536 experts. A `uint16` capture uses twice as many bytes
+as a `uint8` capture for the same sequence length, MoE layer count, and top-k.
+The service does not choose the cap. Derive both the sampling and training
+caps with `cortex_training.router_replay_planner`, which selects that width
+from the expert count and includes it in `CachePlan.max_cache_bytes`. The same
+object can be set on a sampling sub-job through `extra_sampling["router_replay"]`.
+See [python-sdk.md](python-sdk.md#router-replay-capacity-planning).
 
 For LoRA training, set `extra_training["peft_config"]` to a PEFT
-`LoraConfig`-compatible object. At minimum, specify `peft_type="Lora"`; `r` and
-`lora_alpha` default to `8` on the server, although explicit values are
-recommended when the same configuration is also used by sampling.
+`LoraConfig`-compatible object. It is validated and rewritten client-side, so it
+must specify `peft_type="Lora"` — exactly that spelling, not the `"LORA"` a
+Hugging Face `adapter_config.json` writes — plus `target_modules`,
+`target_parameters`, or both. `r`, `lora_alpha`, `lora_dropout`, and `bias` are
+filled with their defaults (`8`, `8`, `0.0`, `"none"`) by the client when
+omitted, although explicit values are recommended when the same configuration is
+also used by sampling. Unsupported keys are rejected.
+
+`peft_config` is validated the same way on all three submission paths: typed
+training, typed sampling ([section 8.3](#83-inferenceconfig)), and the raw
+`create_job_from_body()` body. A config with no `peft_config` stays valid, and
+every other key in `extra_training` / `extra_sampling` remains open
+passthrough.
 
 The current client also rejects an effective PrimeRL config that combines an
 enabled/default `fused_cross_entropy` with `fp32_lm_head=True` or an integer
@@ -1331,7 +1730,21 @@ sampling = SubJobConfig.sampling_job(
 For LoRA sampling, set `extra_sampling["peft_config"]` when creating the
 sub-job. This enables the vLLM LoRA manager before the model starts. The
 adapter's `r`, `lora_alpha`, and `target_modules` must match the training
-configuration used for adapter synchronization.
+configuration used for adapter synchronization. It is validated and rewritten by
+the same rules as the training block (see
+[section 8.2](#82-trainingconfig)).
+
+`vllm_config.clear_cache_on_weight_sync` controls whether a weight sync clears
+the sampling sub-job's prefix cache. It is a boolean, default `true`, and
+applies only to the default weight sync (see
+[section 7.2](#72-weight-sync)). Set it to `false` to opt out, for example
+`extra_sampling={"vllm_config": {"clear_cache_on_weight_sync": False}}`. With
+`false`, only a best-effort reset after the sync remains. That reset cannot clear
+blocks held by running requests, so requests may read KV computed under the old
+weights. The key is not validated: a misspelled key is silently ignored, and the
+sync keeps clearing the cache. The `clear_cache` key in each sampling target's
+sync result shows whether the opt-out was applied (see
+[section 7.2](#72-weight-sync)).
 
 For either config type, the server requires `multiplex_job_id` to be a complete
 `{job_id}:{sub_job_type}:{index}` id outside the job being created.
@@ -1345,10 +1758,23 @@ For either config type, the server requires `multiplex_job_id` to be a complete
 }
 ```
 
-`checkpoint_id` is required by the server-side source-checkpoint model.
-`source_job_id` is optional in the client/proto shape, but cross-job
-initialization must identify the job that owns the saved checkpoint. The typed
-client forwards this object without validating either field.
+Exactly one source is required:
+
+- `checkpoint_id` identifies a checkpoint saved by Cortex Training.
+  `source_job_id` identifies the job that owns it and is required for cross-job
+  initialization.
+- `external_stage_path` identifies a complete Hugging Face safetensors
+  directory in a stage the submitting role can read. It cannot be combined with
+  `checkpoint_id` or `source_job_id`.
+
+```json
+{
+  "external_stage_path": "@MY_DB.MY_SCHEMA.MODEL_IMPORT/qwen-sft-run7"
+}
+```
+
+The typed client forwards this object without validating its fields. The server
+resolves stage credentials; clients must not provide `stage_info` themselves.
 
 ### 8.5 Memory-diagnostics settings
 
@@ -1416,21 +1842,25 @@ metadata = wire.read_metadata(frame)
 
 ### 9.3 Request chunking
 
-`forward_backward()` and `generate()` call:
+`forward_backward()`, `generate()`, and byte `forward()` call:
 
 ```python
 wire.encode_byte_chunks(
     frame,
     kind="request",
-    operation="fwd-bwd-or-generate",
-    max_bytes=60 * 1024 * 1024,
+    operation="fwd-bwd-or-generate-or-forward",
+    max_bytes=...,
 )
 ```
 
 `forward_backward()` always sends a chunk envelope, including when the request
 fits in one chunk, so every logical operation has a caller-generated identity.
-`generate()` still sends the original frame unchanged when it fits. Each
-DSSST1 request chunk contains:
+`generate()` still sends the original frame unchanged when it fits, as
+`application/octet-stream`. Byte `forward()` also sends the original frame
+unchanged when it fits; it splits only when the encoded JSON body would exceed
+`CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES` (default 16 MiB). Those
+chunks travel inside the `/operation` JSON envelope (`payload_b64`) rather than
+as octet-stream. Each DSSST1 request chunk contains:
 
 - A `uint8` payload tensor.
 - `chunk_idx` and `total_chunks`.
@@ -1469,7 +1899,14 @@ A non-chunked DSSST1 result can appear inside poll JSON as:
 }
 ```
 
-`poll_request()` base64-decodes and passes the frame to `wire.loads()`.
+`poll_request()` base64-decodes and passes the frame to `wire.loads()`. If the
+JSON envelope also has a `metrics` object, those keys are shallow-merged into
+the decoded result's `metrics`. Envelope keys win on collision. Payload
+`metrics` are kept when the envelope has none.
+
+A result with `payload_b64` but no `wire_format` is left encoded unless
+`poll_request()` is completing a `forward()` request id minted by this client.
+In that case the blob is decoded the same way and envelope `metrics` are merged.
 
 ### 9.5 Result chunks
 
@@ -1485,7 +1922,8 @@ Large results can arrive through poll events:
 
 A poll can also include `next_cursor`. `poll_request()` drains all pages,
 validates chunk SHA-256 values, uses `wire.decode_result_chunks()`, and returns
-the reconstructed object.
+the reconstructed object. Terminal-page `result.metrics` are merged into that
+object with the same envelope-wins rule as [section 9.4](#94-encoded-results).
 
 ---
 
@@ -1557,10 +1995,185 @@ batch = {
 
 `context` and `processing` are open backend contracts. Their accepted keys,
 registered loss functions, and post-processors come from the deployed training
-backend, not the REST schema.
+backend, not the REST schema. The optional ratio controls of the `grpo` loss and
+its variants, and the `grpo` teacher term, both described below, are an
+exception: their configuration keys, context tensors, and the metrics named
+below, are listed here.
 
 Do not use `build_forward_backward_payload()` for this extended shape: that
 helper currently ignores `context` and `processing`.
+
+#### Ratio controls for the CISPO loss
+
+On server versions that include these controls, the `grpo` loss and its variants
+`ap_grpo`, `grpo_echo_v1`, and `ap_grpo_echo_v1` accept optional ratio controls
+in `processing.config`. All are off by default, and any active control requires
+`use_cispo_loss` to be `true`. The masks drop tokens from the CISPO policy term
+only; the loss normalizers stay as they were.
+
+| Key | Meaning |
+|---|---|
+| `ratio_mask_bounds_pos`, `ratio_mask_bounds_neg` | Inclusive importance-ratio bands, chosen by the sign of the token's advantage (see below). A pair `[low, high]` of finite numbers or `null`, with `low < high` and `low >= 0`; a `null` end is unbounded |
+| `prob_diff_mask_max_pos`, `prob_diff_mask_max_neg` | Finite, non-negative maximum directional probability gap between the current policy and the sampler |
+| `seq_mask_stat` | The sequence statistic that the sequence gate tests: `mean_log_ratio` (default) or `mean_k3` |
+| `seq_mask_bounds_pos`, `seq_mask_bounds_neg` | Inclusive bands for that statistic, chosen by advantage sign (see below). A pair of finite numbers or `null`, with `low < high`; a `null` end is unbounded |
+| `ratio_m2_threshold` | Finite, positive M2PO filtering threshold for the current-policy versus sampler ratio |
+| `log_ratio_sq_coef` | Finite, non-negative coefficient of a squared log-ratio penalty. Unlike the masks, the penalty is computed over the original loss mask whatever the masks drop. A positive value is rejected with `token-mean` aggregation when `sequence_loss_weights` is present |
+| `ratio_stats` | Boolean. `true` reports the ratio metrics (histograms, mask counts, and the metrics below) without enabling a mask |
+| `ratio_mask_rebalance` | Boolean. `true` rescales the kept advantages of each sign that keeps any mass so that its total returns to its pre-mask value (see below) |
+
+A control is active as soon as its key is present with a valid value, even a
+neutral one such as `log_ratio_sq_coef: 0.0`. An explicit `null` is rejected for
+every ratio-control key, so omit a key to leave it off; inside a bounds pair, a
+`null` end still means unbounded. An explicit `false` of `ratio_stats` or
+`ratio_mask_rebalance` does not count: a request whose only ratio-control keys
+are one or both of these set to `false` is inert and needs no `use_cispo_loss`.
+The mixed losses `grpo_mixed_v1` and `ap_grpo_mixed_v1` reject every
+ratio-control key, including an explicit `false`, so that policy-only gates
+cannot affect NLL tokens.
+
+The `_pos` and `_neg` gates split tokens by the sign of the token-level
+advantage, before any sequence-level averaging and including the teacher term
+when it is enabled. An advantage of exactly `0` counts as positive. With
+`importance_sampling_level` set to `"sequence"`, the CISPO term uses each
+sequence's averaged advantage while the gates keep the token-level sign, so the
+two can differ. A sequence is tested against `seq_mask_bounds_pos` when it has
+at least one positive-side token and against `seq_mask_bounds_neg` when it has
+at least one negative-side token, and a band violation drops only that side's
+tokens.
+
+Whenever a ratio control is active, the `metrics` of the forward/backward result
+carry the keys below. Keys ending in `_sum` are added up over workers. The
+result also carries other ratio-control entries, such as per-drop counts and
+further histogram bins, that are not listed here.
+
+| Metric | Meaning |
+|---|---|
+| `ratio_mask_pos_pre_mass_sum`, `ratio_mask_neg_pre_mass_sum` | The advantage mass before masking: `\|A\|` summed over the policy tokens with advantage `A >= 0` (`pos`) or `A < 0` (`neg`). It goes through the loss's own normalization (for `token-mean`, divided by the number of policy tokens in the whole request), without the data-parallel factor and without importance, clip, `rollout_is_weights`, or `behav_imp_weight_cap` weights. `A` is the advantage the CISPO term uses: with `importance_sampling_level` set to `"sequence"`, each sequence's averaged advantage, so the sequence counts as `pos` or `neg` as a whole by the sign of its mean |
+| `ratio_mask_pos_kept_mass_sum`, `ratio_mask_neg_kept_mass_sum` | The same sums over the tokens that survive every active drop (ratio band, probability gap, sequence gate, `ratio_m2_threshold`) |
+| `ratio_mask_kept_k3_sum` | The sum over the kept tokens of `exp(d) - 1 - d`, where `d` is the trainer log probability minus the sampler log probability (`old_log_probs_shifted`), clamped to `[-20, 20]`. It is raw, not divided by the loss denominators, and is `0` when the request has no `old_log_probs_shifted` |
+| `ratio_trainable_token_count`, `ratio_mask_dropped_token_count` | The policy tokens the ratio controls see, and how many of them some active drop removes |
+| `seq_stat_bin_<i>_sequence_count`, `i` from `0` to `6` | The number of sequences whose log ratio (current policy minus sampler log probability), averaged over the sequence's policy tokens, falls in bucket `i` of the edges `-0.2, -0.05, -0.01, 0.01, 0.05, 0.2`. Each bucket includes its upper edge: bucket `0` holds values up to `-0.2` and bucket `6` values above `0.2`. It always bins the mean log ratio, also when `seq_mask_stat` is `mean_k3` |
+| `ratio_mask_rebalance` | The flag as `0.0` or `1.0` |
+| `ratio_rebalance_pos_post_mass_sum`, `ratio_rebalance_neg_post_mass_sum` | Only with `ratio_mask_rebalance` set to `true`. The kept mass of the sign after scaling: equal to its pre-mask mass, up to rounding, when the sign's kept mass is positive, and `0` when it is not |
+| `ratio_rebalance_pos_unrestored_mass_sum`, `ratio_rebalance_neg_unrestored_mass_sum` | Only with `ratio_mask_rebalance` set to `true`. The pre-mask mass of a sign whose kept mass is `0`, and `0` otherwise |
+
+The four mass sums equal their value for the unsplit batch, up to rounding, when
+the loss normalization is request-global: `token-mean`; `prompt-mean` with
+`prompt_group_ids` (the service derives the request-wide counts it needs) or with
+client-supplied `sequence_loss_weights`; and the `seq-mean-token-sum`,
+`seq-mean-token-sum-norm`, and `seq-mean-token-mean` values of `loss_agg_mode`
+when the client sends a request-global `global_batch_size`. Otherwise each call
+normalizes by its own counts, and so do these sums. Sequence-parallel shards
+count once, and a worker with no policy token reports `0`. The `post` and
+`unrestored` sums below are in the same normalized units and are also added up
+over workers. The k3 sum and the two counts are not normalized: they add up across microbatches, workers, and
+sequence-parallel ranks in every aggregation mode, apart from the placement
+effects below.
+
+`ratio_m2_threshold` ranks the tokens of one model call, so with it the kept
+mass, the dropped count, and the k3 sum depend on how rows are placed on
+workers, while the pre-mask mass does not. The baseline `m2_threshold` key,
+which is not `ratio_m2_threshold`, acts on the tokens a worker holds in one call
+(under sequence parallelism, on each rank's own window) and removes tokens
+before the ratio controls act. Those tokens are in neither the pre-mask nor the
+kept mass, and are excluded from `ratio_trainable_token_count`. With it the
+masses, the k3 sum, and the counts depend on how rows are placed in calls and on
+the sequence-parallel split, and with several calls per worker on
+`max_tokens_per_mb`. With either key the restoration scale below depends on
+placement as well.
+
+The clamp of `d` applies to the reported k3 sum only: `seq_mask_stat` set to
+`mean_k3` gates on the unclamped k3. The kept-token mean is
+`ratio_mask_kept_k3_sum / (ratio_trainable_token_count -
+ratio_mask_dropped_token_count)`. When the request carries
+`old_log_probs_shifted`, the service also reports
+`trainable_logprob_lowvar_all/mean`, the same estimator over every trainable
+token before masking, with the same clamp. With no drop, no token removed by the
+baseline `m2_threshold`, and finite log probabilities,
+`ratio_mask_kept_k3_sum / ratio_trainable_token_count` equals it up to rounding.
+The service computes `trainable_logprob_lowvar_all/mean` with `exp(d) - 1 - d` in
+float32, which loses precision for `|d|` of about `1e-3` or less, so a gap there
+comes from that metric. A trainer log probability that is not finite is replaced
+by `0` before the loss, and its token still counts. A sampler log probability
+that is not finite at a trained token makes the request fail, so no k3 sum is
+returned.
+
+With `ratio_mask_rebalance` set to `true`, once the masks have decided which
+tokens to drop, the kept tokens of positive advantage are scaled by `P0/Pk` and
+those of negative advantage by `N0/Nk`. `P0` and `N0` are
+`ratio_mask_pos_pre_mass_sum` and `ratio_mask_neg_pre_mass_sum`; `Pk` and `Nk`
+are `ratio_mask_pos_kept_mass_sum` and `ratio_mask_neg_kept_mass_sum`; all four
+are summed over all workers. Every worker applies the same scale, and each sign
+returns to its own pre-mask mass, not to the other sign's. Only advantage
+magnitudes change: which tokens are dropped, the counts, and the k3 sum do not
+depend on the scaling. The scale is computed for one forward/backward request,
+so a step split across several requests gets one scale per request, and a sign
+that loses all its mass in one part is not restored there. A sign whose kept mass
+is `0` has nothing to scale, including a sign whose only surviving tokens have
+advantage `0`: its scale is `1` and its pre-mask mass is reported as
+unrestored. With nothing dropped, both scales are `1` and the objective is
+unchanged, up to rounding. The scale is not capped and is not reported, but it
+can be computed from the reported masses, and it is large when little of a
+sign's mass survives (`100` when one of 100 equal-magnitude positive tokens is
+kept). The CISPO ratio clip (`is_weight_clip_max`, when set) still applies
+independently of the scaling, so the restoration does not equalize
+ratio-weighted gradients.
+
+`ratio_mask_rebalance` set to `true` and `ratio_m2_threshold` each require one
+packed model call per worker. A request that would need more than one call per
+worker is rejected before it is dispatched to the workers, with an error that
+names the key (both keys when both are set) and the per-worker call counts. The
+training sub-job's `training_config.mb_spec.max_tokens_per_mb` budget (default
+`10240` tokens when `mb_spec` or the key is omitted) must therefore be large
+enough to keep each worker's share in one call. Two rejections come later:
+`ratio_m2_threshold` is also rejected under sequence parallelism, and an active
+ratio control without `use_cispo_loss` is rejected. A worker raises both when it
+resolves the loss, before any forward pass.
+
+#### Teacher term for on-policy distillation
+
+On server versions that include it, the `grpo` and `ap_grpo` losses accept a
+teacher term that adds, at every trained token, a clipped teacher-minus-policy
+log ratio to that token's advantage:
+
+```text
+advantage[i] += teacher_tau * clamp(teacher_log_probs_shifted[i] - log_prob[i],
+                                    -teacher_clip_negative, teacher_clip)
+```
+
+`log_prob[i]` is the training policy's own log probability, detached. With
+`context["advantages"]` all zero, this term is the whole signal and the update
+is an on-policy distillation step on reverse KL to the teacher; with task
+advantages, the two add.
+
+| Key | Meaning |
+|---|---|
+| `teacher_tau` | Finite, non-negative weight of the term. `0` (the default) turns it off |
+| `teacher_clip` | Finite, positive upper clip on the log ratio. Required when `teacher_tau > 0` |
+| `teacher_clip_negative` | Optional finite, non-negative magnitude of the lower clip. Defaults to `teacher_clip` |
+
+When `teacher_tau > 0`, `context` must carry `teacher_log_probs_shifted`: a
+floating-point tensor with the same shape as the prediction-aligned
+log probabilities, where position `i` holds the teacher's log probability of
+`input_ids[:, i + 1]` (see [section 10.4](#104-shifted-log-probability-convention)).
+Positions outside `loss_mask` are ignored, as are positions whose teacher value
+is not finite. The term also requires the default token-level
+`importance_sampling_level`, and with `token-mean` aggregation it rejects
+`sequence_loss_weights`. Configuration keys are checked by name, so a misspelled
+key fails the request instead of training without the term.
+
+With the term enabled, the `metrics` of the forward/backward result carry:
+
+| Metric | Meaning |
+|---|---|
+| `teacher_tau` | The weight that was applied |
+| `teacher_term_token_count` | Tokens that received the term |
+| `teacher_log_ratio_sum` | Sum of the unclipped teacher-minus-policy log ratios over those tokens |
+| `teacher_clipped_log_ratio_sum` | The same sum after clipping |
+
+`-teacher_log_ratio_sum / teacher_term_token_count` is a per-token estimate of
+the reverse KL from the policy to the teacher on the trained tokens.
 
 ### 10.4 Shifted log-probability convention
 
@@ -1581,12 +2194,12 @@ These are conventional backend results, not closed REST schemas:
 
 | Operation | Common result |
 |---|---|
-| `forward-backward` | `job_id`, `avg_loss`, `metrics`, `post_process_outputs` |
+| `forward-backward` | `job_id`, `avg_loss`, `metrics`, `post_process_outputs`; `metrics` carries the ratio-control metrics when those controls are active (see [section 10.3](#103-arctictraining-extensions)) |
 | `step` | `global_steps`, `last_lr`, optional `peak_memory` |
 | `save` | `job_id`, `stage_path` (carries the `cp_<uuid>` id), `checkpoint_path`, `checkpoint_tag`, `version` — no `checkpoint_id` key in the observed release (see 6.3) |
 | `load` | `checkpoint_id` and backend load metadata |
 | `generate` | `job_id`, `results[]` |
-| `weight-sync` | Completion/transfer metadata |
+| `weight-sync` | Completion/transfer metadata; each sampling target's result carries `clear_cache` (see [section 7.2](#72-weight-sync)) |
 | `forward` | Backend-specific forward-only result |
 
 Generic-operation responses and fields inside `metrics` or generation results
@@ -1609,8 +2222,10 @@ serve empty, non-EOF pages during placement while the pod is still appearing.
 `fetch_execution_logs(job_id)`:
 
 1. Calls `GET /{job_id}/experiment-run`.
-2. Resolves the current user, account, and role through the SQL statements API.
-3. Opens an explicitly PAT-authenticated Snowflake Connector session.
+2. For profile clients, opens an independent connection from the same
+   Snowflake profile.
+3. For direct PAT clients, resolves the current user and role through the SQL
+   statements API and opens an equivalent Connector session.
 4. Uses experiment artifact `LIST` and `GET` to download every object below a
    `/_logs/{sub_job_id}/` subtree.
 
@@ -1632,19 +2247,58 @@ paths or object-store credentials.
 
 ### 12.3 Persisted stdout download
 
-`download_stdout_logs(job_id, output_dir)` downloads gzip chunks under
-`_stdout/{sub_job_id}/`, orders them by artifact name, and streams them into
-`<output_dir>/<sub_job_id>/stdout.log`. Each destination is replaced atomically;
-an invalid chunk leaves an existing file unchanged.
+`download_stdout_logs(job_id, output_dir, *, resume=False, progress=None)` downloads gzip chunks
+under `_stdout/{sub_job_id}/`, orders them by artifact name, and streams them
+into `<output_dir>/<sub_job_id>/stdout.log`. A large download may open
+additional Snowflake sessions to fetch one sub-job's chunks, and each of
+those sessions can prompt for authentication. Each sub-job is committed before
+the next one starts. A failed chunk leaves that sub-job's committed bytes
+and manifest in place. A hidden
+`.<filename>.manifest.json` beside the file records `version`, the sorted
+relative chunk paths, and the committed byte length.
+
+`resume=True` appends only when those paths are a prefix of the current sorted
+list and the file is at least that many bytes. A longer file is truncated back
+to the committed length. A missing or shorter file is rebuilt, as is a chunk
+list that is no longer a prefix of the sorted paths.
+Two downloads of the same output directory at once are unsupported.
+The method stays silent unless `progress` is passed. On a terminal, the CLI
+draws one updating line on stderr; a redirected stderr gets one final line per
+sub-job.
 
 ### 12.4 GPU metrics download
 
-`download_metrics(job_id, output_dir)` applies the same bounded reconstruction
-to `gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under `_metrics/{sub_job_id}/` and
-writes `<output_dir>/<sub_job_id>/gpu.jsonl`.
+`download_metrics(job_id, output_dir, *, resume=False, progress=None)` applies the same
+reconstruction to `gpu.YYYYMMDD-HHMMSS.UUID.gz` chunks under
+`_metrics/{sub_job_id}/` and writes `<output_dir>/<sub_job_id>/gpu.jsonl`,
+including `resume`, `progress`, and the manifest beside that file.
 
 The reconstructed file contains the JSONL records emitted by the deployed
-training runtime.
+training runtime. Version 2 GPU rows have no `kind` field and include:
+
+| Field | Meaning |
+|---|---|
+| `record_version` | Row schema version; currently `2` |
+| `sub_job_id` | Sub-job that produced the sample |
+| `sample_ts` | RFC3339 UTC scrape time; fractional seconds may use nanosecond precision |
+| `worker_num` | Worker ordinal within the sub-job |
+| `local_gpu_index` | GPU index within one worker; it repeats across workers |
+| `global_gpu_index` | GPU identity within one sub-job; group GPU series by this field |
+| `gpu_uuid` | Device UUID reported by the GPU runtime |
+| `gpu_util_pct` | GPU utilization percentage gauge |
+| `fb_used_bytes` / `fb_free_bytes` | Used and free framebuffer bytes |
+| `power_watts` | Board power gauge |
+| `gpu_temp_c` | GPU temperature gauge |
+| `sm_active_pct` / `sm_occupancy_pct` | Optional SM activity gauges |
+| `tensor_active_pct` / `dram_active_pct` | Optional tensor and DRAM activity gauges |
+| `seq` / `seq_epoch` | Sample sequence and its opaque generation |
+| `sample_interval_s` | Sampling interval in seconds |
+
+One row represents one GPU at one scrape. Gauge values are used as-is rather
+than differenced. JSON `null` means unmeasured and is distinct from `0.0`.
+`global_gpu_index` is unique only inside a sub-job, so consumers loading more
+than one file also group by `sub_job_id`. A future mixed stream can distinguish
+GPU rows with `kind: "gpu"`; consumers should ignore kinds they do not support.
 
 ### 12.5 Zone scheduling events
 
@@ -1837,18 +2491,10 @@ These are current gaps, not supported API behavior:
 1. `save(checkpoint_id=...)` sends a field that is absent from the server's
    `SaveRequest`, so a caller-selected id is not honored. Use the server-assigned
    id from `stage_path` or the job's checkpoint list (section 6.3).
-2. Generic `forward()` wraps binary input in a base64 JSON payload, while the
-   server's `/forward` route expects raw DSSST1 bytes, so byte-based
-   `forward()` is not end-to-end compatible. Request construction is
-   unit-tested; the round trip is not.
-3. `tail_events()` and `stream_events()` send an operation type the server does
+2. `tail_events()` and `stream_events()` send an operation type the server does
    not accept (see [section 7.9](#79-unsupported-zone-events-client-helper)).
-4. `wait_for_job()` does not treat `terminated` as terminal, so a torn-down job
+3. `wait_for_job()` does not treat `terminated` as terminal, so a torn-down job
    polls until `poll_timeout` rather than failing immediately.
-5. Generate prompt validation resolves `max_seq_len` from the first sub-job
+4. Generate prompt validation resolves `max_seq_len` from the first sub-job
    carrying an `inference_config` rather than matching `job_type="sampling"`. A
    `log_probability` sub-job listed first therefore supplies the wrong window.
-6. `_operation()` writes a debug line to stdout, which corrupts the CLI's JSON
-   output for operation-based commands (`weight-sync`, `tail-logs`,
-   `cancel-request`, `reset-prefix-cache`, router replay). Redirect stdout or
-   parse stderr-free output until this is removed.

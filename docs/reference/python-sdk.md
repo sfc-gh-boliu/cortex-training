@@ -8,7 +8,18 @@ from cortex_training import CortexTrainingClient, SubJobConfig, JobType
 client: every data-plane call returns a `request_id` that you poll, and results
 are whatever the backend returns.
 
-Construct it with a Programmatic Access Token:
+Construct it with a named Snowflake connection profile:
+
+```python
+client = CortexTrainingClient.from_connection_name("training")
+```
+
+Pass no name to use the Connector-configured default profile. The profile's
+database and schema are used unless explicitly overridden. The client shares
+the profile's live Snowflake session token with REST and telemetry calls,
+reconnecting once when the API reports token expiry.
+
+Direct Programmatic Access Token construction remains supported:
 
 ```python
 client = CortexTrainingClient.from_pat(
@@ -21,13 +32,15 @@ client = CortexTrainingClient.from_pat(
 
 Tuning knobs on the constructor: `endpoint`, `poll_interval` (0.5s),
 `poll_timeout` (1800s), `poll_backoff_multiplier` (1.25), `poll_max_interval`
-(6s), `pool_maxsize` (1024), `max_retries` (10). `from_pat` also accepts
-`telemetry_timeout` (3s) for best-effort client metrics.
+(6s), `pool_maxsize` (1024), `max_retries` (10), and `request_timeout`
+(`(30s connect, 600s read)`). Pass a positive scalar to use the same connect
+and read timeout, or a `(connect, read)` pair. `from_connection_name` and
+`from_pat` also accept `telemetry_timeout` (3s) for best-effort client metrics.
 
 ## Client metrics
 
-Clients created with `CortexTrainingClient.from_pat` automatically emit one
-best-effort event when an essential operation fails. Set
+Snowflake profile and PAT clients automatically emit one best-effort event
+when an essential operation fails. Set
 `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY=1` to also emit successful outcomes.
 Local or mock clients constructed with an explicit `base_url` treat
 `emit_metric` as a no-op. Set `CORTEX_TRAINING_DISABLE_TELEMETRY=1` to skip
@@ -36,7 +49,8 @@ constructing the emitter.
 Tracked operations:
 
 - Job lifecycle: `create_job`, `wait_for_job`, `get_job`, `list_jobs`,
-  `list_models`, `cancel_job`, `get_capacity`, `get_experiment_run`
+  `list_models`, `iter_jobs` (one event per page), `cancel_job`, `get_capacity`,
+  `get_capacity_breakdown`, `get_experiment_run`
 - Compute: `forward_backward`, `forward`, `generate`, `generate_stream`, `step`
 - Checkpoints and logs: `save`, `load`, `list_checkpoints`,
   `export_checkpoint`, `delete_checkpoint`, `fetch_execution_logs`
@@ -48,8 +62,16 @@ Each emitted event body contains `success`, `duration_ms`, `request_count`,
 `attempt_count`, and `retry_count`. Failures also include a bounded
 `error_message` with common credential patterns redacted. Queryable attributes
 include available `job_id`, sub-job identifiers, `request_id`,
-`checkpoint_id`, `error.type`, HTTP status, Snowflake request ID, and server
-error code. Records use OTLP resource attributes
+`checkpoint_id`, `error.type`, HTTP status, and server error code.
+Two attributes carry Snowflake request IDs:
+
+| Attribute | Meaning | When set |
+|---|---|---|
+| `error.snowflake_request_id` | Snowflake request ID of the failing response | Failures whose response had the header |
+| `snowflake.request_ids` | Recent Snowflake request IDs of the operation (up to 10, including retried attempts), newest last | Whenever any were seen |
+
+`snowflake.request_id` is a deprecated alias of `error.snowflake_request_id`,
+emitted for one release. Records use OTLP resource attributes
 `service.name = cortex-training` and
 `snowflake.account_host = <normalized connection hostname>`.
 
@@ -74,14 +96,27 @@ operation.
 
 | Method | Returns | Notes |
 |---|---|---|
-| `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None)` | `job_id` | Validates each `SubJobConfig` client-side first. A job takes zero or one `training` sub-job and any number of `sampling` / `log_probability` sub-jobs. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200` |
-| `create_job_from_body(body)` | response dict | For callers that already hold the REST JSON. Enforces the same one-training-sub-job rule before sending |
+| `create_job(sub_jobs, job_id=None, experiment_name=None, hardware=None)` | `job_id` | Validates each `SubJobConfig` client-side first. Only `training` and `sampling` sub-jobs can be submitted: a job takes zero or one `training` sub-job and any number of `sampling` sub-jobs. `hardware` is `H200`, `B200`, or `B300` (the `Hardware` enum or its string); omitted means `H200` |
+| `create_job_from_body(body)` | response dict | For callers that already hold the REST JSON. Enforces the same one-training-sub-job and no-`log_probability` rules before sending |
 | `get_job(job_id)` | job dict | Includes `sub_jobs` with their configs |
 | `list_jobs(status=None)` | list of jobs | Returns the inner list, not the envelope |
 | `list_models()` | list of models | Active models configured for new jobs; returns the inner list |
+| `iter_jobs(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100)` | iterator of jobs | Jobs across the account that the caller can see, newest first, following page tokens; each also carries `database_name` and `schema_name`. The server applies every filter. Arguments are checked on the call: `page_size` is 1 to 1000, and `schema` needs `database` with it. A 404 means account-level listing is not enabled for the account. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2endpoint) |
+| `for_job(job)` | `CortexTrainingClient` | Bound to a job from `iter_jobs` for per-job calls. Borrows this client's session, auth, and telemetry, so keep this one open; closing the returned client is a no-op. Never creates the job's database |
 | `wait_for_job(job_id)` | job dict | Polls until `running`; raises on `failed`/`done`/`cancelled` or timeout. Does not treat `terminated` as terminal |
 | `cancel_job(job_id)` | `None` | Idempotent while cancelling/cancelled |
 | `get_capacity(hardware=None)` | capacity dict | `has_reservation`, `max_total_gpus`, `reserved_gpus`, `in_use_gpus`, `pending_gpus`, `available_gpus`, scoped to `hardware` (omitted means the server default, H200). The CLI `capacity` command queries every type unless `--hardware` is set. `max_total_gpus` is the canonical ceiling (`-1` uncapped); `reserved_gpus` is deprecated |
+| `get_capacity_breakdown(hardware=None, *, dimensions=("job_type", "submitted_by"))` | capacity dict plus `breakdown` | `get_capacity` split by sub-job type and/or submitter; each split has a `status` and `groups`. Unknown dimensions raise `ValueError`. See [rest-api.md section 5.4](rest-api.md#breakdown---breakdown) |
+
+`JobType.LOG_PROBABILITY` stays a schema type: a `SubJobConfig` carrying it
+still constructs, validates, and serializes to `"log_probability"`. Submission
+is what is blocked. `create_job()`, `create_job_from_body()`,
+`SubJobConfig.sampling_job()`, and `cortex-training submit` (including
+`--dry-run`) all raise before sending, with the message
+`log_probability sub-jobs are not currently supported` prefixed by the offending
+location — for example
+`sub_job_configs[1].job_type: log_probability sub-jobs are not currently
+supported`. The short alias `log_prob` is rejected the same way.
 
 ## Training and sampling
 
@@ -90,12 +125,117 @@ operation.
 | `forward_backward(job_id, data)` | `request_id` | `data` is a DSSST1 frame; always chunk-wrapped |
 | `step(job_id, learning_rate=None)` | `request_id` | Omitting the rate uses the job's optimizer setting |
 | `generate(job_id, prompts, sampling_params=None, routing_key=None, strict=None)` | `request_id` | Pre-tokenized prompts are length-checked client-side |
-| `generate_stream(...)` | response dict | UTF-8 JSON body; read progress with `get_request_status` |
+| `generate_stream(...)` | response dict | Same DSSST1 body encoding as `generate`, sent in one POST; read progress with `get_request_status` |
 | `weight_sync(job_id, source_sub_job_id, target_sub_job_ids, weight_format=None)` | `request_id` | `weight_format="lora"` syncs adapters only |
-| `forward(job_id, payload, ...)` | response dict | See the known limitation in [rest-api.md section 14](rest-api.md#14-known-limitations) |
-| `poll_request(job_id, request_id)` | result dict | Handles backoff, DSSST1 decoding and chunked results |
+| `forward(job_id, payload, ...)` | response dict | Byte frames that exceed the `/operation` JSON ceiling are request-chunked; see [rest-api.md section 7.1](rest-api.md#71-forward) |
+| `poll_request(job_id, request_id)` | result dict | Handles backoff, DSSST1 decoding, chunked results, and envelope `metrics` merge (envelope wins on key collision) |
 | `get_request_status(job_id, request_id, max_events=None, cursor=None)` | status dict | |
 | `cancel_request(job_id, request_id, ...)` | response dict | |
+
+A training sub-job with router replay picks how forward/backward treats rows
+whose routing no sampling worker holds with `router_replay["mode"]` in the
+`extra_training` argument of `SubJobConfig.training_job(...)`, together with
+`"enabled": true`:
+
+- `"strict"` (default) fails the request.
+- `"best_effort"` routes those rows with the trainer's own MoE gate and adds
+  `router_replay/rows_*` and `router_replay/tokens_*` keys to the polled
+  result's `metrics`. With whole-block activation checkpointing it also needs
+  `ac_config.router_replay_recompute` left at its default `true`.
+
+The server rejects `"best_effort"` without `"enabled": true`, and any mode
+other than `"strict"` on a sampling sub-job. See
+[rest-api.md section 8.2](rest-api.md#82-trainingconfig) and
+[section 6.1](rest-api.md#61-forwardbackward---post-job_idforward-backward).
+
+## Router-replay capacity planning
+
+`cortex_training.router_replay_planner` derives the per-worker
+`router_replay.max_cache_bytes` caps before you create a job. It only
+calculates. It does not call the service, edit a job config, or reserve GPU
+memory. Put `CachePlan.max_cache_bytes` on the sampling and training
+`router_replay` objects yourself. When bootstrapping with an explicit cap, pass
+the training result to `bootstrap_router_replay(..., max_cache_bytes=...)`.
+
+One full-sequence capture occupies:
+
+```text
+entry_bytes = seq_len * num_moe_layers * topk * dtype_bytes
+```
+
+`moe_geometry_from_config` reads `num_hidden_layers` and `num_experts_per_tok`
+from the config root or `text_config`, and rejects conflicting values. Every
+recognized expert-count field (`num_local_experts`, `n_routed_experts`,
+`num_experts`, `moe_num_experts`) must agree, be positive, and be at least
+`topk`. A count of 256 or fewer selects `dtype_bytes=1` because those expert
+ids fit in `uint8`. A count from 257 through 65536 selects `dtype_bytes=2`
+(`uint16`). A larger count is rejected. `plan_sampling_cache_bytes` and
+`plan_training_cache_bytes` use that width unless you pass `dtype_bytes`.
+
+The sampling cap is per sampling replica, and the training cap is per
+data-parallel shard:
+
+```text
+backlog = max_inflight_rollouts
+        + ceil(batch_size * over_generation_multiplier)
+        + batch_size * max(async_depth, 1)
+per_replica_rollouts = ceil(backlog / replicas * routing_skew)
+sampling_cap = ceil(per_replica_rollouts * entry_bytes * safety_factor)
+
+resident_rows = ceil(batch_size / dp_size)
+training_cap = ceil(resident_rows * entry_bytes * safety_factor)
+```
+
+`max_inflight_rollouts` defaults to `batch_size`. `routing_skew` defaults to
+`2.0` and `safety_factor` defaults to `1.2`. Replica and data-parallel counts
+come from `derive_num_sampling_workers` and `derive_dp_size`; known GPU counts
+must divide exactly by the parallel widths. The skew estimate is not an
+overflow-proof bound. Raise it, or set a manual cap, when a worker retains
+more replay entries than the average backlog times the skew.
+
+`plan_vllm_gpu_memory_utilization` lowers vLLM's `gpu_memory_utilization` by
+the sampling cap divided by the GPU's byte capacity. It raises when that
+reservation exceeds half the GPU or would push utilization below `0.05`.
+
+```python
+from cortex_training import router_replay_planner as rrp
+
+geometry = rrp.resolve_model_moe_geometry(
+    "org/moe-model",
+    num_moe_layers_override=40,
+    topk_override=8,
+    num_experts_override=512,
+)
+assert geometry.dtype_bytes == 2
+
+backlog = rrp.derive_backlog_rollouts(batch_size=16, async_depth=2)
+sampling_workers = rrp.derive_num_sampling_workers(
+    sampling_gpus=8,
+    sampling_tensor_parallel_size=2,
+)
+sampling_plan = rrp.plan_sampling_cache_bytes(
+    seq_len=8192,
+    geometry=geometry,
+    backlog_rollouts=backlog,
+    num_sampling_workers=sampling_workers,
+)
+training_plan = rrp.plan_training_cache_bytes(
+    seq_len=8192,
+    geometry=geometry,
+    resident_rows=rrp.derive_resident_rows(
+        batch_size=16,
+        dp_size=rrp.derive_dp_size(training_gpus=8, sp_size=2),
+    ),
+)
+sampling_cap = sampling_plan.max_cache_bytes
+training_cap = training_plan.max_cache_bytes
+```
+
+The same sequence length, layer count, and top-k with 512 experts stores each
+expert id in two bytes, so each capture is twice as large as one from a model
+with 256 or fewer experts. See
+[rest-api.md section 8.2](rest-api.md#82-trainingconfig) for the
+`max_cache_bytes` field.
 
 ## Checkpoints
 
@@ -111,10 +251,19 @@ operation.
 `stream_logs(job_id, follow=True, ...)` yields entries and keeps polling.
 `fetch_execution_logs(job_id)` downloads every log file for the job's experiment
 run and returns `{sub_job_id, filename, artifact_uri, content}` dicts.
-`download_stdout_logs(job_id, output_dir)` reconstructs persisted console chunks
-as `<output_dir>/<sub_job_id>/stdout.log`.
-`download_metrics(job_id, output_dir)` reconstructs GPU metric chunks as
-`<output_dir>/<sub_job_id>/gpu.jsonl`.
+`download_stdout_logs(job_id, output_dir, *, resume=False, progress=None)` reconstructs persisted
+console chunks as `<output_dir>/<sub_job_id>/stdout.log`.
+`download_metrics(job_id, output_dir, *, resume=False, progress=None)` reconstructs GPU metric
+chunks as `<output_dir>/<sub_job_id>/gpu.jsonl`. The methods stay silent unless
+`progress` is passed. `progress` receives status updates without a trailing
+newline, then `"\n"` when that sub-job finishes or fails; a status that needs no
+updating arrives as one message ending in a newline. An error raised by
+`progress` stops the download. A large download may open additional Snowflake
+sessions for one sub-job, and each session can prompt for authentication.
+`resume=True` appends chunks
+that are not already recorded in the manifest beside that file. See
+[GPU metrics download](rest-api.md#124-gpu-metrics-download) for the JSONL row
+schema.
 `get_experiment_run(job_id)` resolves the experiment/run names.
 
 ## Building payloads
@@ -136,6 +285,15 @@ what the CLI's `fwd-bwd` command uses.
 the LoRA subset supported by weight sync. It requires `peft_type` to be exactly
 `"Lora"`, so a config copied from a Hugging Face `adapter_config.json` (which
 writes `"LORA"`) must be adjusted.
+
+`cortex_training.optimizer.normalize_optimizer_config(cfg)` does the same for
+the training optimizer block, returning `(canonical_optimizer,
+gradient_clipping)`. It resolves the `type`/`name` and `beta1`/`beta2` aliases,
+flattens a DeepSpeed `params` sub-object, hoists a nested `gradient_clipping`
+out of the block, and rejects scheduler or unknown keys. `TrainingConfig` runs
+it on construction, so calling it directly is only useful for checking a config
+before building the typed object; see
+[REST API section 8.2](rest-api.md#82-trainingconfig) for the rules.
 
 ## Exceptions
 

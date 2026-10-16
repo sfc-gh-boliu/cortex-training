@@ -28,6 +28,8 @@ from cortex_training.tui.__main__ import run as _run_tui
 _TUI_FLAG_OPTIONS = {"--no-verify-ssl"}
 _TUI_VALUE_OPTIONS = {
     "--config",
+    "--connection",
+    "-c",
     "--base-url",
     "--host",
     "--pat",

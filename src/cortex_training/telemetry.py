@@ -15,10 +15,11 @@
 
 """Best-effort client telemetry over Snowflake's OTLP endpoint.
 
-Telemetry is deliberately isolated from the Cortex Training request session
-because the two paths use different authentication schemes:
+Telemetry is deliberately isolated from the Cortex Training HTTP session. Both
+paths consume a Snowflake session-token provider, while legacy PAT clients
+obtain that provider by exchanging the PAT:
 
-* Cortex Training APIs accept the PAT directly.
+* Profile-backed Cortex Training APIs use the Connector's live session token.
 * Observability APIs require a short-lived Snowflake session token.
 
 All metric emission failures are swallowed. Telemetry must never change the
@@ -37,6 +38,7 @@ import time
 import weakref
 from collections.abc import Mapping
 from typing import Any
+from typing import Protocol
 from urllib.parse import urlparse
 
 import requests
@@ -55,6 +57,22 @@ _DEFAULT_QUEUE_SIZE = 1024
 _WORKER_IDLE_SECONDS = 30.0
 _STOP = object()
 _EMITTERS: weakref.WeakSet["OtlpMetricEmitter"] = weakref.WeakSet()
+
+
+class SessionTokenProvider(Protocol):
+    """Authentication lifecycle consumed by the OTLP emitter."""
+
+    def _ensure_process(self) -> None:
+        ...
+
+    def get_token(self) -> str:
+        ...
+
+    def invalidate(self) -> None:
+        ...
+
+    def close(self) -> None:
+        ...
 
 
 def _flush_emitters_at_exit() -> None:
@@ -223,7 +241,7 @@ class OtlpMetricEmitter:
     def __init__(
         self,
         base_url: str,
-        token_provider: CachedSessionTokenProvider,
+        token_provider: SessionTokenProvider,
         *,
         service_name: str = "cortex-training",
         service_version: str | None = None,
@@ -307,7 +325,12 @@ class OtlpMetricEmitter:
                 return self._telemetry_base_url
             response = self._session.get(
                 f"{self.base_url}/observability/system/hostname",
-                headers={"Authorization": f'Snowflake Token="{token}"'},
+                headers={
+                    "Authorization": f'Snowflake Token="{token}"',
+                    # The endpoint answers 500 without an explicit JSON Accept
+                    # header, which silently disables all telemetry.
+                    "Accept": "application/json",
+                },
                 timeout=self.timeout,
             )
             response.raise_for_status()

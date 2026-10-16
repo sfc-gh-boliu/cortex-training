@@ -18,10 +18,14 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
+import re
 import sys
+from datetime import date
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from pathlib import Path
 from typing import Any
@@ -48,6 +52,38 @@ _CONFIG_ALIASES = {
 
 _LOGIN_STATE_ENV = "CORTEX_TRAINING_LOGIN_FILE"
 
+# The statuses each `list --status` word matches, as on the account-level
+# route: pending excludes placing, done takes the DONE older jobs show, and
+# UNKNOWN rows match nothing.
+_LIST_STATUS_FILTERS = {
+    "pending": {"pending"},
+    "placing": {"placing"},
+    "initializing": {"initializing"},
+    "running": {"running"},
+    "failed": {"failed"},
+    "cancelled": {"cancelled"},
+    "terminated": {"terminated"},
+    "active": {"pending", "placing", "initializing", "running"},
+    "done": {"cancelled", "terminated", "done"},
+}
+
+# Status words the server can answer with that are not the ones it filters on:
+# older rows, and states a backend ahead of the API layer reports.
+_STATUS_ALIASES = {
+    "queued": "pending",
+    "creating": "initializing",
+    "canceled": "cancelled",
+    "completed": "done",
+    "succeeded": "done",
+    "error": "failed",
+}
+
+# `capacity --breakdown` choice -> get_capacity_breakdown() dimension.
+_CAPACITY_BREAKDOWN_CHOICES = {
+    "job-type": "job_type",
+    "submitted-by": "submitted_by",
+}
+
 
 def _env(*names: str) -> str | None:
     for name in names:
@@ -68,6 +104,10 @@ def _has_url_scheme(url: str) -> bool:
     return url.startswith("http://") or url.startswith("https://")
 
 
+# The service rejects a GPU type the account does not support with this code.
+_UNSUPPORTED_HARDWARE_CODE = "517604"
+
+
 def _load_cortex_training_client_class():
     from .client import CortexTrainingClient
 
@@ -86,6 +126,9 @@ def _hardware_choices() -> list[str]:
     return [member.value for member in Hardware]
 
 
+_FRACTION_RE = re.compile(r"\.([0-9]+)")
+
+
 def _created_epoch(raw: Any) -> float | None:
     if raw is None:
         return None
@@ -94,6 +137,10 @@ def _created_epoch(raw: Any) -> float | None:
         return None
     if created_at.endswith("Z"):
         created_at = created_at[:-1] + "+00:00"
+    # Before Python 3.11, fromisoformat takes only 3 or 6 fractional digits.
+    created_at = _FRACTION_RE.sub(
+        lambda match: "." + match.group(1)[:6].ljust(6, "0"), created_at, count=1
+    )
     try:
         created = datetime.fromisoformat(created_at)
     except ValueError:
@@ -128,6 +175,116 @@ def _jobs_latest_last(jobs: list[Any]) -> list[Any]:
     return list(reversed(jobs))
 
 
+def _newest_jobs(jobs: list[Any], limit: int) -> list[Any]:
+    """The ``limit`` newest jobs by ``created_at``, in the order given.
+
+    A missing timestamp ranks oldest, so ``--limit`` drops those rows first;
+    ties break toward the earlier row, the server answering newest first.
+    """
+    if limit >= len(jobs):
+        return list(jobs)
+    last = len(jobs) - 1
+
+    def rank(item: tuple[int, Any]) -> tuple[float, int]:
+        index, job = item
+        created = _created_epoch(job.get("created_at")) if isinstance(job, dict) else None
+        return (created if created is not None else float("-inf"), last - index)
+
+    newest = sorted(enumerate(jobs), key=rank)[-limit:]
+    return [job for _, job in sorted(newest)]
+
+
+def _status_list(raw: str) -> str:
+    """argparse type for --status: the comma list, lowercased, every word known."""
+    words = [word.strip().lower() for word in raw.split(",")]
+    for word in words:
+        if word not in _LIST_STATUS_FILTERS:
+            raise argparse.ArgumentTypeError(
+                f"unknown status {word!r}; use a comma-separated list of "
+                + ", ".join(_LIST_STATUS_FILTERS)
+            )
+    return ",".join(words)
+
+
+def _list_statuses(words: str) -> set[str]:
+    """The job statuses a --status list from _status_list keeps."""
+    statuses: set[str] = set()
+    for word in words.split(","):
+        statuses |= _LIST_STATUS_FILTERS[word]
+    return statuses
+
+
+_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+def _utc_date(value: str) -> date:
+    """argparse type for --since/--until: a YYYY-MM-DD date, read as a UTC day."""
+    # Matched first because date.fromisoformat also takes forms such as 20261001.
+    if _DATE_RE.fullmatch(value):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            pass
+    raise argparse.ArgumentTypeError(f"expected a YYYY-MM-DD date, got {value!r}")
+
+
+def _utc_midnight(day: date) -> float:
+    return datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp()
+
+
+def _same_name(wanted: str, actual: Any) -> bool:
+    # Rows carry names as stored. SQL identifier rules, as the server applies to
+    # submitted_by: an unquoted name means its uppercase form, a "quoted" one
+    # exactly what is between the quotes.
+    if len(wanted) > 1 and wanted[0] == wanted[-1] == '"':
+        wanted = wanted[1:-1].replace('""', '"')
+    else:
+        wanted = wanted.upper()
+    return isinstance(actual, str) and actual == wanted
+
+
+def _list_filter(args: argparse.Namespace) -> Callable[[dict], bool]:
+    """Build the list filters for the schema's jobs; --all has the server apply them."""
+    # Rows can carry an enum name (JOB_STATE_RUNNING) or an alias, so compare
+    # on the normalized word rather than the raw field.
+    from .client import CortexTrainingClient
+
+    def status_of(job: dict) -> str:
+        word = CortexTrainingClient._normalize_job_status(job.get("status"))
+        return _STATUS_ALIASES.get(word, word)
+
+    statuses = None if args.status is None else _list_statuses(args.status)
+    since = None if args.since is None else _utc_midnight(args.since)
+    # --until names the last day kept, so the bound is the next midnight.
+    until = None if args.until is None else _utc_midnight(args.until + timedelta(days=1))
+
+    def keep(job: dict) -> bool:
+        if statuses is not None and status_of(job) not in statuses:
+            return False
+        if args.user is not None and not _same_name(args.user, job.get("submitted_by")):
+            return False
+        if since is None and until is None:
+            return True
+        created = _created_epoch(job.get("created_at"))
+        return (
+            created is not None
+            and (since is None or created >= since)
+            and (until is None or created < until)
+        )
+
+    return keep
+
+
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number, got {value!r}") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {number}")
+    return number
+
+
 def build_parser(
     *,
     prog: str = "cortex-training",
@@ -141,6 +298,15 @@ def build_parser(
         "--config",
         default=_env("CORTEX_TRAINING_CONFIG"),
         help="Path to a reusable Cortex Training CLI config JSON file.",
+    )
+    parser.add_argument(
+        "--connection",
+        "-c",
+        default=_env("CORTEX_TRAINING_CONNECTION"),
+        help=(
+            "Snowflake connection profile name. When no legacy config or direct "
+            "credentials are configured, the Snowflake default profile is used."
+        ),
     )
     parser.add_argument(
         "--base-url",
@@ -169,7 +335,7 @@ def build_parser(
     parser.add_argument(
         "--no-verify-ssl",
         action="store_true",
-        help="Disable SSL certificate verification for PAT-authenticated requests.",
+        help="Disable SSL certificate verification for authenticated requests.",
     )
     parser.add_argument("--poll-interval", type=float)
     parser.add_argument("--poll-timeout", type=float)
@@ -217,7 +383,43 @@ def build_parser(
     checkpoints.add_argument("job_id")
 
     list_jobs = subparsers.add_parser("list", help="List Cortex Training jobs.")
-    list_jobs.add_argument("--status", help="Optional status filter.")
+    list_jobs.add_argument(
+        "--status",
+        type=_status_list,
+        help=(
+            "Comma-separated statuses to keep: "
+            + ", ".join(_LIST_STATUS_FILTERS)
+            + ". active is pending through running; done is cancelled, terminated, "
+            "and the DONE that older jobs show."
+        ),
+    )
+    list_jobs.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "List jobs across every schema in the account that the current user "
+            "can see, not just the configured one. Fails if account-level listing "
+            "is not enabled for the account."
+        ),
+    )
+    list_jobs.add_argument("--user", help="Keep jobs submitted by this user.")
+    list_jobs.add_argument(
+        "--since",
+        type=_utc_date,
+        metavar="YYYY-MM-DD",
+        help="Keep jobs created on or after this date (a UTC day).",
+    )
+    list_jobs.add_argument(
+        "--until",
+        type=_utc_date,
+        metavar="YYYY-MM-DD",
+        help="Keep jobs created on or before this date (a UTC day).",
+    )
+    list_jobs.add_argument(
+        "--limit",
+        type=_positive_int,
+        help="Print at most this many of the newest matching jobs.",
+    )
 
     subparsers.add_parser(
         "models",
@@ -233,8 +435,18 @@ def build_parser(
         "--hardware",
         choices=_hardware_choices(),
         help=(
-            "Show only this GPU hardware. "
-            "Omit to show capacity for every hardware type."
+            "Show only this GPU hardware. Omit to show capacity for every type "
+            "your account supports; unsupported types are listed separately."
+        ),
+    )
+    capacity.add_argument(
+        "--breakdown",
+        action="append",
+        choices=tuple(_CAPACITY_BREAKDOWN_CHOICES),
+        help=(
+            "Also split in_use_gpus and pending_gpus by sub-job type "
+            "(job-type) or by submitting user (submitted-by). Repeat to get "
+            "both."
         ),
     )
 
@@ -367,6 +579,15 @@ def build_parser(
             "Defaults to the current working directory."
         ),
     )
+    download_log.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue an earlier stdout download in the output directory and "
+            "fetch only output that is not already saved. Two downloads of the "
+            "same directory at once are unsupported."
+        ),
+    )
 
     download_metrics = subparsers.add_parser(
         "download-metrics",
@@ -379,6 +600,15 @@ def build_parser(
         help=(
             "Directory to write <sub_job_id>/gpu.jsonl files. Created if "
             "missing. Defaults to the current working directory."
+        ),
+    )
+    download_metrics.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue an earlier metrics download in the output directory and "
+            "fetch only metrics that are not already saved. Two downloads of "
+            "the same directory at once are unsupported."
         ),
     )
 
@@ -402,7 +632,10 @@ def build_parser(
     )
 
     if include_tui:
-        subparsers.add_parser("tui", help="Open the read-only Cortex Training log TUI.")
+        subparsers.add_parser(
+            "tui",
+            help="Open the read-only Cortex Training logs and resources TUI.",
+        )
 
     return parser
 
@@ -515,7 +748,12 @@ def _has_connection(
 
 
 def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, Any]:
+    args._legacy_config_selected = False
+    if getattr(args, "connection", None):
+        return {}
+
     if args.config:
+        args._legacy_config_selected = True
         return _load_config(args.config)
 
     if not load_login:
@@ -534,7 +772,10 @@ def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, A
     login_config = _read_login_config_path()
     if login_config is None:
         return {}
+    if not Path(login_config).expanduser().is_file():
+        return {}
     args.config = login_config
+    args._legacy_config_selected = True
     return _load_config(login_config)
 
 
@@ -544,20 +785,25 @@ def _resolve_args(
     load_login: bool = True,
 ) -> argparse.Namespace:
     config = _select_config(args, load_login=load_login)
+    profile_requested = bool(getattr(args, "connection", None))
     args.base_url = _coalesce(
         args.base_url,
         _config_str(config, "base_url"),
-        _env("CORTEX_TRAINING_BASE_URL"),
+        None if profile_requested else _env("CORTEX_TRAINING_BASE_URL"),
     )
     args.host = _coalesce(
         args.host,
         _config_str(config, "host"),
-        _env("CORTEX_TRAINING_HOST", "SNOWFLAKE_HOST"),
+        None
+        if profile_requested
+        else _env("CORTEX_TRAINING_HOST", "SNOWFLAKE_HOST"),
     )
     args.pat = _coalesce(
         args.pat,
         _config_str(config, "pat"),
-        _env("CORTEX_TRAINING_PAT", "SNOWFLAKE_PAT"),
+        None
+        if profile_requested
+        else _env("CORTEX_TRAINING_PAT", "SNOWFLAKE_PAT"),
     )
     args.database = _coalesce(
         args.database,
@@ -568,7 +814,6 @@ def _resolve_args(
         args.schema,
         _config_str(config, "schema"),
         _env("CORTEX_TRAINING_SCHEMA", "SNOWFLAKE_SCHEMA"),
-        "PUBLIC",
     )
     args.endpoint = _coalesce(
         args.endpoint,
@@ -593,6 +838,17 @@ def _resolve_args(
             args.no_verify_ssl = no_verify_ssl
         elif verify_ssl is not None:
             args.no_verify_ssl = not verify_ssl
+    direct_credentials_present = any((args.base_url, args.host, args.pat))
+    if profile_requested and direct_credentials_present:
+        raise ValueError(
+            "--connection cannot be combined with --base-url, --host, or --pat"
+        )
+    direct_connection_complete = bool(args.base_url or (args.host and args.pat))
+    args.use_connection_profile = profile_requested or (
+        not args._legacy_config_selected and not direct_connection_complete
+    )
+    if not args.use_connection_profile and args.schema is None:
+        args.schema = "PUBLIC"
     return args
 
 
@@ -616,6 +872,14 @@ def parse_args(
 ) -> argparse.Namespace:
     parser = build_parser(prog=prog, include_tui=include_tui)
     args = parser.parse_args(argv)
+    if args.command == "list":
+        if args.since is not None and args.until is not None and args.since > args.until:
+            parser.error("--since must not be later than --until")
+        # --until is sent as the day after, which does not exist for the last date.
+        if args.until == date.max:
+            parser.error(f"--until must be earlier than {date.max}")
+        if args.user is not None and not args.user.strip():
+            parser.error("--user must not be empty")
     if args.command == "login":
         args.login_config = args.login_config or args.login_config_option
         return args
@@ -625,6 +889,8 @@ def parse_args(
     if dry_run:
         return args
     args = _normalize_connection_args(args)
+    if args.use_connection_profile:
+        return args
     if not args.database:
         parser.error("provide --database or set CORTEX_TRAINING_DATABASE/SNOWFLAKE_DATABASE")
     if args.base_url is None and (args.host is None or args.pat is None):
@@ -642,6 +908,12 @@ def build_client(args: argparse.Namespace, cortex_training_client_cls):
     }
     if args.base_url:
         return cortex_training_client_cls(base_url=args.base_url, **kwargs)
+    if args.use_connection_profile:
+        return cortex_training_client_cls.from_connection_name(
+            connection_name=args.connection,
+            verify_ssl=not args.no_verify_ssl,
+            **kwargs,
+        )
     return cortex_training_client_cls.from_pat(
         host=_normalize_host(args.host),
         pat=args.pat,
@@ -664,26 +936,64 @@ def _read_json_object(path: str, stdin: TextIO) -> dict[str, Any]:
     return parsed
 
 
+# Duplicated from client.py rather than imported: submit --dry-run must stay
+# importable without pulling in the client (and therefore torch).
+_LOG_PROBABILITY_JOB_TYPE_ALIASES = frozenset({"log_probability", "log_prob"})
+_UNSUPPORTED_LOG_PROBABILITY_MESSAGE = (
+    "log_probability sub-jobs are not currently supported"
+)
+
+
+def _normalized_job_type(job_type: Any) -> str:
+    if not isinstance(job_type, str):
+        return ""
+    return job_type.strip().lower().removeprefix("job_type_")
+
+
+def _is_log_probability_job_type(job_type: Any) -> bool:
+    return _normalized_job_type(job_type) in _LOG_PROBABILITY_JOB_TYPE_ALIASES
+
+
+def _reject_log_probability_sub_job(job_type: Any, *, location: str) -> None:
+    if _is_log_probability_job_type(job_type):
+        raise ValueError(f"{location}: {_UNSUPPORTED_LOG_PROBABILITY_MESSAGE}")
+
+
 def _validate_create_job_body(body: dict[str, Any]) -> None:
+    from .client import _validate_raw_sub_job_configs
+
     sub_job_configs = body.get("sub_job_configs")
     if not isinstance(sub_job_configs, list) or not sub_job_configs:
         raise ValueError("job JSON must contain a non-empty sub_job_configs list")
     # Mirrors client.create_job_from_body; submit --dry-run never builds a client.
-    training_sub_jobs = sum(
-        1
-        for cfg in sub_job_configs
-        if isinstance(cfg, dict) and str(cfg.get("job_type") or "").strip().lower() == "training"
-    )
-    if training_sub_jobs > 1:
-        raise ValueError("at most one training sub-job is supported per job")
+    training_sub_jobs = 0
+    for index, cfg in enumerate(sub_job_configs):
+        if not isinstance(cfg, dict):
+            continue
+        job_type = cfg.get("job_type")
+        _reject_log_probability_sub_job(
+            job_type, location=f"sub_job_configs[{index}].job_type"
+        )
+        if str(job_type or "").strip().lower() == "training":
+            training_sub_jobs += 1
+            if training_sub_jobs > 1:
+                raise ValueError("at most one training sub-job is supported per job")
+    _validate_raw_sub_job_configs(sub_job_configs)
 
 
-def _print_json(value: Any, stdout: TextIO, *, compact: bool) -> None:
+def _print_json(value: Any, stdout: TextIO, *, compact: bool, sort_keys: bool = True) -> None:
     if compact:
-        json.dump(value, stdout, separators=(",", ":"), sort_keys=True)
+        json.dump(value, stdout, separators=(",", ":"), sort_keys=sort_keys)
     else:
-        json.dump(value, stdout, indent=2, sort_keys=True)
+        json.dump(value, stdout, indent=2, sort_keys=sort_keys)
     stdout.write("\n")
+
+
+def _request_sent_pat(response: Any) -> bool:
+    # Connection-profile requests carry a session token from a login that
+    # already accepted the PAT, so a 401 there is not a PAT problem.
+    headers = getattr(getattr(response, "request", None), "headers", None) or {}
+    return headers.get("X-Snowflake-Authorization-Token-Type") == "PROGRAMMATIC_ACCESS_TOKEN"
 
 
 def _format_error(exc: BaseException) -> str:
@@ -693,7 +1003,7 @@ def _format_error(exc: BaseException) -> str:
 
     parts = [str(exc)]
     request_id = getattr(response, "headers", {}).get("x-snowflake-request-id")
-    if request_id:
+    if request_id and request_id not in parts[0]:
         parts.append(f"snowflake request id: {request_id}")
 
     body = (getattr(response, "text", "") or "").strip()
@@ -701,6 +1011,12 @@ def _format_error(exc: BaseException) -> str:
         if len(body) > 4000:
             body = body[:4000] + "...<truncated>"
         parts.append(f"response body: {body}")
+    if getattr(response, "status_code", None) == 401 and _request_sent_pat(response):
+        from cortex_training.snowflake_auth import credentials_rejected_hint
+
+        parts.append(
+            credentials_rejected_hint("Snowflake rejected your credentials (HTTP 401).")
+        )
     return "\n".join(parts)
 
 
@@ -730,6 +1046,33 @@ def _cmd_submit(
     return 0
 
 
+def _cmd_list(args: argparse.Namespace, client, stdout: TextIO) -> int:
+    if args.all:
+        jobs = list(
+            itertools.islice(
+                client.iter_jobs(
+                    status=args.status,
+                    submitted_by=args.user,
+                    created_after=args.since,
+                    # The server's bound is exclusive; --until names the last day kept.
+                    created_before=(
+                        None if args.until is None else args.until + timedelta(days=1)
+                    ),
+                    # No bigger than what gets printed; the server takes 1 to 1000.
+                    page_size=min(args.limit or 100, 1000),
+                ),
+                args.limit,
+            )
+        )
+    else:
+        keep = _list_filter(args)
+        jobs = [job for job in client.list_jobs() if keep(job)]
+    if args.limit is not None:
+        jobs = _newest_jobs(jobs, args.limit)
+    _print_json({"jobs": _jobs_latest_last(jobs)}, stdout, compact=args.compact)
+    return 0
+
+
 def _cmd_login(args: argparse.Namespace, stdout: TextIO) -> int:
     config_path = _write_login_config_path(args.login_config)
     _print_json(
@@ -738,6 +1081,36 @@ def _cmd_login(args: argparse.Namespace, stdout: TextIO) -> int:
         compact=args.compact,
     )
     return 0
+
+
+def _cmd_capacity(args: argparse.Namespace, client, stdout: TextIO) -> int:
+    dimensions = tuple(
+        _CAPACITY_BREAKDOWN_CHOICES[choice] for choice in args.breakdown or ()
+    )
+
+    def lookup(hardware: str) -> dict:
+        if dimensions:
+            return client.get_capacity_breakdown(
+                hardware=hardware, dimensions=dimensions
+            )
+        return client.get_capacity(hardware=hardware)
+
+    if args.hardware is not None:
+        capacity = lookup(args.hardware)
+    else:
+        capacity = _capacity_by_hardware(lookup)
+    _print_json(_breakdown_last(capacity), stdout, compact=args.compact, sort_keys=False)
+    return 0
+
+
+def _breakdown_last(value: Any) -> Any:
+    """``value`` with keys sorted, except that ``breakdown`` follows the totals."""
+    if isinstance(value, dict):
+        keys = sorted(value, key=lambda key: (key == "breakdown", key))
+        return {key: _breakdown_last(value[key]) for key in keys}
+    if isinstance(value, list):
+        return [_breakdown_last(item) for item in value]
+    return value
 
 
 def _json_bool(value: Any, name: str) -> bool:
@@ -833,10 +1206,16 @@ def _cmd_generate(
     if not isinstance(prompts, list) or not prompts:
         raise ValueError("generate JSON must contain a non-empty prompts list")
 
+    # A flat list of integers is one pre-tokenized prompt, not a batch of
+    # single-token prompts, and the client encodes it that way. ``bool`` is an
+    # ``int`` subclass, so exclude it rather than read [true, false] as tokens.
+    single_tokenized = isinstance(prompts[0], int) and not isinstance(prompts[0], bool)
+    prompt_count = 1 if single_tokenized else len(prompts)
+
     sampling_params = payload.get("sampling_params")
     if sampling_params is not None:
         if isinstance(sampling_params, list):
-            if len(sampling_params) != len(prompts):
+            if len(sampling_params) != prompt_count:
                 raise ValueError("generate sampling_params list length must match prompts length")
             if any(item is not None and not isinstance(item, dict) for item in sampling_params):
                 raise ValueError("generate sampling_params list items must be objects or null")
@@ -856,7 +1235,7 @@ def _cmd_generate(
     )
     response = {
         "job_id": args.job,
-        "prompt_count": len(prompts),
+        "prompt_count": prompt_count,
         "request_id": request_id,
     }
     if poll:
@@ -895,10 +1274,47 @@ def _cmd_weight_sync(args: argparse.Namespace, client, stdout: TextIO) -> int:
     return 0
 
 
-def _cmd_download_log(args: argparse.Namespace, client, stdout: TextIO) -> int:
+def _artifact_progress_writer(stderr: TextIO) -> Callable[[str], None]:
+    """Draw one updating terminal line. A redirected stderr gets the final line."""
+    try:
+        tty = stderr.isatty()
+    except (OSError, ValueError):
+        tty = False
+    latest: str | None = None
+
+    def write(message: str) -> None:
+        nonlocal latest
+        try:
+            if message == "\n":
+                status, latest = latest, None
+                if status is None:
+                    return
+                stderr.write("\n" if tty else status + "\n")
+            elif message.endswith("\n"):
+                stderr.write(message)
+            else:
+                latest = message
+                if not tty:
+                    return
+                stderr.write("\r" + message)
+            stderr.flush()
+        except OSError:
+            return
+
+    return write
+
+
+def _cmd_download_log(
+    args: argparse.Namespace, client, stdout: TextIO, stderr: TextIO
+) -> int:
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
     if args.log_type == "stdout":
-        logs = client.download_stdout_logs(args.job_id, out_dir)
+        logs = client.download_stdout_logs(
+            args.job_id,
+            out_dir,
+            resume=args.resume,
+            progress=_artifact_progress_writer(stderr),
+        )
         _print_json(
             {"job_id": args.job_id, "logs": logs},
             stdout,
@@ -925,10 +1341,15 @@ def _cmd_download_log(args: argparse.Namespace, client, stdout: TextIO) -> int:
 
 
 def _cmd_download_metrics(
-    args: argparse.Namespace, client, stdout: TextIO
+    args: argparse.Namespace, client, stdout: TextIO, stderr: TextIO
 ) -> int:
     out_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.cwd()
-    metrics = client.download_metrics(args.job_id, out_dir)
+    metrics = client.download_metrics(
+        args.job_id,
+        out_dir,
+        resume=args.resume,
+        progress=_artifact_progress_writer(stderr),
+    )
     _print_json(
         {"job_id": args.job_id, "metrics": metrics},
         stdout,
@@ -937,17 +1358,55 @@ def _cmd_download_metrics(
     return 0
 
 
+def _is_unsupported_hardware(exc: BaseException) -> bool:
+    """Whether a capacity lookup failed only because the account lacks that GPU type."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return False
+    try:
+        body = response.json()
+    except Exception:
+        return False
+    if not isinstance(body, dict):
+        return False
+    code = str(body.get("code") or body.get("error_code") or "")
+    message = str(body.get("message") or "")
+    return code == _UNSUPPORTED_HARDWARE_CODE and "unsupported hardware" in message
+
+
+def _capacity_by_hardware(lookup: Callable[[str], dict]) -> dict[str, Any]:
+    """Capacity for every GPU type the account supports, plus the ones it does not."""
+    supported: dict[str, Any] = {}
+    unsupported: list[str] = []
+    first_unsupported: BaseException | None = None
+    for hardware in _hardware_choices():
+        try:
+            supported[hardware] = lookup(hardware)
+        except Exception as exc:
+            if not _is_unsupported_hardware(exc):
+                raise
+            unsupported.append(hardware)
+            first_unsupported = first_unsupported or exc
+    if not supported and first_unsupported is not None:
+        raise first_unsupported
+    return {"capacity_by_hardware": supported, "unsupported_hardware": unsupported}
+
+
 def _run(
     args: argparse.Namespace,
     client_factory: Callable[[argparse.Namespace], Any],
     stdout: TextIO,
     stdin: TextIO,
+    stderr: TextIO,
 ) -> int:
     if args.command == "login":
         return _cmd_login(args, stdout)
 
     if args.command == "submit" and args.dry_run:
         return _cmd_submit(args, None, stdout, stdin)
+
+    if args.command == "download-log" and args.resume and args.log_type != "stdout":
+        raise ValueError("--resume applies to --log-type stdout, not execution logs")
 
     client = client_factory(args)
     if args.command == "submit":
@@ -963,9 +1422,7 @@ def _run(
         )
         return 0
     if args.command == "list":
-        jobs = client.list_jobs(status=args.status)
-        _print_json({"jobs": _jobs_latest_last(jobs)}, stdout, compact=args.compact)
-        return 0
+        return _cmd_list(args, client, stdout)
     if args.command == "models":
         _print_json(
             {"models": client.list_models()},
@@ -974,17 +1431,7 @@ def _run(
         )
         return 0
     if args.command == "capacity":
-        if args.hardware is not None:
-            capacity = client.get_capacity(hardware=args.hardware)
-        else:
-            capacity = {
-                "capacity_by_hardware": {
-                    hardware: client.get_capacity(hardware=hardware)
-                    for hardware in _hardware_choices()
-                }
-            }
-        _print_json(capacity, stdout, compact=args.compact)
-        return 0
+        return _cmd_capacity(args, client, stdout)
     if args.command == "cancel":
         client.cancel_job(args.job_id)
         _print_json(
@@ -1007,9 +1454,9 @@ def _run(
     if args.command == "weight-sync":
         return _cmd_weight_sync(args, client, stdout)
     if args.command == "download-log":
-        return _cmd_download_log(args, client, stdout)
+        return _cmd_download_log(args, client, stdout, stderr)
     if args.command == "download-metrics":
-        return _cmd_download_metrics(args, client, stdout)
+        return _cmd_download_metrics(args, client, stdout, stderr)
     raise ValueError(f"unknown command: {args.command}")
 
 
@@ -1044,7 +1491,7 @@ def main(
                 return None
 
             client_factory = empty_client_factory
-        return _run(args, client_factory, stdout, stdin)
+        return _run(args, client_factory, stdout, stdin, stderr)
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"error: {_format_error(exc)}", file=stderr)
         return 1

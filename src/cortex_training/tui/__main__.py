@@ -15,12 +15,9 @@
 
 """Resolve Cortex Training connection arguments and launch the read-only TUI.
 
-Connection handling is delegated to ``cortex_training._cli`` so the TUI shares the
-SDK's auth surface: it honours ``cortex-training login`` state, ``--config`` /
-``CORTEX_TRAINING_CONFIG``, the ``CORTEX_TRAINING_*`` / ``SNOWFLAKE_*`` env vars, and explicit
-``--base-url`` (local/mock) or ``--host`` + ``--pat`` flags, exactly like the
-CLI. Run ``cortex-training login config.json`` once and then just
-``cortex-training tui JOB_ID``.
+Connection handling is delegated to ``cortex_training._cli`` so the TUI shares
+the SDK's auth surface: legacy config/login state wins, followed by direct
+flags, then a named or configured-default Snowflake connection profile.
 """
 
 from __future__ import annotations
@@ -33,12 +30,15 @@ import sys
 def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=prog,
-        description="Read-only TUI for Cortex Training logs.",
+        description="Read-only TUI for Cortex Training logs and GPU resources.",
     )
     p.add_argument(
         "job_id", nargs="?", help="Job (session) id to open directly. If omitted, the TUI shows a job picker."
     )
-    p.add_argument("--sub-job-id", help="Sub-job id used to scope log sources and routing.")
+    p.add_argument(
+        "--sub-job-id",
+        help="Open one matching sub-job directly in the Logs and Resource tabs.",
+    )
     p.add_argument(
         "--config",
         dest="config",
@@ -47,6 +47,12 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
             "Path to a reusable Cortex Training config or credential JSON file "
             "(same format as the cortex-training CLI config)."
         ),
+    )
+    p.add_argument(
+        "--connection",
+        "-c",
+        default=os.environ.get("CORTEX_TRAINING_CONNECTION"),
+        help="Snowflake connection profile name.",
     )
     p.add_argument("--base-url", help="Direct base URL for a local or otherwise compatible server.")
     p.add_argument("--host", help="Snowflake account host for PAT auth.")
@@ -88,19 +94,23 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
         args = cli._normalize_connection_args(args)
     except ValueError as exc:
         parser.error(str(exc))
-    if not args.database:
+    if not args.use_connection_profile and not args.database:
         parser.error("provide --database or set CORTEX_TRAINING_DATABASE/SNOWFLAKE_DATABASE")
-    if args.base_url is None and (args.host is None or args.pat is None):
+    if (
+        not args.use_connection_profile
+        and args.base_url is None
+        and (args.host is None or args.pat is None)
+    ):
         parser.error(
             "no connection configured: run 'cortex-training login config.json', "
-            "set CORTEX_TRAINING_CONFIG, pass --config config.json, or pass "
-            "--base-url (local/mock) or --host + --pat"
+            "set CORTEX_TRAINING_CONFIG, pass --config config.json, "
+            "--connection NAME, --base-url (local/mock), or --host + --pat"
         )
 
     client = cli.build_client(args, cli._load_cortex_training_client_class())
 
-    # job_id is optional: given, we jump straight to that job's logs; omitted,
-    # the TUI opens the job picker (list_jobs) so you can choose one.
+    # job_id is optional: given, open that job's dashboard; omitted, open the
+    # job picker (list_jobs) so the user can choose one.
     CortexTrainingLogTUI(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=args.poll_interval).run()
     return 0
 

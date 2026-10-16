@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import io
 import json
+import time
+from datetime import date
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -52,9 +55,14 @@ class FakeClient:
         self.capacity_requested = False
         self.capacity_hardware = None
         self.capacity_hardware_requests = []
+        self.capacity_breakdown_requests = []
+        self.capacity_breakdown_errors = {}
         self.checkpoints_job_id = None
         self.jobs = None
         self.models_requested = False
+        self.account_jobs = []
+        self.account_jobs_pulled = 0
+        self.iter_jobs_filters = None
         self.stdout_log_job_id = None
         self.stdout_log_output_dir = None
         self.metrics_job_id = None
@@ -84,6 +92,12 @@ class FakeClient:
             {"name": "Qwen/Qwen3-8B"},
         ]
 
+    def iter_jobs(self, **filters):
+        self.iter_jobs_filters = filters
+        for job in self.account_jobs:
+            self.account_jobs_pulled += 1
+            yield job
+
     def list_checkpoints(self, job_id):
         self.checkpoints_job_id = job_id
         return [
@@ -110,6 +124,14 @@ class FakeClient:
                 "B300": 0,
             }.get(hardware, 40),
         }
+
+    def get_capacity_breakdown(
+        self, hardware=None, *, dimensions=("job_type", "submitted_by")
+    ):
+        self.capacity_breakdown_requests.append((hardware, dimensions))
+        if hardware in self.capacity_breakdown_errors:
+            raise self.capacity_breakdown_errors[hardware]
+        return _capacity_with_breakdown(hardware, dimensions)
 
     def forward_backward(self, job_id, payload):
         self.forward_backward_job_id = job_id
@@ -198,9 +220,10 @@ class FakeClient:
             },
         ]
 
-    def download_stdout_logs(self, job_id, output_dir):
+    def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None):
         self.stdout_log_job_id = job_id
         self.stdout_log_output_dir = output_dir
+        self.stdout_resume = resume
         path = output_dir / f"{job_id}:training:0" / "stdout.log"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("console\n", encoding="utf-8")
@@ -215,9 +238,10 @@ class FakeClient:
             }
         ]
 
-    def download_metrics(self, job_id, output_dir):
+    def download_metrics(self, job_id, output_dir, *, resume=False, progress=None):
         self.metrics_job_id = job_id
         self.metrics_output_dir = output_dir
+        self.metrics_resume = resume
         path = output_dir / f"{job_id}:training:0" / "gpu.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('{"gpu_utilization":0.5}\n', encoding="utf-8")
@@ -244,6 +268,39 @@ class FakeHTTPError(OSError):
                 "text": '{"message":"backend detail"}',
             },
         )()
+
+
+def _capacity_with_breakdown(hardware, dimensions):
+    """A normalized get_capacity_breakdown() result for ``dimensions``."""
+    breakdown = {"job_count": 1, "truncated": False, "unsupported_dimensions": []}
+    if "job_type" in dimensions:
+        breakdown["by_job_type"] = {
+            "groups": [
+                {"job_type": "TRAINING", "in_use_gpus": 8, "pending_gpus": 0, "sub_job_count": 1},
+                {"job_type": "SAMPLING", "in_use_gpus": 0, "pending_gpus": 0, "sub_job_count": 0},
+                {"job_type": "LOG_PROBABILITY", "in_use_gpus": 0, "pending_gpus": 0, "sub_job_count": 0},
+            ],
+        }
+    if "submitted_by" in dimensions:
+        breakdown["by_submitted_by"] = {
+            "groups": [
+                {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                 "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                {"kind": "OTHER", "submitted_by": None, "is_caller": False,
+                 "in_use_gpus": 0, "pending_gpus": 0, "job_count": 0},
+                {"kind": "UNATTRIBUTED", "submitted_by": None, "is_caller": False,
+                 "in_use_gpus": 0, "pending_gpus": 0, "job_count": 0},
+            ],
+        }
+    return {
+        "has_reservation": True,
+        "max_total_gpus": 8,
+        "reserved_gpus": 8,
+        "in_use_gpus": 8,
+        "pending_gpus": 0,
+        "available_gpus": {"H200": 0, "B200": 4, "B300": 2}.get(hardware, 0),
+        "breakdown": breakdown,
+    }
 
 
 def _factory(instances):
@@ -374,6 +431,127 @@ def test_submit_dry_run_rejects_two_training_sub_jobs(tmp_path):
     assert "at most one training sub-job is supported per job" in stderr.getvalue()
 
 
+def _write_lora_job(tmp_path, peft_config):
+    path = tmp_path / "lora.json"
+    sub_job = {
+        "job_type": "training",
+        "model_name": "gpt2",
+        "training_config": {
+            "max_seq_len": 128,
+            "train_batch_size": 1,
+            "n_gpus": 2,
+            "peft_config": peft_config,
+        },
+    }
+    path.write_text(json.dumps({"sub_job_configs": [sub_job]}), encoding="utf-8")
+    return path
+
+
+def test_submit_dry_run_rejects_invalid_peft_config(tmp_path):
+    stderr = io.StringIO()
+    path = _write_lora_job(tmp_path, {"peft_type": "LORA", "target_modules": ["q_proj"]})
+
+    rc = cli.main(["submit", str(path), "--dry-run"], stderr=stderr)
+
+    assert rc == 1
+    assert "peft_config.peft_type" in stderr.getvalue()
+
+
+def test_submit_dry_run_prints_the_normalized_peft_config(tmp_path):
+    stdout = io.StringIO()
+    path = _write_lora_job(tmp_path, {"peft_type": "Lora", "r": 16, "target_modules": ["q_proj"]})
+
+    rc = cli.main(["submit", str(path), "--dry-run"], stdout=stdout)
+
+    assert rc == 0
+    peft = json.loads(stdout.getvalue())["sub_job_configs"][0]["training_config"]["peft_config"]
+    assert peft["task_type"] == "CAUSAL_LM"
+    assert peft["target_parameters"] == []
+
+
+# Spellings a caller could plausibly put in job JSON for the unsupported
+# log-probability type.
+LOG_PROBABILITY_JOB_TYPES = [
+    "log_probability",
+    "LOG_PROBABILITY",
+    "JOB_TYPE_LOG_PROBABILITY",
+    "log_prob",
+    " log_probability ",
+]
+
+
+def _write_log_probability_job(tmp_path, job_type):
+    path = tmp_path / "log-probability.json"
+    path.write_text(
+        json.dumps(
+            {
+                "sub_job_configs": [
+                    {
+                        "job_type": "sampling",
+                        "model_name": "gpt2",
+                        "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                    },
+                    {
+                        "job_type": job_type,
+                        "model_name": "gpt2",
+                        "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.parametrize("job_type", LOG_PROBABILITY_JOB_TYPES)
+def test_submit_dry_run_rejects_log_probability_sub_jobs(tmp_path, job_type):
+    stderr = io.StringIO()
+    path = _write_log_probability_job(tmp_path, job_type)
+
+    rc = cli.main(["submit", str(path), "--dry-run"], stderr=stderr)
+
+    assert rc == 1
+    assert (
+        "sub_job_configs[1].job_type: log_probability sub-jobs are not currently supported"
+        in stderr.getvalue()
+    )
+
+
+def test_submit_rejects_log_probability_sub_jobs(tmp_path):
+    instances = []
+    stderr = io.StringIO()
+    path = _write_log_probability_job(tmp_path, "log_probability")
+
+    rc = cli.main(
+        _base_args() + ["submit", str(path)],
+        client_factory=_factory(instances),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert (
+        "sub_job_configs[1].job_type: log_probability sub-jobs are not currently supported"
+        in stderr.getvalue()
+    )
+    assert instances[0].submitted_body is None
+
+
+# The CLI duplicates these so `submit --dry-run` never imports the client; keep
+# the two copies from drifting apart.
+def test_cli_log_probability_rejection_matches_client():
+    from cortex_training import client
+
+    assert (
+        cli._LOG_PROBABILITY_JOB_TYPE_ALIASES
+        == client._LOG_PROBABILITY_JOB_TYPE_ALIASES
+    )
+    assert (
+        cli._UNSUPPORTED_LOG_PROBABILITY_MESSAGE
+        == client._UNSUPPORTED_LOG_PROBABILITY_MESSAGE
+    )
+
+
 def test_list_prints_jobs_with_status_filter():
     instances = []
     stdout = io.StringIO()
@@ -385,10 +563,401 @@ def test_list_prints_jobs_with_status_filter():
     )
 
     assert rc == 0
-    assert instances[0].status_filter == "running"
+    # The schema route mishandles comma lists and groups, so the CLI asks it for
+    # every job and filters the rows itself.
+    assert instances[0].status_filter is None
     assert json.loads(stdout.getvalue()) == {
         "jobs": [{"job_id": "j1", "status": "running"}],
     }
+
+
+_STATUS_ROWS = [
+    {"job_id": status.lower(), "status": status}
+    for status in (
+        "PENDING",
+        "PLACING",
+        "INITIALIZING",
+        "RUNNING",
+        "FAILED",
+        "CANCELLED",
+        "TERMINATED",
+        "UNKNOWN",
+    )
+]
+
+_SUBMITTED_ROWS = [
+    {"job_id": "upper", "submitted_by": "JDOE"},
+    {"job_id": "lower", "submitted_by": "jdoe"},
+    {"job_id": "quoted", "submitted_by": 'J"DOE'},
+    {"job_id": "other", "submitted_by": "ASMITH"},
+    {"job_id": "anonymous"},
+]
+
+_DATED_ROWS = [
+    {"job_id": "before", "created_at": "2026-09-30T23:59:59Z"},
+    {"job_id": "midnight", "created_at": "2026-10-01T00:00:00Z"},
+    {"job_id": "noon", "created_at": "2026-10-01T12:00:00.250Z"},
+    {"job_id": "next-day", "created_at": "2026-10-02T00:00:00+00:00"},
+]
+
+
+def _list_ids(argv, *, jobs=None, account_jobs=()):
+    """Run `list ARGV` on one FakeClient; return it and the printed job ids."""
+    client = FakeClient()
+    client.jobs = jobs
+    client.account_jobs = list(account_jobs)
+    stdout = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["list", *argv],
+        client_factory=lambda _args: client,
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    return client, [job["job_id"] for job in json.loads(stdout.getvalue())["jobs"]]
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("pending", {"pending"}),
+        ("placing", {"placing"}),
+        ("active", {"pending", "placing", "initializing", "running"}),
+        ("done", {"cancelled", "terminated"}),
+        (" Running , FAILED ", {"running", "failed"}),
+        ("done,terminated", {"cancelled", "terminated"}),
+        (
+            "active,failed,done",
+            {
+                "pending",
+                "placing",
+                "initializing",
+                "running",
+                "failed",
+                "cancelled",
+                "terminated",
+            },
+        ),
+    ],
+)
+def test_list_status_accepts_words_groups_and_comma_lists(status, expected):
+    client, ids = _list_ids(["--status", status], jobs=_STATUS_ROWS)
+
+    assert client.status_filter is None
+    assert set(ids) == expected
+
+
+@pytest.mark.parametrize("scope", [[], ["--all"]])
+@pytest.mark.parametrize(
+    "status", ["unknown", "completed", "running,", "job_state_running"]
+)
+def test_list_rejects_unknown_status_before_building_a_client(capsys, scope, status):
+    instances = []
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            _base_args() + ["list", *scope, "--status", status],
+            client_factory=_factory(instances),
+        )
+
+    assert exc.value.code == 2
+    assert "unknown status" in capsys.readouterr().err
+    # Building a client can open a Snowflake login.
+    assert instances == []
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        # Enum names and aliases a server can answer with, not only the words
+        # --status takes.
+        ("running", {"enum", "plain"}),
+        ("active", {"enum", "plain", "queued", "creating"}),
+        ("done", {"canceled", "completed", "succeeded"}),
+        ("failed", {"error"}),
+        # UNKNOWN is deliberately matched by no word.
+        ("active,done,failed", {"enum", "plain", "queued", "creating",
+                                "canceled", "completed", "succeeded", "error"}),
+    ],
+)
+def test_list_status_matches_enum_names_and_aliases(status, expected):
+    rows = [
+        {"job_id": "enum", "status": "JOB_STATE_RUNNING"},
+        {"job_id": "plain", "status": "running"},
+        {"job_id": "queued", "status": "queued"},
+        {"job_id": "creating", "status": "creating"},
+        {"job_id": "canceled", "status": "canceled"},
+        {"job_id": "completed", "status": "completed"},
+        {"job_id": "succeeded", "status": "succeeded"},
+        {"job_id": "error", "status": "error"},
+        {"job_id": "unknown", "status": "UNKNOWN"},
+    ]
+
+    _, ids = _list_ids(["--status", status], jobs=rows)
+
+    assert set(ids) == expected
+
+
+def test_list_status_done_includes_legacy_done_rows():
+    _, ids = _list_ids(
+        ["--status", "done"],
+        jobs=[
+            {"job_id": "legacy", "status": "DONE"},
+            {"job_id": "cancelled", "status": "CANCELLED"},
+            {"job_id": "failed", "status": "FAILED"},
+        ],
+    )
+
+    assert set(ids) == {"legacy", "cancelled"}
+
+
+@pytest.mark.parametrize(
+    ("user", "expected"),
+    [
+        # As on the server: unquoted means uppercase, quoted means exact.
+        ("jdoe", {"upper"}),
+        ("JDoe", {"upper"}),
+        ('"jdoe"', {"lower"}),
+        ('"J""DOE"', {"quoted"}),
+        ("asmith", {"other"}),
+    ],
+)
+def test_list_user_follows_sql_identifier_rules(user, expected):
+    _, ids = _list_ids(["--user", user], jobs=_SUBMITTED_ROWS)
+
+    assert set(ids) == expected
+
+
+@pytest.mark.parametrize("scope", [[], ["--all"]])
+@pytest.mark.parametrize("user", ["", "  "])
+def test_list_rejects_an_empty_user(capsys, scope, user):
+    instances = []
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            _base_args() + ["list", *scope, "--user", user],
+            client_factory=_factory(instances),
+        )
+
+    assert exc.value.code == 2
+    assert "--user must not be empty" in capsys.readouterr().err
+    assert instances == []
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["--since", "2026-10-01"], ["midnight", "noon", "next-day"]),
+        (["--until", "2026-09-30"], ["before"]),
+        # --until keeps the whole day it names.
+        (["--until", "2026-10-01"], ["before", "midnight", "noon"]),
+        (["--since", "2026-10-01", "--until", "2026-10-01"], ["midnight", "noon"]),
+    ],
+)
+def test_list_since_and_until_keep_whole_utc_days(argv, expected):
+    _, ids = _list_ids(argv, jobs=_DATED_ROWS + [{"job_id": "undated"}])
+
+    assert ids == expected
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="needs time.tzset")
+@pytest.mark.parametrize("zone", ["America/Los_Angeles", "Asia/Tokyo"])
+def test_list_dates_are_utc_days_in_any_local_zone(monkeypatch, zone):
+    monkeypatch.setenv("TZ", zone)
+    time.tzset()
+    try:
+        _, ids = _list_ids(
+            ["--since", "2026-10-01", "--until", "2026-10-01"], jobs=_DATED_ROWS
+        )
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+    assert ids == ["midnight", "noon"]
+
+
+def test_list_dates_read_created_at_with_any_fraction_precision():
+    jobs = [
+        {"job_id": "five", "created_at": "2026-10-01T01:00:00.12345Z"},
+        {"job_id": "nine", "created_at": "2026-10-01T02:00:00.123456789Z"},
+    ]
+
+    _, ids = _list_ids(["--since", "2026-10-01", "--until", "2026-10-01"], jobs=jobs)
+
+    assert ids == ["five", "nine"]
+
+
+@pytest.mark.parametrize("scope", [[], ["--all"]])
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--since", "yesterday"], "expected a YYYY-MM-DD date, got 'yesterday'"),
+        (["--until", "10/01/2026"], "expected a YYYY-MM-DD date"),
+        # Dates only: a time of day, or a compact date, is refused.
+        (["--since", "2026-10-01T12:00:00Z"], "expected a YYYY-MM-DD date"),
+        (["--since", "20261001"], "expected a YYYY-MM-DD date"),
+        (["--until", "2026-02-30"], "expected a YYYY-MM-DD date"),
+        (
+            ["--since", "2026-10-02", "--until", "2026-10-01"],
+            "--since must not be later than --until",
+        ),
+        (["--until", "9999-12-31"], "--until must be earlier than 9999-12-31"),
+    ],
+)
+def test_list_rejects_bad_dates_before_building_a_client(capsys, scope, argv, message):
+    instances = []
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            _base_args() + ["list", *scope, *argv],
+            client_factory=_factory(instances),
+        )
+
+    assert exc.value.code == 2
+    assert message in capsys.readouterr().err
+    assert instances == []
+
+
+def test_list_limit_keeps_the_newest_matching_jobs_printed_last():
+    jobs = [
+        {**row, "status": status}
+        for row, status in zip(_DATED_ROWS, ("RUNNING", "RUNNING", "FAILED", "RUNNING"))
+    ]
+
+    _, ids = _list_ids(["--limit", "2"], jobs=jobs)
+    assert ids == ["noon", "next-day"]
+
+    _, ids = _list_ids(["--status", "running", "--limit", "2"], jobs=jobs)
+    assert ids == ["midnight", "next-day"]
+
+
+def test_list_limit_drops_undated_jobs_before_newer_dated_ones():
+    # A row whose live status could not be read carries no created_at.
+    jobs = [{"job_id": "undated-a"}, {"job_id": "undated-b"}] + _DATED_ROWS
+
+    _, ids = _list_ids(["--limit", "2"], jobs=jobs)
+    assert ids == ["noon", "next-day"]
+
+    # Every dated job outranks both undated rows, however old it is.
+    _, ids = _list_ids(["--limit", "4"], jobs=jobs)
+    assert ids == ["before", "midnight", "noon", "next-day"]
+
+    # Undated rows fill what the dated ones leave, newest first, and still
+    # print after them.
+    _, ids = _list_ids(["--limit", "5"], jobs=jobs)
+    assert ids == ["before", "midnight", "noon", "next-day", "undated-a"]
+
+
+def test_list_limit_keeps_the_first_undated_jobs_when_none_are_dated():
+    # Nothing is dated, so the server's newest-first order is all there is.
+    jobs = [{"job_id": name} for name in ("newest", "middle", "oldest")]
+
+    _, ids = _list_ids(["--limit", "2"], jobs=jobs)
+
+    assert ids == ["middle", "newest"]
+
+
+@pytest.mark.parametrize("limit", ["0", "-1", "two"])
+def test_list_rejects_a_limit_below_one(limit):
+    with pytest.raises(SystemExit):
+        cli.parse_args(_base_args() + ["list", "--limit", limit])
+
+
+def test_list_all_reads_the_account_and_prints_it_oldest_first():
+    newest_first = list(reversed(_DATED_ROWS))
+
+    client, ids = _list_ids(
+        ["--all"], jobs=[{"job_id": "schema-row"}], account_jobs=newest_first
+    )
+
+    assert ids == ["before", "midnight", "noon", "next-day"]
+    assert client.iter_jobs_filters == {
+        "status": None,
+        "submitted_by": None,
+        "created_after": None,
+        "created_before": None,
+        "page_size": 100,
+    }
+
+
+def test_list_all_sends_every_filter_to_the_server():
+    rows = [
+        {"job_id": "b", "status": "FAILED", "created_at": "2026-10-01T02:00:00Z"},
+        {"job_id": "a", "status": "RUNNING", "created_at": "2026-10-01T01:00:00Z"},
+    ]
+
+    client, ids = _list_ids(
+        [
+            "--all",
+            "--status",
+            "active, FAILED",
+            "--user",
+            "jdoe",
+            "--since",
+            "2026-10-01",
+            "--until",
+            "2026-10-02",
+        ],
+        account_jobs=rows,
+    )
+
+    assert client.iter_jobs_filters == {
+        "status": "active,failed",
+        "submitted_by": "jdoe",
+        "created_after": date(2026, 10, 1),
+        # The server's bound is exclusive, so --until sends the day after.
+        "created_before": date(2026, 10, 3),
+        "page_size": 100,
+    }
+    assert ids == ["a", "b"]
+
+
+def test_list_all_limit_stops_reading_after_the_newest_jobs():
+    client, ids = _list_ids(
+        ["--all", "--limit", "2"], account_jobs=list(reversed(_DATED_ROWS))
+    )
+
+    assert ids == ["noon", "next-day"]
+    assert client.account_jobs_pulled == 2
+    assert client.iter_jobs_filters["page_size"] == 2
+
+
+def test_list_all_caps_the_page_size_at_the_server_maximum():
+    client, _ = _list_ids(["--all", "--limit", "5000"])
+
+    assert client.iter_jobs_filters["page_size"] == 1000
+
+
+def test_list_all_reports_listing_that_is_not_enabled():
+    import requests
+
+    class NotEnabledClient(FakeClient):
+        def iter_jobs(self, **filters):
+            response = requests.Response()
+            response.status_code = 404
+            raise requests.HTTPError(
+                "account-level job listing is not enabled for this account",
+                response=response,
+            )
+            yield
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["list", "--all"],
+        client_factory=lambda _args: NotEnabledClient(),
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert (
+        "error: account-level job listing is not enabled for this account"
+        in stderr.getvalue()
+    )
+    assert stdout.getvalue() == ""
 
 
 def test_list_prints_latest_jobs_last():
@@ -569,7 +1138,98 @@ def test_capacity_prints_account_gpu_usage():
                 "available_gpus": 0,
             },
         },
+        "unsupported_hardware": [],
     }
+
+
+def _unsupported_hardware_error(hardware: str, *, code: str = "517604", message: str | None = None):
+    import requests
+
+    response = requests.Response()
+    response.status_code = 409
+    response._content = json.dumps(
+        {
+            "code": code,
+            "message": message
+            or f'Cortex training getCapacity failed: unsupported hardware "{hardware}": '
+            "supported hardware is H200, B300",
+        }
+    ).encode()
+    return requests.HTTPError("409 Client Error: Conflict", response=response)
+
+
+class _PartialHardwareClient(FakeClient):
+    def __init__(self, failures):
+        super().__init__()
+        self._failures = failures
+
+    def get_capacity(self, hardware=None):
+        if hardware in self._failures:
+            self.capacity_hardware_requests.append(hardware)
+            raise self._failures[hardware]
+        return super().get_capacity(hardware)
+
+
+def test_capacity_lists_unsupported_hardware_separately():
+    client = _PartialHardwareClient({"B200": _unsupported_hardware_error("B200")})
+    stdout = io.StringIO()
+
+    rc = cli.main(_base_args() + ["capacity"], client_factory=lambda _args: client, stdout=stdout)
+
+    assert rc == 0
+    assert client.capacity_hardware_requests == ["H200", "B200", "B300"]
+    result = json.loads(stdout.getvalue())
+    assert set(result["capacity_by_hardware"]) == {"H200", "B300"}
+    assert result["capacity_by_hardware"]["H200"]["available_gpus"] == 40
+    assert result["unsupported_hardware"] == ["B200"]
+
+
+def test_capacity_still_fails_on_other_errors():
+    other = _unsupported_hardware_error("B200", code="517604", message="Cortex training getCapacity failed: timeout")
+    client = _PartialHardwareClient({"B200": other})
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["capacity"],
+        client_factory=lambda _args: client,
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "timeout" in stderr.getvalue()
+
+
+def test_capacity_errors_when_no_hardware_is_supported():
+    client = _PartialHardwareClient(
+        {hardware: _unsupported_hardware_error(hardware) for hardware in ("H200", "B200", "B300")}
+    )
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["capacity"],
+        client_factory=lambda _args: client,
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "unsupported hardware" in stderr.getvalue()
+
+
+def test_capacity_with_unsupported_hardware_flag_reports_service_error():
+    client = _PartialHardwareClient({"B200": _unsupported_hardware_error("B200")})
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["capacity", "--hardware", "B200"],
+        client_factory=lambda _args: client,
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "supported hardware is H200, B300" in stderr.getvalue()
 
 
 def test_capacity_passes_hardware():
@@ -594,6 +1254,306 @@ def test_capacity_rejects_unknown_hardware():
             client_factory=_factory([]),
             stdout=io.StringIO(),
         )
+
+
+_CAPACITY_HARDWARE = ("H200", "B200", "B300")
+
+
+def _run_capacity(argv, *, client=None):
+    client = client or FakeClient()
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + argv,
+        client_factory=lambda _args: client,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    return rc, client, stdout.getvalue(), stderr.getvalue()
+
+
+@pytest.mark.parametrize(
+    "hardware_args", [[], ["--hardware", "B300"]], ids=["fan-out", "single"]
+)
+def test_capacity_without_breakdown_prints_get_capacity_unchanged(hardware_args):
+    rc, client, out, err = _run_capacity(["capacity", *hardware_args])
+
+    if hardware_args:
+        expected = FakeClient().get_capacity("B300")
+        lookups = ["B300"]
+    else:
+        expected = {
+            "capacity_by_hardware": {
+                hardware: FakeClient().get_capacity(hardware)
+                for hardware in _CAPACITY_HARDWARE
+            },
+            "unsupported_hardware": [],
+        }
+        lookups = list(_CAPACITY_HARDWARE)
+    assert rc == 0
+    assert err == ""
+    assert client.capacity_breakdown_requests == []
+    assert client.capacity_hardware_requests == lookups
+    assert out == json.dumps(expected, indent=2, sort_keys=True) + "\n"
+
+
+def test_capacity_help_lists_breakdown(capsys, monkeypatch):
+    # Wide enough that argparse does not wrap the help text mid-phrase.
+    monkeypatch.setenv("COLUMNS", "200")
+
+    with pytest.raises(SystemExit) as exc:
+        cli.parse_args(["capacity", "--help"])
+
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--breakdown {job-type,submitted-by}" in help_text
+    assert (
+        "by sub-job type (job-type) or by submitting user (submitted-by)" in help_text
+    )
+
+
+@pytest.mark.parametrize("choice", ["owner-role", "job_type", "JOB-TYPE"])
+def test_capacity_breakdown_rejects_unknown_choice(choice):
+    with pytest.raises(SystemExit):
+        cli.parse_args(_base_args() + ["capacity", "--breakdown", choice])
+
+
+# The CLI spells each dimension with a hyphen; it must send the client's name.
+def test_cli_breakdown_choices_match_client_dimensions():
+    from cortex_training import client
+
+    assert (
+        tuple(cli._CAPACITY_BREAKDOWN_CHOICES.values())
+        == client._CAPACITY_BREAKDOWN_DIMENSIONS
+    )
+
+
+@pytest.mark.parametrize(
+    "breakdown_args, dimensions",
+    [
+        (["--breakdown", "job-type"], ("job_type",)),
+        (["--breakdown", "submitted-by"], ("submitted_by",)),
+        (
+            ["--breakdown", "job-type", "--breakdown", "submitted-by"],
+            ("job_type", "submitted_by"),
+        ),
+        (
+            ["--breakdown", "submitted-by", "--breakdown", "job-type"],
+            ("submitted_by", "job_type"),
+        ),
+    ],
+    ids=["job-type", "submitted-by", "both", "both-reversed"],
+)
+def test_capacity_breakdown_fans_out_with_wire_dimensions(breakdown_args, dimensions):
+    rc, client, out, err = _run_capacity(["capacity", *breakdown_args])
+
+    assert rc == 0
+    assert err == ""
+    assert client.capacity_hardware_requests == []
+    assert client.capacity_breakdown_requests == [
+        (hardware, dimensions) for hardware in _CAPACITY_HARDWARE
+    ]
+    assert json.loads(out) == {
+        "capacity_by_hardware": {
+            hardware: _capacity_with_breakdown(hardware, dimensions)
+            for hardware in _CAPACITY_HARDWARE
+        },
+        "unsupported_hardware": [],
+    }
+
+
+def test_capacity_breakdown_lists_unsupported_hardware_separately():
+    client = FakeClient()
+    client.capacity_breakdown_errors["B200"] = _unsupported_hardware_error("B200")
+
+    rc, client, out, err = _run_capacity(
+        ["capacity", "--breakdown", "job-type"], client=client
+    )
+
+    assert rc == 0
+    assert err == ""
+    result = json.loads(out)
+    assert set(result["capacity_by_hardware"]) == {"H200", "B300"}
+    assert result["unsupported_hardware"] == ["B200"]
+
+
+def test_capacity_breakdown_single_hardware_prints_compact_sorted_json():
+    rc, client, out, err = _run_capacity(
+        ["--compact", "capacity", "--hardware", "B300", "--breakdown", "submitted-by"]
+    )
+
+    assert rc == 0
+    assert err == ""
+    assert client.capacity_hardware_requests == []
+    assert client.capacity_breakdown_requests == [("B300", ("submitted_by",))]
+    expected = cli._breakdown_last(_capacity_with_breakdown("B300", ("submitted_by",)))
+    assert out == json.dumps(expected, separators=(",", ":")) + "\n"
+    assert list(json.loads(out))[-1] == "breakdown"
+
+
+@pytest.mark.parametrize("hardware", _CAPACITY_HARDWARE)
+def test_capacity_breakdown_fails_on_the_first_lookup_error(hardware):
+    client = FakeClient()
+    client.capacity_breakdown_errors = {hardware: _http_error(503)}
+
+    rc, _, out, err = _run_capacity(
+        ["capacity", "--breakdown", "job-type"], client=client
+    )
+
+    assert rc == 1
+    assert out == ""
+    assert err.startswith("error: 503 Client Error")
+    # As without --breakdown, the first failed lookup fails the command.
+    looked_up = [requested for requested, _ in client.capacity_breakdown_requests]
+    assert looked_up == list(
+        _CAPACITY_HARDWARE[: _CAPACITY_HARDWARE.index(hardware) + 1]
+    )
+    assert client.capacity_hardware_requests == []
+
+
+def test_capacity_breakdown_prints_the_real_client_result_with_sorted_keys():
+    from cortex_training import client as client_module
+
+    client = client_module.CortexTrainingClient(
+        base_url="http://test.local", database="DB", schema="SCH"
+    )
+    client._session = MagicMock()
+    response = MagicMock(status_code=200)
+    response.json.return_value = {
+        "has_reservation": True,
+        "max_total_gpus": 16,
+        "reserved_gpus": 16,
+        "in_use_gpus": 12,
+        "available_gpus": 4,
+        "breakdown": {
+            "unsupported_dimensions": [],
+            "job_count": 2,
+            "truncated": False,
+            "by_job_type": {"status": "DISABLED", "groups": []},
+            "by_submitted_by": {
+                "status": "OK",
+                "groups": [
+                    {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                     "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                    {"kind": "OTHER", "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+                    {"kind": "UNATTRIBUTED", "in_use_gpus": 0, "pending_gpus": 0, "job_count": 0},
+                ],
+            },
+        },
+    }
+    client._session.get.return_value = response
+
+    rc, _, out, err = _run_capacity(
+        [
+            "capacity",
+            "--hardware",
+            "H200",
+            "--breakdown",
+            "job-type",
+            "--breakdown",
+            "submitted-by",
+        ],
+        client=client,
+    )
+
+    assert rc == 0, err
+    client._session.get.assert_called_once_with(
+        f"{client._prefix}/capacity",
+        timeout=client_module._CAPACITY_REQUEST_TIMEOUT,
+        params={"hardware": "H200", "breakdown": "job_type,submitted_by"},
+    )
+    expected = {
+        "has_reservation": True,
+        "max_total_gpus": 16,
+        "reserved_gpus": 16,
+        "in_use_gpus": 12,
+        "pending_gpus": 0,
+        "available_gpus": 4,
+        "breakdown": {
+            "job_count": 2,
+            "truncated": False,
+            "unsupported_dimensions": [],
+            "by_job_type": {"status": "DISABLED", "groups": []},
+            "by_submitted_by": {
+                "status": "OK",
+                "groups": [
+                    {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                     "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                    {"kind": "OTHER", "submitted_by": None, "is_caller": False,
+                     "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+                    {"kind": "UNATTRIBUTED", "submitted_by": None, "is_caller": False,
+                     "in_use_gpus": 0, "pending_gpus": 0, "job_count": 0},
+                ],
+            },
+        },
+    }
+    assert out == json.dumps(cli._breakdown_last(expected), indent=2) + "\n"
+    assert list(json.loads(out))[-1] == "breakdown"
+
+
+def test_capacity_breakdown_prints_visible_user_rows_in_server_order():
+    from cortex_training import client as client_module
+
+    client = client_module.CortexTrainingClient(
+        base_url="http://test.local", database="DB", schema="SCH"
+    )
+    client._session = MagicMock()
+    response = MagicMock(status_code=200)
+    # Scope VISIBLE names other users as well as the caller, ALICE, by
+    # in_use_gpus + pending_gpus descending and then by name. Printing with
+    # sorted keys must not reorder the rows.
+    response.json.return_value = {
+        "in_use_gpus": 28,
+        "pending_gpus": 16,
+        "breakdown": {
+            "unsupported_dimensions": [],
+            "job_count": 5,
+            "truncated": False,
+            "by_submitted_by": {
+                "status": "OK",
+                "groups": [
+                    {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
+                     "in_use_gpus": 16, "pending_gpus": 8, "job_count": 2},
+                    {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+                     "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+                    {"kind": "USER", "submitted_by": "BOB", "is_caller": False,
+                     "in_use_gpus": 0, "pending_gpus": 8, "job_count": 1},
+                    {"kind": "OTHER", "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+                    {"kind": "UNATTRIBUTED", "in_use_gpus": 0, "pending_gpus": 0, "job_count": 0},
+                ],
+            },
+        },
+    }
+    client._session.get.return_value = response
+
+    rc, _, out, err = _run_capacity(
+        ["--compact", "capacity", "--hardware", "H200", "--breakdown", "submitted-by"],
+        client=client,
+    )
+
+    assert rc == 0, err
+    assert err == ""
+    assert client._session.get.call_args.kwargs["params"] == {
+        "hardware": "H200",
+        "breakdown": "submitted_by",
+    }
+    assert json.loads(out)["breakdown"]["by_submitted_by"] == {
+        "status": "OK",
+        "groups": [
+            {"kind": "USER", "submitted_by": "CAROL", "is_caller": False,
+             "in_use_gpus": 16, "pending_gpus": 8, "job_count": 2},
+            {"kind": "USER", "submitted_by": "ALICE", "is_caller": True,
+             "in_use_gpus": 8, "pending_gpus": 0, "job_count": 1},
+            {"kind": "USER", "submitted_by": "BOB", "is_caller": False,
+             "in_use_gpus": 0, "pending_gpus": 8, "job_count": 1},
+            {"kind": "OTHER", "submitted_by": None, "is_caller": False,
+             "in_use_gpus": 4, "pending_gpus": 0, "job_count": 1},
+            {"kind": "UNATTRIBUTED", "submitted_by": None, "is_caller": False,
+             "in_use_gpus": 0, "pending_gpus": 0, "job_count": 0},
+        ],
+    }
 
 
 def test_cancel_prints_confirmation():
@@ -968,6 +1928,58 @@ def test_generate_can_skip_poll(tmp_path):
     }
 
 
+def test_generate_counts_flat_token_list_as_one_prompt(tmp_path):
+    instances = []
+    stdout = io.StringIO()
+    path = tmp_path / "generate.json"
+    path.write_text(json.dumps({"poll": False, "prompts": [1, 2, 3]}), encoding="utf-8")
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert instances[0].generate_prompts == [1, 2, 3]
+    assert json.loads(stdout.getvalue())["prompt_count"] == 1
+
+
+def test_generate_rejects_sampling_params_list_longer_than_one_flat_prompt(tmp_path):
+    path = tmp_path / "generate.json"
+    path.write_text(
+        json.dumps({"prompts": [1, 2, 3], "sampling_params": [{"max_tokens": 4}, None, None]}),
+        encoding="utf-8",
+    )
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory([]),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "sampling_params list length must match prompts length" in stderr.getvalue()
+
+
+def test_generate_counts_nested_token_lists_as_a_batch(tmp_path):
+    instances = []
+    stdout = io.StringIO()
+    path = tmp_path / "generate.json"
+    path.write_text(json.dumps({"poll": False, "prompts": [[1, 2], [3, 4]]}), encoding="utf-8")
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "generate", str(path)],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert json.loads(stdout.getvalue())["prompt_count"] == 2
+
+
 def test_weight_sync_defaults_to_training_and_sampling_subjobs():
     instances = []
     stdout = io.StringIO()
@@ -1135,6 +2147,217 @@ def test_download_log_stdout_routes_to_reconstruction(tmp_path):
     assert client.stdout_log_output_dir == tmp_path
     assert (tmp_path / "job-1:training:0" / "stdout.log").read_text() == "console\n"
     assert json.loads(stdout.getvalue())["logs"][0]["filename"] == "stdout.log"
+
+
+def test_download_log_resume_reaches_stdout_download(tmp_path):
+    stdout = io.StringIO()
+    client = FakeClient()
+
+    rc = cli.main(
+        _base_args()
+        + ["download-log", "job-1", "--log-type", "stdout", "--resume", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert client.stdout_resume is True
+
+
+def test_download_log_resume_rejects_execution_logs(tmp_path):
+    stderr = io.StringIO()
+
+    def client_factory(_args):
+        raise AssertionError("client constructed before the --resume check")
+
+    rc = cli.main(
+        _base_args() + ["download-log", "job-1", "--resume", "--output-dir", str(tmp_path)],
+        client_factory=client_factory,
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "--resume applies to --log-type stdout" in stderr.getvalue()
+
+
+def test_download_metrics_resume_reaches_client(tmp_path):
+    client = FakeClient()
+
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--resume", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: client,
+        stdout=io.StringIO(),
+    )
+
+    assert rc == 0
+    assert client.metrics_resume is True
+
+
+def test_download_commands_write_progress_to_stderr(tmp_path):
+    class ProgressClient(FakeClient):
+        def download_stdout_logs(self, job_id, output_dir, *, resume=False, progress=None):
+            if progress is not None:
+                progress("stdout: found 1 chunks for job\n")
+            return super().download_stdout_logs(
+                job_id, output_dir, resume=resume, progress=None
+            )
+
+        def download_metrics(self, job_id, output_dir, *, resume=False, progress=None):
+            if progress is not None:
+                progress("metrics: found 1 chunks for job\n")
+            return super().download_metrics(
+                job_id, output_dir, resume=resume, progress=None
+            )
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    rc = cli.main(
+        _base_args()
+        + ["download-log", "job-1", "--log-type", "stdout", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: ProgressClient(),
+        stdout=stdout,
+        stderr=stderr,
+    )
+    assert rc == 0
+    assert json.loads(stdout.getvalue())["logs"][0]["filename"] == "stdout.log"
+    assert stderr.getvalue() == "stdout: found 1 chunks for job\n"
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path / "metrics")],
+        client_factory=lambda _: ProgressClient(),
+        stdout=stdout,
+        stderr=stderr,
+    )
+    assert rc == 0
+    assert json.loads(stdout.getvalue())["metrics"][0]["filename"] == "gpu.jsonl"
+    assert stderr.getvalue() == "metrics: found 1 chunks for job\n"
+
+
+class _TtyStderr(io.StringIO):
+    def isatty(self):
+        return True
+
+
+class _WriteFails(_TtyStderr):
+    def write(self, message):
+        raise BrokenPipeError(message)
+
+
+class _FlushFails(_TtyStderr):
+    def flush(self):
+        raise OSError("flush")
+
+
+@pytest.mark.parametrize("stream_cls", [_WriteFails, _FlushFails])
+@pytest.mark.parametrize(
+    "messages",
+    [["metrics: found 1 chunks for job\n"], ["metrics: [#] 1/1 job", "\n"]],
+)
+def test_download_metrics_survives_stderr_oserror(stream_cls, messages, tmp_path):
+    class ProgressClient(FakeClient):
+        def download_metrics(self, job_id, output_dir, *, resume=False, progress=None):
+            for message in messages:
+                progress(message)
+            return super().download_metrics(job_id, output_dir, resume=resume, progress=None)
+
+    stdout = io.StringIO()
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: ProgressClient(),
+        stdout=stdout,
+        stderr=stream_cls(),
+    )
+    assert rc == 0
+    assert json.loads(stdout.getvalue())["job_id"] == "job-1"
+
+
+def test_artifact_progress_writer_edges():
+    for stream in (_TtyStderr(), io.StringIO()):
+        write = cli._artifact_progress_writer(stream)
+        write("\n")
+        write("stdout: no new chunks for job\n")
+        assert stream.getvalue() == "stdout: no new chunks for job\n"
+
+    for error in (ValueError, OSError):
+
+        class IsattyFails(io.StringIO):
+            isatty_calls = 0
+
+            def isatty(self):
+                type(self).isatty_calls += 1
+                raise error("closed")
+
+        stream = IsattyFails()
+        write = cli._artifact_progress_writer(stream)
+        write("metrics: [#] 1/2 job")
+        write("metrics: [##] 2/2 job")
+        write("\n")
+        assert stream.getvalue() == "metrics: [##] 2/2 job\n"
+        assert IsattyFails.isatty_calls == 1
+
+    class FailsOnce(io.StringIO):
+        failed = False
+
+        def write(self, message):
+            if not self.failed:
+                self.failed = True
+                raise BrokenPipeError(message)
+            return super().write(message)
+
+    stream = FailsOnce()
+    write = cli._artifact_progress_writer(stream)
+    write("metrics: [#] 1/1 job")
+    write("\n")
+    write("\n")
+    assert stream.getvalue() == ""
+
+
+def test_download_progress_is_one_terminal_line(tmp_path):
+    class ProgressClient(FakeClient):
+        def download_metrics(self, job_id, output_dir, *, resume=False, progress=None):
+            if progress is not None:
+                progress("metrics: [##------------------] 1/2 job")
+                progress("metrics: [####################] 2/2 job")
+                progress("\n")
+            return super().download_metrics(job_id, output_dir, resume=resume, progress=None)
+
+    tty = _TtyStderr()
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: ProgressClient(),
+        stdout=io.StringIO(),
+        stderr=tty,
+    )
+    assert rc == 0
+    assert tty.getvalue() == (
+        "\rmetrics: [##------------------] 1/2 job"
+        "\rmetrics: [####################] 2/2 job\n"
+    )
+
+    plain = io.StringIO()
+    rc = cli.main(
+        _base_args() + ["download-metrics", "job-1", "--output-dir", str(tmp_path / "plain")],
+        client_factory=lambda _: ProgressClient(),
+        stdout=io.StringIO(),
+        stderr=plain,
+    )
+    assert rc == 0
+    assert plain.getvalue() == "metrics: [####################] 2/2 job\n"
+
+
+def test_execution_log_download_writes_no_progress(tmp_path):
+    stderr = io.StringIO()
+    rc = cli.main(
+        _base_args() + ["download-log", "job-1", "--output-dir", str(tmp_path)],
+        client_factory=lambda _: FakeClient(),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+    assert rc == 0
+    assert stderr.getvalue() == ""
 
 
 def test_download_metrics_defaults_to_cwd(tmp_path, monkeypatch):
@@ -1456,3 +2679,215 @@ def test_login_rejects_invalid_config(tmp_path, monkeypatch, config_flags):
     assert rc == 1
     assert not login_state.exists()
     assert "unknown config key" in stderr.getvalue()
+
+
+def test_no_legacy_config_falls_back_to_default_snowflake_profile(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(
+        "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing-login.json")
+    )
+    for name in (
+        "CORTEX_TRAINING_CONFIG",
+        "CORTEX_TRAINING_BASE_URL",
+        "CORTEX_TRAINING_HOST",
+        "SNOWFLAKE_HOST",
+        "CORTEX_TRAINING_PAT",
+        "SNOWFLAKE_PAT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
+
+    assert rc == 0
+    assert seen["use_connection_profile"] is True
+    assert seen["connection"] is None
+    assert seen["database"] is None
+    assert seen["schema"] is None
+
+
+@pytest.mark.parametrize(
+    ("environment_name", "environment_value"),
+    [
+        ("SNOWFLAKE_HOST", "leftover.example"),
+        ("SNOWFLAKE_PAT", "leftover-pat"),
+    ],
+)
+def test_incomplete_direct_environment_falls_back_to_default_profile(
+    tmp_path, monkeypatch, environment_name, environment_value
+):
+    monkeypatch.setenv(
+        "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing-login.json")
+    )
+    for name in (
+        "CORTEX_TRAINING_CONFIG",
+        "CORTEX_TRAINING_BASE_URL",
+        "CORTEX_TRAINING_HOST",
+        "SNOWFLAKE_HOST",
+        "CORTEX_TRAINING_PAT",
+        "SNOWFLAKE_PAT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(environment_name, environment_value)
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
+
+    assert rc == 0
+    assert seen["use_connection_profile"] is True
+    assert seen["connection"] is None
+
+
+def test_named_connection_bypasses_invalid_login_state(tmp_path, monkeypatch):
+    login_state = tmp_path / "login.json"
+    login_state.write_text("not json", encoding="utf-8")
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    rc = cli.main(
+        ["--connection", "training-profile", "list"],
+        client_factory=make_client,
+        stdout=io.StringIO(),
+    )
+
+    assert rc == 0
+    assert seen["use_connection_profile"] is True
+    assert seen["connection"] == "training-profile"
+
+
+def test_existing_legacy_config_wins_over_profile_fallback(tmp_path, monkeypatch):
+    config = _write_config(
+        tmp_path,
+        {"base_url": "http://legacy.local", "database": "LEGACY_DB"},
+    )
+    monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(config))
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
+
+    assert rc == 0
+    assert seen["use_connection_profile"] is False
+    assert seen["base_url"] == "http://legacy.local"
+
+
+def test_missing_remembered_config_falls_back_to_profile(tmp_path, monkeypatch):
+    login_state = tmp_path / "login.json"
+    login_state.write_text(
+        json.dumps({"config_path": str(tmp_path / "removed-config.json")}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
+
+    assert rc == 0
+    assert seen["use_connection_profile"] is True
+
+
+def test_named_connection_conflicts_with_direct_flags():
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        ["--connection", "training-profile", "--host", "x.test", "list"],
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "--connection cannot be combined" in stderr.getvalue()
+
+
+def test_build_client_uses_named_snowflake_connection(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing.json")
+    )
+    args = cli.parse_args(["--connection", "training-profile", "list"])
+    client_cls = MagicMock()
+    connected = object()
+    client_cls.from_connection_name.return_value = connected
+
+    assert cli.build_client(args, client_cls) is connected
+    client_cls.from_connection_name.assert_called_once_with(
+        connection_name="training-profile",
+        database=None,
+        schema=None,
+        endpoint="cortex-training",
+        poll_interval=0.5,
+        poll_timeout=1800.0,
+        verify_ssl=True,
+    )
+
+
+def _http_error(status_code: int, headers: dict[str, str] | None = None):
+    import requests
+
+    request = requests.Request(
+        "GET", "https://account.snowflakecomputing.com/api", headers=headers or {}
+    ).prepare()
+    response = requests.Response()
+    response.status_code = status_code
+    response.request = request
+    response._content = b'{"code": "390100", "message": "rejected"}'
+    return requests.HTTPError(f"{status_code} Client Error", response=response)
+
+
+_PAT_HEADERS = {
+    "Authorization": "Bearer REDACTED",
+    "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
+}
+
+
+def test_format_error_explains_rejected_pat_on_401() -> None:
+    message = cli._format_error(_http_error(401, _PAT_HEADERS))
+
+    assert message.startswith("401 Client Error")
+    assert "Snowflake rejected your credentials (HTTP 401)." in message
+    assert "Your user has no network policy." in message
+    assert "authentication.md#network-policy-requirement" in message
+
+
+def test_format_error_skips_pat_hint_for_session_token_401() -> None:
+    message = cli._format_error(
+        _http_error(401, {"Authorization": 'Snowflake Token="REDACTED"'})
+    )
+
+    assert "401 Client Error" in message
+    assert "network policy" not in message
+
+
+def test_format_error_leaves_other_http_errors_unchanged() -> None:
+    message = cli._format_error(_http_error(409, _PAT_HEADERS))
+
+    assert "409 Client Error" in message
+    assert "network policy" not in message
+
+
+def test_format_error_does_not_repeat_request_id_already_in_message() -> None:
+    exc = FakeHTTPError()
+    exc.args = (f"[snowflake request id: sf-req-1] {exc.args[0]}",)
+
+    message = cli._format_error(exc)
+
+    assert message.count("sf-req-1") == 1
+    assert "response body:" in message

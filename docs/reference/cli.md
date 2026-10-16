@@ -10,7 +10,7 @@ below, such as `ct login config.json` or `ct --job JOB_ID step`.
 ## Installation
 
 Requires Python 3.10+. Installing the package gives you the `cortex-training`
-CLI, the `cortex-training tui` log viewer, and the `cortex_training` Python SDK.
+CLI, the `cortex-training tui` job dashboard, and the `cortex_training` Python SDK.
 
 This project uses [uv](https://docs.astral.sh/uv/); `pip` works in place of
 `uv pip` throughout if you prefer.
@@ -81,6 +81,8 @@ positional `JOB_ID` after the subcommand.
 ### [Connection](#connection-config)
 
 ```bash
+cortex-training --connection training list    # Use a Snowflake profile
+cortex-training list                          # Use the configured default profile
 cortex-training login config.json             # Remember config for future commands
 cortex-training login --config config.json    # Equivalent login syntax
 cortex-training --config config.json list     # Use config for one command
@@ -101,13 +103,15 @@ cortex-training submit - < job.json           # Read JSON from stdin
 ```bash
 cortex-training list
 cortex-training list --status running
+cortex-training list --status active,failed --user JDOE --since 2026-10-01 --limit 20
+cortex-training list --all                    # Every schema you can see
 cortex-training get JOB_ID
 cortex-training wait JOB_ID                   # Wait until running, not finished
 cortex-training cancel JOB_ID
 cortex-training checkpoints JOB_ID
 cortex-training models                        # Active configured models
-cortex-training capacity                      # All supported GPU types
-cortex-training capacity --hardware B200
+cortex-training capacity                      # Every GPU type your account supports
+cortex-training capacity --hardware H200
 ```
 
 ### [Training And Generation](#run-a-forward-backward-smoke-test)
@@ -133,11 +137,11 @@ cortex-training --job JOB_ID load CHECKPOINT_ID --target-sub-job-id JOB_ID:train
 cortex-training --job JOB_ID load CHECKPOINT_ID --no-poll
 ```
 
-### [Logs And Metrics](#log-tui)
+### [Logs And Metrics](#job-tui)
 
 ```bash
 cortex-training tui                          # Open job picker
-cortex-training tui JOB_ID                   # Open job logs
+cortex-training tui JOB_ID                   # Open the job dashboard
 cortex-training download-log JOB_ID --output-dir ./logs
 cortex-training download-log JOB_ID --log-type stdout --output-dir ./logs
 cortex-training download-metrics JOB_ID --output-dir ./metrics
@@ -165,7 +169,7 @@ cortex-training fwd-bwd --help
 | `fwd-bwd`, `generate` | Poll the submitted request until completion | Set top-level `"poll": false` in the input JSON |
 | `step` | Poll until completion; learning rate `1e-4` | Set `--lr`; polling cannot be disabled |
 | `load`, `weight-sync` | Poll the submitted request until completion | `--no-poll` returns without waiting for the result |
-| `capacity` | Query H200, B200, and B300 | Select one with `--hardware` |
+| `capacity` | Query each GPU type the account supports | Select one with `--hardware` |
 | `download-log`, `download-metrics` | Write under the current directory | Set `--output-dir` |
 
 ## Detailed Reference
@@ -176,18 +180,43 @@ cortex-training fwd-bwd --help
 - [Load checkpoints](#load-a-checkpoint-into-a-running-job) and [initialize sampling](#start-sampling-from-a-training-checkpoint)
 - [Generate](#run-a-generate-smoke-test) and [sync weights](#sync-training-weights)
 - [Download logs](#download-execution-logs), [stdout](#download-persisted-stdout), and [metrics](#download-gpu-metrics)
-- [Log TUI](#log-tui), [JSON output and help](#json-output-and-help), and [troubleshooting](#troubleshooting)
+- [Job TUI](#job-tui), [JSON output and help](#json-output-and-help), and [troubleshooting](#troubleshooting)
 
 `cortex-training` submits and manages Cortex Training jobs through the Cortex
 Training REST endpoint.
-The normal workflow is:
+The Snowflake-native workflow uses the same connection profiles as the Python
+Connector and Snowflake CLI:
 
-1. Create a connection config JSON.
-2. Run `cortex-training login config.json` once.
-3. Use `cortex-training list`, `submit`, `get`, `cancel`, `wait`, and
-   `capacity` without passing connection flags every time.
+```toml
+# ~/.snowflake/connections.toml
+[training]
+account = "ORG-ACCOUNT"
+host = "ACCOUNT.snowflakecomputing.com"
+user = "USER"
+authenticator = "programmatic_access_token"
+token = "YOUR_PROGRAMMATIC_ACCESS_TOKEN"
+database = "CORTEX_TRAINING_DB"
+schema = "PUBLIC"
+```
 
-### Connection Config
+Protect files containing credentials, then select the named profile:
+
+```bash
+chmod 600 ~/.snowflake/connections.toml
+cortex-training --connection training list
+```
+
+`cortex-training list` with no connection arguments uses the
+Connector-configured default profile. Set
+`SNOWFLAKE_DEFAULT_CONNECTION_NAME=training`, configure
+`default_connection_name = "training"` in Snowflake's `config.toml`, or name
+the connection `[default]`.
+
+Profile lookup is a fallback. An explicit or remembered legacy JSON config, or
+a complete direct `--base-url` / `--host` + `--pat` connection, continues to
+win. This preserves existing scripts.
+
+### Legacy Connection Config
 
 For Snowflake PAT auth, use `host` for the account hostname. Do not use
 `base_url` for Snowflake PAT auth.
@@ -224,7 +253,7 @@ account, use `base_url` with an explicit scheme. This skips PAT auth:
 }
 ```
 
-### Login
+### Legacy Login
 
 Login validates the config and stores only the config path, not the config
 contents:
@@ -261,11 +290,33 @@ Explicit CLI flags override config values.
 ```bash
 cortex-training list
 cortex-training list --status running
+cortex-training list --status active,failed --user JDOE --since 2026-10-01 --limit 20
+cortex-training list --all
 cortex-training get JOB_ID
 cortex-training checkpoints JOB_ID
 cortex-training cancel JOB_ID
 cortex-training wait JOB_ID
 ```
+
+`list` takes these filters:
+
+| Flag | Takes | Notes |
+|---|---|---|
+| `--all` | nothing | lists jobs across every schema in the account that you can see, not just the configured one |
+| `--status` | comma list of `pending`, `placing`, `initializing`, `running`, `failed`, `cancelled`, `terminated`, `active`, `done` | `active` is `pending` through `running`; `done` is `cancelled`, `terminated`, and the `done` that older jobs show; `pending` does not include `placing`. Matched against a row's status in any form the server sends, including `JOB_STATE_RUNNING` and aliases such as `canceled`, `completed`, `succeeded`, `error`, `queued`, `creating` |
+| `--user` | user name | SQL name rules: unquoted means its uppercase form, `"quoted"` means exactly that name |
+| `--since` | `YYYY-MM-DD` | a UTC day; keeps jobs created on or after it |
+| `--until` | `YYYY-MM-DD` | a UTC day; keeps jobs created on or before it, so `--since D --until D` means "on day D" |
+| `--limit` | number | prints at most this many of the newest matching jobs by `created_at`; a job listed without one counts as oldest |
+
+Without `--all`, the CLI fetches the configured schema's jobs and applies the
+filters itself, leaving out a job with no `created_at` when `--since` or
+`--until` is set. With `--all`, the server applies them across the account
+([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2endpoint));
+where account-level listing is not enabled for the account, the command fails
+with `account-level job listing is not enabled for this account`. A bad
+`--status`, `--since`, `--until`, or `--limit`, or an empty `--user`, exits
+with status 2 before connecting.
 
 `get` fetches current job details; `checkpoints` lists saved checkpoints.
 `wait` waits for the job to reach **running**, not for training to finish.
@@ -290,21 +341,72 @@ by hardware:
 
 ```bash
 cortex-training capacity
-cortex-training capacity --hardware B200
+cortex-training capacity --hardware H200
 ```
 
 The default command queries `H200`, `B200`, and `B300` independently and
-prints a `capacity_by_hardware` map. Each entry includes `has_reservation`,
-`max_total_gpus`, `reserved_gpus`, `in_use_gpus`, `pending_gpus`, and
-`available_gpus`.
+prints a `capacity_by_hardware` map with one entry per GPU type your account
+supports. Each entry includes `has_reservation`, `max_total_gpus`,
+`reserved_gpus`, `in_use_gpus`, `pending_gpus`, and `available_gpus`. Types the
+service rejects as unsupported for the account (error code `517604`) are listed
+in `unsupported_hardware` instead, which is empty when every type is supported:
 
-`--hardware` keeps the single-capacity response shape for one GPU type.
+```json
+{
+  "capacity_by_hardware": {
+    "B300": {"available_gpus": 8, "has_reservation": true, "max_total_gpus": 8, "...": "..."},
+    "H200": {"available_gpus": 16, "has_reservation": true, "max_total_gpus": 16, "...": "..."}
+  },
+  "unsupported_hardware": ["B200"]
+}
+```
+
+Any other error still fails the command, and so does an account that supports
+none of the types.
+
+Each hardware lookup is attempted once with at most a 10-second connect timeout
+and a 30-second read timeout; a shorter SDK timeout still wins. A silent
+network, proxy, or service hop therefore fails instead of leaving the command
+blocked indefinitely. The three lookups run serially; use `--hardware` when
+only one type is needed.
+
+`--hardware` keeps the single-capacity response shape for one GPU type. Asking
+for a type your account does not support returns the service's error, which
+names the supported types.
 
 `max_total_gpus` is the canonical ceiling and supersedes the deprecated
 `reserved_gpus`. `in_use_gpus` counts only GPUs the account holds; queued work
 is reported separately in `pending_gpus`. See
 [REST API reference section 5.5](rest-api.md#55-capacity---get-capacity) and
 [GPU hardware](../concepts/hardware.md).
+
+#### Capacity Breakdown
+
+`--breakdown` splits `in_use_gpus` and `pending_gpus` by sub-job type
+(`job-type`) or by submitting user (`submitted-by`). Repeat it for both:
+
+```bash
+cortex-training capacity --hardware H200 --breakdown job-type --breakdown submitted-by
+```
+
+Each capacity object then carries a `breakdown`, as
+`get_capacity_breakdown()` returns it:
+
+```bash
+cortex-training capacity --hardware H200 --breakdown submitted-by \
+  | jq -c '.breakdown.by_submitted_by.groups[]'
+```
+
+```json
+{"kind":"USER","submitted_by":"YOUR_USER","is_caller":true,"in_use_gpus":24,"pending_gpus":0,"job_count":2}
+{"kind":"USER","submitted_by":"SOME_USER","is_caller":false,"in_use_gpus":8,"pending_gpus":16,"job_count":2}
+{"kind":"OTHER","submitted_by":null,"is_caller":false,"in_use_gpus":8,"pending_gpus":0,"job_count":1}
+{"kind":"UNATTRIBUTED","submitted_by":null,"is_caller":false,"in_use_gpus":4,"pending_gpus":0,"job_count":1}
+```
+
+Until the breakdown is enabled for your account, each dimension reports
+`DISABLED`. See [REST API reference section 5.4](rest-api.md#breakdown---breakdown)
+for every field and status.
 
 ### Submit A Job
 
@@ -339,7 +441,11 @@ cortex-training submit job.json --dry-run
 
 Without `--wait`, submission returns without waiting for the job to run.
 `--wait` waits until **running**, not until training finishes. `--dry-run`
-validates and prints the request body without sending it.
+validates and prints the request body without sending it, applying the same
+checks as a live submit — so the printed body already shows any `peft_config`
+in its canonical form. A `log_probability` or `log_prob` sub-job is rejected
+before send, including on `--dry-run`, with
+`log_probability sub-jobs are not currently supported`.
 
 The repo includes a Prime-RL/Qwen3.6 training example:
 
@@ -435,9 +541,11 @@ training sub-job with `"load_optimizer_states": false` in its `training_config`.
 This cannot be changed at load time. See
 [DP size compatibility](rest-api.md#dp-size-compatibility) for the constraint.
 
-This is the runtime load path. Create-time resume still uses
+This is the runtime load path. Create-time initialization from a checkpoint
+saved by Cortex Training still uses
 [`source_checkpoint_info`](rest-api.md#65-create-time-checkpoint-initialization)
-in the submitted sub-job JSON.
+in the submitted sub-job JSON. To start a job from weights you trained
+elsewhere, see [Start a Job From Your Own Weights](../guides/training/external-weights.md).
 
 `load` polls until the request completes by default. Pass `--no-poll` to return
 the request metadata without waiting for the result.
@@ -465,9 +573,11 @@ cortex-training --job-id JOB_ID generate examples/api/generate.json
 
 The generate JSON contains `prompts`, optional `sampling_params`, and optional
 `routing_key` / `strict` fields. `sampling_params` may be one object applied to
-all prompts or a list of objects/nulls aligned with `prompts`. The CLI submits
-`generate` and polls the request by default. Set `"poll": false` to print only
-the submitted `request_id`.
+all prompts or a list of objects/nulls aligned with `prompts`. A flat list of
+integers such as `"prompts": [1, 2, 3]` is one pre-tokenized prompt, not three;
+use the nested form `[[1, 2], [3, 4]]` for a batch. The CLI submits `generate`
+and polls the request by default. Set `"poll": false` to print only the
+submitted `request_id`.
 
 ### Sync Training Weights
 
@@ -521,9 +631,18 @@ Reconstruct each sub-job's persisted stdout/stderr chunks into
 
 ```bash
 cortex-training download-log JOB_ID --log-type stdout --output-dir /path/to/logs
+cortex-training download-log JOB_ID --log-type stdout --output-dir /path/to/logs --resume
 ```
 
 The current working directory is used when `--output-dir` is omitted.
+`--resume` continues a stdout download already in that directory. It does not
+apply to execution logs, including `download-log` without `--log-type stdout`.
+On a terminal, progress is one line on stderr that updates in place. A
+redirected stderr gets one final line per sub-job. Progress is not part of
+the JSON on stdout.
+A large download may open additional Snowflake sessions for one sub-job, and
+each session can prompt for authentication. Two downloads of the same
+directory at once are unsupported.
 
 ### Download GPU Metrics
 
@@ -532,27 +651,33 @@ Reconstruct each sub-job's GPU metric chunks into
 
 ```bash
 cortex-training download-metrics JOB_ID --output-dir /path/to/metrics
+cortex-training download-metrics JOB_ID --output-dir /path/to/metrics --resume
 ```
 
 The command prints the saved path, chunk count, and first/last logical artifact
-URIs for each reconstructed file.
+URIs for each reconstructed file. `--resume` continues a metrics download
+already in that directory. On a terminal, progress is one line on stderr
+that updates in place. A redirected stderr gets one final line per sub-job.
+Progress is not part of the JSON on stdout. A large download may open
+additional Snowflake sessions for one sub-job, and each session can prompt
+for authentication. Two downloads of the same directory at once are
+unsupported.
 
-### Log TUI
+### Job TUI
 
-`cortex-training tui` is a read-only terminal UI for tailing a running job's logs
-live. It reuses the same connection handling as `cortex-training` — login state,
-`--config` /
-`CORTEX_TRAINING_CONFIG`, the `CORTEX_TRAINING_*` / `SNOWFLAKE_*` env vars, or explicit
-flags. So once you've run `cortex-training login config.json` you can just launch it:
+`cortex-training tui` is a read-only terminal dashboard for job logs and GPU
+resources. It uses the same connection handling and fallback order as the CLI,
+including named and configured-default Snowflake profiles:
 
 ```bash
 cortex-training tui                 # opens a job picker
-cortex-training tui JOB_ID          # opens that job's logs directly
+cortex-training tui JOB_ID          # opens that job's dashboard directly
 ```
 
 Without login state, pass connection details the same way as the CLI:
 
 ```bash
+cortex-training tui JOB_ID --connection training
 cortex-training tui JOB_ID --config config.json
 cortex-training tui JOB_ID --host ACCOUNT.snowflakecomputing.com --pat YOUR_PAT \
   --database CORTEX_TRAINING_DB --schema PUBLIC --endpoint cortex-training
@@ -569,21 +694,31 @@ cortex-training tui \
   --database CORTEX_TRAINING_DB --schema PUBLIC
 ```
 
-Pass `--sub-job-id JOB_ID:training:0` to open one sub-job's log directly instead
-of the source list.
+Pass `--sub-job-id JOB_ID:training:0` to scope Logs and Resource to one matching
+sub-job. An unmatched id is shown as an error rather than falling back to a
+different sub-job.
 
-The left panel lists the job's sub-jobs; select one to tail its logs (the
-zone-manager pod is the Ray head, so a sub-job's worker output is included).
+The **Logs** tab's left panel lists the job's sub-jobs; select one to tail its
+logs (the zone-manager pod is the Ray head, so a sub-job's worker output is
+included).
 Logs are cached locally so reopening a job replays instantly without
 re-fetching from the server — under `~/.cache/cortex-training/` (or
 `$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`.
+
+A finished job loads its saved console once. A stream error while the job is
+still running stays an error. The level key filters structured live lines and
+does not hide lines from that saved console.
 
 The TUI also writes two files into your home directory: saved logs from the `s`
 key (`~/cortex-training-<job8>-<source>.log`, where `<job8>` is the first eight
 characters of the job id) and its own error log
 (`~/.cortex-training-errors.log`).
 
-Keys in the log view:
+Use `t` to switch between Logs and Resource. The **Resource** tab plots GPU
+utilization and lists each GPU. Use `1`–`5` for 5 minutes, 15 minutes, 1 hour,
+6 hours, or all history; use `r` to refresh.
+
+Keys in Logs:
 
 | Key | Action |
 |-----|--------|
@@ -594,7 +729,18 @@ Keys in the log view:
 | `y` | Copy the whole log to the clipboard |
 | `c` | Copy the current selection |
 | `r` | Refresh the sub-job list |
+| `t` | Switch to Resource |
 | `[` / `]` | Narrow / widen the sources panel |
+| `b` / `esc` | Back (`esc` clears an active log filter first) |
+| `q` | Quit |
+
+Keys in Resource:
+
+| Key | Action |
+|-----|--------|
+| `1` / `2` / `3` / `4` / `5` | Show 5m / 15m / 1h / 6h / all history |
+| `r` | Refresh |
+| `t` | Return to Logs |
 | `b` / `esc` | Back |
 | `q` | Quit |
 
@@ -625,6 +771,8 @@ usage: cortex-training --job JOB_ID fwd-bwd [-h] json_file
 Connection values can also come from:
 
 ```bash
+CORTEX_TRAINING_CONNECTION
+SNOWFLAKE_DEFAULT_CONNECTION_NAME
 CORTEX_TRAINING_CONFIG
 CORTEX_TRAINING_BASE_URL
 CORTEX_TRAINING_HOST
@@ -639,15 +787,37 @@ CORTEX_TRAINING_ENDPOINT
 ```
 
 `CORTEX_TRAINING_DISABLE_TELEMETRY` (truthy) skips OTLP client metrics on
-PAT-authenticated clients. `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`
+Snowflake profile and PAT clients. `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`
 (truthy) also emits successful outcomes for essential operations; failures
 are emitted by default. See the [Python SDK reference](python-sdk.md#client-metrics).
+
+`CORTEX_TRAINING_DISABLE_TENSOR_PROMPTS` (truthy) sends pre-tokenized prompts
+as JSON lists inside the request frame instead of as tensors. The request body
+stays a DSSST1 frame either way.
+
+`CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES` is the per-request JSON body
+ceiling for byte `forward()` `/operation` posts (integer bytes, default 16 MiB,
+minimum 16 KiB). Frames larger than that are split into request chunks.
 
 ### Troubleshooting
 
 If you see `provide --base-url for local/mock use, or both --host and --pat`,
 the CLI found a `host` but no PAT. Add `"pat": "..."` to `config.json` or set
 `CORTEX_TRAINING_PAT`.
+
+If no legacy config or complete direct connection is present, the CLI falls
+back to the Snowflake Connector's configured default. If your profile is not
+named `default`, pass `--connection NAME` or set
+`SNOWFLAKE_DEFAULT_CONNECTION_NAME`.
+
+If Snowflake rejects your PAT, the CLI keeps the original error and adds next
+steps: `394400 (08001) ... Programmatic access token is invalid` from a
+connection profile, or a `401` on a request that sent the PAT directly
+(`config.json`, `--pat`, or `CORTEX_TRAINING_PAT`). The most common cause is a
+user with no network policy; see
+[Network policy requirement](../getting-started/authentication.md#network-policy-requirement).
+A `401` on a connection-profile request gets no hint, because the PAT was
+already accepted at login.
 
 If you see `Invalid URL ... No scheme supplied`, the config is using a bare
 Snowflake hostname as `base_url`. Use `host` for Snowflake PAT auth, or use a

@@ -1,124 +1,92 @@
-# Cortex Training Client
+<h3 align="center">
+  <img src="assets/cortex_training_logo.svg" width=400px><br>
+</h3>
 
-Python SDK, command-line tools, runnable recipes, and documentation for the
-Cortex Training REST API.
+<div align="center">
 
-## Install
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/cortex-training)](https://pypi.org/project/cortex-training/)
 
-Requires Python 3.10 or later and [uv](https://docs.astral.sh/uv/getting-started/installation/).
-Create an environment and install the client:
+</div>
 
-```bash
-uv venv
-source .venv/bin/activate
-uv pip install git+https://github.com/snowflakedb/cortex-training.git
-```
+Cortex Training is Snowflake's serverless platform for post-training open-weight LLMs on managed GPU clusters. This repository contains the Python SDK, CLI, and ready-to-run recipes, powered by the open-source [Arctic Platform](https://github.com/Snowflake-AI-Research/Arctic-Platform) engine. Run reinforcement learning, supervised fine-tuning, and inference serving, no GPU infrastructure to manage.
 
-The package includes the CLI, log TUI, and Python SDK. `pip install` also works
-in place of `uv pip install` in an active Python environment.
+## Getting Started
 
-## Log In
+1. **Clone and install** — this gives you the SDK, CLI, and all recipes:
+   ```bash
+   git clone https://github.com/snowflakedb/cortex-training.git
+   cd cortex-training
+   uv venv
+   source .venv/bin/activate
+   uv pip install -e .
+   ```
+   Alternatively, `uv pip install cortex-training` installs the SDK and CLI
+   without recipes.
+2. **Get access** — you need a Snowflake account with Cortex Training enabled.
+   See [account setup](docs/getting-started/account_setup.md) for the full
+   walkthrough and [authentication](docs/getting-started/authentication.md) for
+   PAT generation and connection configuration.
+3. **Connect** — configure a standard
+   [Snowflake connection profile](docs/getting-started/setup.md), then:
+   ```bash
+   cortex-training --connection training capacity
+   # With a configured default profile: cortex-training capacity
+   ```
 
-Create `~/cortex-training-config.json` using the
-[connection template](examples/config/connection.json.template). Set `host` to
-your Snowflake account hostname, `pat` to your programmatic access token, and
-`database` and `schema` to the location of your Cortex Training endpoint.
-Keep this file outside the repository and do not commit credentials.
+## Quick Example
 
-Login validates the config and remembers its path for future CLI commands:
+### **Quick Start Recipe** (recommended)
 
-```bash
-cortex-training login ~/cortex-training-config.json
-```
-
-The equivalent `cortex-training login --config ~/cortex-training-config.json`
-form is also supported.
-
-`ct` is an alias for `cortex-training`: every CLI example also works with `ct`.
-See [connection setup](docs/getting-started/setup.md) for more detail.
-
-## Try the CLI
-
-```bash
-cortex-training capacity           # Check available GPU capacity
-cortex-training models             # List active configured models
-cortex-training list               # List jobs
-cortex-training get JOB_ID         # Inspect a job from the list
-cortex-training tui                # Pick a job and view its logs
-```
-
-See the [CLI quick reference](docs/reference/cli.md#quick-reference) for
-submission, training, generation, checkpoints, and log downloads.
-
-## Run a Recipe
-
-Start with [Run a Quick SFT Job](docs/getting-started/first-sft-run.md), a short
-end-to-end supervised fine-tuning walkthrough.
-
-Recipes require a repository checkout; they are not included in the installed
-package:
+Fine-tune a chat model in one command using our built-in recipes:
 
 ```bash
-git clone https://github.com/snowflakedb/cortex-training.git
-cd cortex-training
+python -m recipes.sft.conversational.train \
+  config=~/your-config.json \
+  max_steps=50
 ```
 
-Install the [recipe dependencies](recipes/README.md#prerequisites), then run
-the chosen recipe's commands from the repository root. Recipes take an explicit
-`config=/path/to/config.json` argument; use the same connection file you logged
-in with.
+This runs supervised fine-tuning on Qwen3-8B with the default config. See the
+[Conversational SFT recipe](recipes/sft/README.md) for all options.
 
-| Task | Recipe |
-|---|---|
-| Fine-tune a chat model with LoRA or full-parameter training | [Conversational SFT](recipes/sft/conversational/README.md) |
-| Train math reasoning with reinforcement learning | [Math GRPO](recipes/rl/math_grpo/README.md) |
-| Serve a model or checkpoint, generate responses, and evaluate | [Inference endpoint](recipes/inference/README.md) |
+### **CLI Mode**
 
-Check `cortex-training models`, `cortex-training capacity`, and the recipe's GPU
-requirements before starting a run. Browse the [recipe index](recipes/README.md)
-for all workflows.
+Recipes are built from step-level CLI primitives. Use them directly for full control over each training step:
 
-## More Documentation
+```bash
+cortex-training submit job.json          # create a job
+cortex-training models                   # list active configured models
+cortex-training fwd-bwd payload.json     # run a forward-backward pass
+cortex-training step --lr 1e-4           # optimizer step
+cortex-training generate --prompt "..."  # sample from the model
+cortex-training cancel JOB_ID            # release GPUs
+```
 
-- [Getting started and prerequisites](docs/getting-started/README.md)
-- [CLI commands and configuration](docs/reference/cli.md)
-- [Python SDK](docs/reference/python-sdk.md)
-- [REST API](docs/reference/rest-api.md)
-- [Model and training-method compatibility](docs/reference/model-compatibility.md)
-- [Job management and cluster status](docs/guides/operations/manage-jobs.md)
-- [RL framework integrations](docs/integrations/README.md)
+See the [CLI reference](docs/reference/cli.md) for the full command set. To use
+an existing RL framework like SkyRL, see
+[integrations](docs/integrations/README.md).
+
+## Recipes
+
+Recipes are end-to-end post-training and inference workflows you can run out of the box or customize. Each includes a Python entry point, configuration files, and a README with expected results. For detailed instructions on running a recipe or building a customized workflow, see the guides below:
+
+- **[Conversational SFT](recipes/sft/README.md)**: supervised fine-tuning on chat datasets with LoRA or full-parameter training.
+- **[Math GRPO](recipes/rl/README.md)**: reinforcement learning for mathematical reasoning with verifiable rewards.
+- **[Inference](recipes/inference/README.md)**: serve a model or checkpoint, generate responses, and evaluate.
+
+Browse the [recipe index](recipes/README.md) for all workflows.
+
+## Documentation
+
+- [Getting started](docs/getting-started/README.md): set up your environment, configure credentials, and run your first job
+- [Key concepts and glossary](docs/concepts/README.md): Cortex Training-specific terms and how they relate
+- [CLI reference](docs/reference/cli.md): all commands, flags, and usage examples
+- [Python SDK reference](docs/reference/python-sdk.md): CortexTrainingClient API for programmatic workflows
+- [REST API reference](docs/reference/rest-api.md): HTTP endpoints and wire format
+- [Model compatibility](docs/reference/model-compatibility.md): supported models, methods, and hardware configurations
+- [RL framework integrations](docs/integrations/README.md): run SkyRL, VERL, TRL, and other RL frameworks on Cortex infrastructure
 
 ## Development
 
-### Editable Install
-
-From a repository checkout, with your Python environment active:
-
-```bash
-uv pip install -e ".[dev]"
-```
-
-### Build a Wheel
-
-With `uv` installed, run:
-
-```bash
-./scripts/build_wheel.sh
-```
-
-The script builds the package using `pyproject.toml` in an isolated build
-environment and writes the wheel to `dist/`. It can be invoked from any working
-directory and does not install the package's runtime dependencies.
-
-### Repository Map
-
-| Path | Purpose |
-|---|---|
-| `model-catalog/` | Supported models, context limits, and recommended job profiles |
-| `docs/` | Getting started material, concepts, guides, and reference |
-| `recipes/` | End-to-end training, sampling, and evaluation workflows |
-| `examples/api/` | Small JSON examples for individual API operations |
-| `examples/config/` | Connection configuration templates |
-| `src/cortex_training/` | Installable Python client |
-| `tests/` | Client and CLI tests |
-| `cluster-status.py` | Optional watch view of running jobs and GPU usage |
+- **Contributing to the client or recipes** — see the [contributing guides](docs/contributing/) for documentation guidelines, recipe templates, and development setup.
+- **Building a distributable package** — see [build instructions](scripts/build_wheel.sh).

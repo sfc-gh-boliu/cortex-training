@@ -35,6 +35,7 @@ import inspect
 import os
 import shlex
 import shutil
+import signal
 import tempfile
 import threading
 import time
@@ -44,11 +45,14 @@ from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from datetime import datetime
 from datetime import timezone
 from itertools import zip_longest
 from pathlib import Path
 
+from rich.segment import Segment
+from rich.style import Style
 from rich.text import Text
 from textual import events
 from textual import work
@@ -56,17 +60,28 @@ from textual.app import App
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
+from textual.containers import ScrollableContainer
 from textual.containers import VerticalScroll
 from textual.content import Content
 from textual.coordinate import Coordinate
+from textual.geometry import Offset
+from textual.geometry import Region
 from textual.css.query import NoMatches
+from textual.notifications import Notification
+from textual.notifications import Notify
 from textual.screen import Screen
+from textual.scroll_view import ScrollView
+from textual.selection import SELECT_ALL
+from textual.selection import SelectEnd
+from textual.selection import Selection
 from textual.widget import Widget
 from textual.widgets import DataTable
 from textual.widgets import Footer
+from textual.widgets._footer import FooterKey
 from textual.widgets._footer import FooterLabel
 from textual.widgets._footer import KeyGroup
 from textual.widgets import Header
+from textual.widgets import HelpPanel
 from textual.widgets import Input
 from textual.widgets import Label
 from textual.widgets import ListItem
@@ -76,6 +91,8 @@ from textual.widgets import Static
 from textual.widgets import TabbedContent
 from textual.widgets import TabPane
 from textual.widgets.data_table import DuplicateKey
+from textual.widgets._toast import Toast
+from textual.widgets._toast import ToastRack
 from textual.widgets.data_table import RowKey
 from textual.worker import get_current_worker
 
@@ -102,6 +119,11 @@ from cortex_training.tui.format import format_job_config
 from cortex_training.tui.format import format_log_entry
 from cortex_training.tui.format import is_active_status
 from cortex_training.tui.format import one_line
+from cortex_training.tui.clipboard import aligned
+from cortex_training.tui.clipboard import copied_note
+from cortex_training.tui.clipboard import copy_local
+from cortex_training.tui.clipboard import screen_dump
+from cortex_training.tui.clipboard import selected_text
 from cortex_training.tui.format import safe_text
 from cortex_training.tui.format import wrap_log_line
 from cortex_training.tui.log_cache import LogCache
@@ -109,6 +131,7 @@ from cortex_training.tui.log_cache import cached_log_pages
 from cortex_training.tui.log_cache import catching_up
 from cortex_training.tui.log_cache import job_cache_dir
 from cortex_training.tui.log_cache import prune_consoles
+from cortex_training.tui.log_cache import prune_metrics
 from cortex_training.tui.log_cache import touch_console
 from cortex_training.tui.resource import DEFAULT_RANGE
 from cortex_training.tui.resource import GPU
@@ -124,6 +147,7 @@ from cortex_training.tui.resource import allocation_text
 from cortex_training.tui.resource import cached_metric_sources
 from cortex_training.tui.resource import format_value
 from cortex_training.tui.resource import freshness_text
+from cortex_training.tui.resource import forget_resource_loaders
 from cortex_training.tui.resource import gpu_allocation
 from cortex_training.tui.resource import has_metric_samples
 from cortex_training.tui.resource import headline_metric
@@ -502,12 +526,364 @@ class _JobRows:
         self.subs: tuple = ()  # ((row key suffix, cells), ...); none while folded
 
 
-class _JobTable(DataTable):
+def scroll_area(widget: Widget) -> Widget | None:
+    """The scrolling area ``widget`` is in (a log, a list, a scrolling pane), or None.
+    A line docked in a pane (the Resources header) doesn't scroll: it is its own area."""
+    for node in widget.ancestors_with_self:
+        if isinstance(node, Screen):
+            return None
+        if node.styles.dock in ("top", "bottom") and isinstance(node.parent, ScrollableContainer):
+            return node
+        if isinstance(node, (ScrollView, ScrollableContainer)) and not isinstance(node, (Footer, DataTable, Input)):
+            return node
+    return None
+
+
+def scrolling_region(area: Widget) -> Region:
+    """Where ``area``'s text scrolls: its content, less the lines docked at its top and bottom."""
+    region = area.scrollable_content_region
+    top, bottom = region.y, region.bottom
+    for child in area.children:
+        if child.display and child.styles.dock == "top":
+            top = max(top, child.region.bottom)
+        elif child.display and child.styles.dock == "bottom":
+            bottom = min(bottom, child.region.y)
+    return Region(region.x, top, region.width, bottom - top) if bottom > top else region
+
+
+class FollowsPointer:
+    """For a screen: while Textual scrolls the text under a drag (the pointer held
+    at an edge), the highlight ends where the pointer is. Textual keeps the end
+    where the pointer was before the scroll, so the highlight neither grew with
+    the scroll nor matched what was copied. And a drag from one text to another in
+    one scrolling area (the Resources stats into the charts) takes in what lies
+    between, in the order it is laid out: Textual places the drag's start off by
+    as much as the area has scrolled since, so the two ends could swap."""
+
+    def _watch__select_state(self, select_state) -> None:
+        if select_state is not None and select_state.end is not None and select_state.is_attached_to_dom():
+            select_state = self._end_on_text(select_state)
+            if select_state is None:  # no text between the pointer and the drag's start yet
+                self._selecting = True
+                self.selections = {}
+                return
+            start, end = select_state.start, select_state.end
+            first, last = start.content_widget, end.content_widget
+            if (first is not None and last is not None and first is not last
+                    and start.content_offset is not None and end.content_offset is not None
+                    and scroll_area(first) is not None and scroll_area(first) is scroll_area(last)):
+                self._selecting = True
+                texts = [widget for widget in scroll_area(first).query("*")
+                         if widget.allow_select and not widget.is_container]
+                if first in texts and last in texts:
+                    head, tail = (start.content_offset, end.content_offset)
+                    if texts.index(first) > texts.index(last):
+                        first, last, head, tail = last, first, tail, head
+                    between = texts[texts.index(first) + 1:texts.index(last)]
+                    # Both ends take in the character under them, as Textual's selection in one text does.
+                    self.selections = {first: Selection(head, None), **{widget: SELECT_ALL for widget in between},
+                                       last: Selection(None, tail + Offset(1, 0))}
+                    return
+        super()._watch__select_state(select_state)
+
+    def _end_on_text(self, state):
+        """``state``, its end moved onto text when the pointer is on blank space (a list's
+        empty part, a pane's blank row) of the area the drag started in: onto the nearest
+        row of text toward the drag's start. Textual would otherwise select every widget
+        beside the blank, a whole log beside an empty list."""
+        start, end = state.start, state.end
+        area = scroll_area(start.content_widget) if start.content_widget is not None else None
+        if end.content_widget is not None or area is None or start.content_offset is None:
+            return state
+        widget = start.content_widget
+        start_y = widget.content_region.y + start.content_offset.y - int(widget.scroll_offset.y)
+        x, y = state.screen_offset
+        step = 1 if start_y > y else -1
+        region = scrolling_region(area)
+        while region.y <= y < region.bottom and y != start_y + step:
+            found = self._text_on_row(area, x, y)
+            if found is not None:
+                text, offset = found
+                new = state.update_end(state.screen_offset, SelectEnd(text.parent, text, offset))
+                self.set_reactive(Screen._select_state, new)
+                return new
+            y += step
+        return None
+
+    def _text_on_row(self, area: Widget, x: int, y: int):
+        """``(widget, offset)`` of the text on screen line ``y`` of ``area`` at column ``x``,
+        or, past a short text (a list entry's name), at that text's end; None on a row
+        without text."""
+        found, offset = self.get_widget_and_offset_at(x, y)
+        if found is not None and offset is not None and not found.is_container and scroll_area(found) is area:
+            return found, offset
+        nearest = None  # the text on the row that starts nearest to the left of the pointer
+        for node in area.query("*"):
+            box = node.region
+            if (not node.is_container and node.allow_select and node.display and box.y <= y < box.bottom
+                    and box.x <= x and (nearest is None or box.x > nearest.region.x)):
+                nearest = node
+        if nearest is None:
+            return None
+        found, offset = self.get_widget_and_offset_at(min(x, nearest.region.right - 1), y)
+        return (found, offset) if found is nearest and offset is not None else None
+
+    def _update_select(self) -> None:
+        state = getattr(self, "_select_state", None)
+        position = getattr(self.app, "mouse_position", None)
+        if state is not None and state.end is not None and position is not None:
+            widget, offset = self.get_widget_and_offset_at(position.x, position.y)
+            if widget is not None:
+                end = (SelectEnd(widget if isinstance(widget, Screen) else widget.parent, widget, offset)
+                       if offset is not None else SelectEnd(widget, None, None))
+                self.set_reactive(Screen._select_state, state.update_end(position, end))
+        super()._update_select()
+
+
+class PickableTable(DataTable):
+    """A table whose rows a drag picks. Textual can't select a table's text with the
+    mouse, so a drag over rows picks them instead: they show highlighted, as selected
+    text does, and are copied as it is (see ``copy_highlight`` on the app), each with
+    its whole id where the screen has one (``whole_id``). A click, or a drag over
+    text elsewhere, drops them."""
+
+    # A press is a drag that picks rows once the pointer leaves its row, or moves
+    # this many cells along it; a hand that moves less meant a click.
+    _DRAG_CELLS = 2
+    # While the button is held past the top or the bottom, the table scrolls a row this often.
+    _EDGE_SCROLL_SECONDS = 0.08
+    _picked: frozenset = frozenset()  # the row keys a drag picked
+    _pick_from: int | None = None  # while the button is down: the row it was pressed on
+    _pick_to: int | None = None  # and the row the pointer is on
+    _pressed_at = None  # where it was pressed (a screen offset)
+    _dragged = False
+    _from_blank = False  # pressed in the blank under the last row: no row is picked until one is reached
+    _edge = 0  # -1 while the pointer is above the rows, 1 below them, else 0
+    _edge_timer = None
+    _swallow_click = False  # Textual follows a drag's release with a click on the row there
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        self._swallow_click = False
+        if event.button != 1 or not self.row_count:
+            return
+        row = self._row_at(event.screen_y)
+        self._from_blank = False
+        if row is None:
+            if self._on_header(event.screen_y):
+                # A click is the table's own; a drag down picks from the top row.
+                row = min(int(self.scroll_y), self.row_count - 1)
+            elif self._in_blank(event.screen_y):
+                # A click does nothing; a drag up picks from the last row to the one it reaches.
+                row, self._from_blank = self.row_count - 1, True
+            else:
+                return
+        self._pick_from = self._pick_to = row
+        self._pressed_at = event.screen_offset
+        self._dragged = False
+        self.capture_mouse()  # the rest of the drag comes here, past the table's edges too
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if self._pick_from is None:
+            return
+        if event.button != 1:  # the release happened where the terminal didn't report it
+            self._end_pick()
+            return
+        if not self._dragged:
+            if (event.screen_y == self._pressed_at.y
+                    and abs(event.screen_x - self._pressed_at.x) < self._DRAG_CELLS):
+                return
+            self._dragged = True
+            self.screen.clear_selection()  # one highlight at a time
+        self._edge = self._edge_of(event.screen_y)
+        if self._edge and self._edge_timer is None:
+            self._edge_timer = self.set_interval(self._EDGE_SCROLL_SECONDS, self._edge_scroll)
+        elif not self._edge and self._edge_timer is not None:
+            self._edge_timer.stop()
+            self._edge_timer = None
+        if self._from_blank and self._in_blank(event.screen_y):
+            self._set_picked(())  # no row reached yet
+            return
+        row = self._row_at(event.screen_y, scroll=True)
+        if row is not None:
+            self._pick_to = row
+        self._pick_range()
+
+    def _pick_range(self) -> None:
+        low, high = sorted((self._pick_from, self._pick_to))
+        rows = self.ordered_rows
+        self._set_picked(rows[index].key for index in range(low, min(high, len(rows) - 1) + 1))
+
+    def _edge_scroll(self) -> None:
+        """The button is held past the top or the bottom: one more row comes into view and into the pick."""
+        if self._pick_from is None or not self._edge:
+            return
+        first = int(self.scroll_y)
+        visible = max(1, self._rows_bottom() - self._rows_top())
+        if self._edge > 0 and self.scroll_y >= self.max_scroll_y:
+            return  # nothing more to bring into view
+        row = max(0, first - 1) if self._edge < 0 else min(self.row_count - 1, first + visible)
+        if row == self._pick_to:
+            return  # at the first or the last row
+        self.scroll_to(y=row if self._edge < 0 else row - visible + 1, animate=False)
+        self._pick_to = row
+        self._pick_range()
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if self._pick_from is None:
+            return
+        dragged = self._dragged
+        self._end_pick()
+        if dragged:
+            self._swallow_click = True
+            copy_highlight = getattr(self.app, "copy_highlight", None)
+            if callable(copy_highlight):
+                copy_highlight(self.screen)  # as a drag over text is copied
+        else:
+            self.clear_picked()  # a click: it does what a click does, and drops the picks
+
+    def on_click(self, event: events.Click) -> None:
+        self.swallowed(event)
+
+    def swallowed(self, event: events.Click) -> bool:
+        """Whether ``event`` is the click Textual sends at the end of a drag that picked
+        rows, which the table's own handler would take for a click on a row, or a
+        middle-button click (a middle drag folded a job where it was let go): it then
+        goes no further."""
+        if not self._swallow_click and event.button == 1:
+            return False
+        self._swallow_click = False
+        event.prevent_default()
+        event.stop()
+        return True
+
+    def _end_pick(self) -> None:
+        self._pick_from = self._pick_to = self._pressed_at = None
+        self._dragged = self._from_blank = False
+        self._edge = 0
+        if self._edge_timer is not None:
+            self._edge_timer.stop()
+            self._edge_timer = None
+        self.release_mouse()
+
+    def _rows_top(self) -> int:
+        """The screen line of the first row in view (under the header)."""
+        return self.scrollable_content_region.y + (self.header_height if self.show_header else 0)
+
+    def _rows_bottom(self) -> int:
+        """The screen line under the last row in view: the table's bottom, or where a
+        scrolling parent (the preview's) or the screen cuts it off."""
+        bottom = self.scrollable_content_region.bottom
+        try:
+            geometry = self.screen.find_widget(self)
+        except Exception:  # noqa: BLE001 - not laid out
+            return bottom
+        visible = geometry.region.intersection(geometry.clip)
+        return min(bottom, visible.bottom) if visible else bottom
+
+    def _on_header(self, screen_y: int) -> bool:
+        return self.show_header and self.scrollable_content_region.y <= screen_y < self._rows_top()
+
+    def _in_blank(self, screen_y: int) -> bool:
+        """Whether screen line ``screen_y`` is in the table, under its last row."""
+        top = self._rows_top()
+        return top <= screen_y < self._rows_bottom() and int(self.scroll_y) + screen_y - top >= self.row_count
+
+    def _edge_of(self, screen_y: int) -> int:
+        if screen_y < self._rows_top():
+            return -1
+        return 1 if screen_y >= self._rows_bottom() else 0
+
+    def _row_at(self, screen_y: int, *, scroll: bool = False) -> int | None:
+        """The index of the row on screen line ``screen_y`` (every row is one line);
+        None on the header and under the last row, or above or below the table, without
+        ``scroll``. With ``scroll``, past the top or the bottom the table scrolls a row,
+        and it is the row that came into view."""
+        if not self.row_count:
+            return None
+        top, bottom = self._rows_top(), self._rows_bottom()
+        first = int(self.scroll_y)  # the header stays put: rows scroll under it
+        last = first + max(0, bottom - top) - 1
+        if screen_y < top or screen_y >= bottom:
+            if not scroll:
+                return None
+            row = max(0, first - 1) if screen_y < top else last + 1
+            if row > last and self.scroll_y >= self.max_scroll_y:
+                row = last  # the table can't scroll on (a parent cuts it off): the last row in view
+        else:
+            row = first + screen_y - top
+            if not scroll and row >= self.row_count:
+                return None  # the blank under the last row
+        row = min(row, self.row_count - 1)
+        if row < first or row > last:
+            self.scroll_to(y=row if row < first else first + row - last, animate=False)
+        return row
+
+    def _set_picked(self, keys) -> None:
+        picked = frozenset(keys)
+        if picked != self._picked:
+            self._picked = picked
+            self._restyle()
+
+    def clear_picked(self) -> None:
+        if self._picked:
+            self._picked = frozenset()
+            self._restyle()
+
+    def picked_keys(self) -> list:
+        """The rows a drag picked that the table still has, in its order."""
+        if not self._picked:
+            return []
+        return [row.key for row in self.ordered_rows if row.key in self._picked]
+
+    def picked_text(self) -> tuple[str, str] | None:
+        """``(text, what)`` for the rows a drag picked; None when there are none."""
+        keys = self.picked_keys()
+        if not keys:
+            return None
+        ids = " with whole ids" if callable(getattr(self.screen, "whole_id", None)) else ""
+        return "\n".join(self.rows_text(keys)), f"{len(keys):,} row{'' if len(keys) == 1 else 's'}{ids}"
+
+    def _restyle(self) -> None:
+        # The table keeps each line it drew, by what it drew it from, which doesn't
+        # include the picks: drop those, so the rows are drawn again.
+        for name in ("_line_cache",):
+            cache = getattr(self, name, None)
+            if cache is not None:
+                cache.clear()
+        self.refresh()
+
+    def _render_line_in_row(self, row_key, line_no, base_style, cursor_location, hover_location):
+        fixed, scrollable = super()._render_line_in_row(row_key, line_no, base_style, cursor_location,
+                                                        hover_location)
+        if row_key not in self._picked or self._row_locations.get(row_key) == cursor_location.row:
+            return fixed, scrollable  # the cursor's row shows the cursor
+        # Over every cell, the fixed ones and the hovered one too. The highlight's
+        # background only: its text colour is "keep the text's", which a row's plain
+        # cells would take for the background's.
+        on = Style(bgcolor=self.screen.get_component_rich_style("screen--selection").bgcolor)
+        return ([list(Segment.apply_style(cell, post_style=on)) for cell in fixed],
+                [list(Segment.apply_style(cell, post_style=on)) for cell in scrollable])
+
+    def rows_text(self, keys=None) -> list:
+        """The header and the rows (``keys``, else every one), as aligned lines. Where
+        the screen has a ``whole_id`` for a row (an id column cuts ids short), a last
+        column has it."""
+        whole_id = getattr(self.screen, "whole_id", None)
+        extra = ["Whole ID"] if callable(whole_id) else []
+        rows = [[str(column.label) for column in self.ordered_columns] + extra]
+        for key in keys if keys is not None else [row.key for row in self.ordered_rows]:
+            cells = [str(cell) for cell in self.get_row(key)]
+            rows.append(cells + ([whole_id(key.value) or ""] if extra else []))
+        return aligned(rows)
+
+
+class _JobTable(PickableTable):
     """The job list's table. Home and End go to the first and the last job. → unfolds
     the highlighted job's sub-jobs and ← folds them (on a sub-job row, its job's);
     where there is nothing to unfold or fold they scroll sideways, the marker and
     the name staying in place. A click on a job's ▸/▾ marker unfolds or folds it.
-    The screen does the unfolding (see :meth:`JobListScreen.unfold_highlighted`)."""
+    The screen does the unfolding (see :meth:`JobListScreen.unfold_highlighted`).
+    A drag over rows picks them (see :class:`PickableTable`)."""
 
     BINDINGS = [
         Binding("home", "first_job", "First job", show=False),
@@ -540,7 +916,10 @@ class _JobTable(DataTable):
     def on_click(self, event: events.Click) -> None:
         """A click on a job's ▸/▾ marker unfolds or folds that job, and puts the
         cursor on it; any other click is the table's own (it highlights the row,
-        and a click on the highlighted cell opens it)."""
+        and a click on the highlighted cell opens it). The click Textual sends at
+        the end of a drag that picked rows is none of these."""
+        if self.swallowed(event):
+            return
         key = self._marker_at(event)
         toggle = getattr(self.screen, "toggle_job_at", None)
         if key is not None and callable(toggle) and toggle(key):
@@ -612,7 +991,7 @@ class _JobTable(DataTable):
     _FAST_FILL = ("_data", "_row_locations", "_require_update_dimensions", "_update_count", "_highlight_cursor")
 
 
-class JobListScreen(Screen):
+class JobListScreen(FollowsPointer, Screen):
     """Every job in the retention window: live first, then history, with sub-job rows.
 
     The jobs are the configured schema's; ``a`` switches to the account-wide list
@@ -639,6 +1018,9 @@ class JobListScreen(Screen):
     BINDINGS = [
         ("q", "quit", "Quit"),
         KEYS_BINDING,
+        # c: what the mouse highlighted, else everything (see action_copy_text); ctrl+c
+        # and a right-click do the same.
+        ("c", "copy_text", "Copy"),
         # Priority: the app runs these as each key arrives, so the keys typed right
         # after /, Esc or Enter go where that key sends the focus, in the order
         # typed. A plain binding runs only once the key has passed through the
@@ -653,7 +1035,7 @@ class JobListScreen(Screen):
         # a: the account-wide list, or back to the configured schema's. The footer
         # names where it goes (check_action shows one of the two), so it is the button.
         Binding("a", "show_list('account')", "All schemas"),
-        Binding("a", "show_list('schema')", "This schema"),
+        Binding("a", "show_list('schema')", "Current schema"),
         ("s", "cycle_sort", "Sort"),
         ("o", "toggle_order", "Order"),
         ("e", "expand_all", "Expand/collapse all"),
@@ -920,7 +1302,7 @@ class JobListScreen(Screen):
         # (The subtitle is drawn as plain text, never markup.)
         keys = "↑/↓, Enter · →/← sub-jobs · / search · s sort · o order"
         if not self._lister.schema_only:
-            keys += " · a this schema" if self._account_wanted() else " · a all schemas"
+            keys += " · a current schema" if self._account_wanted() else " · a all schemas"
         bits = [refresh_status, self._scope_text(), f"select a job ({keys} · r refresh)"]
         self.app.sub_title = "  ·  ".join(bit for bit in bits if bit)
 
@@ -961,7 +1343,7 @@ class JobListScreen(Screen):
             return
         self._lister.account_wide = account
         # Until the account-wide list is on screen: if its load doesn't bring it,
-        # the list stays on this schema and says why (see _on_jobs).
+        # the list stays on the current schema and says why (see _on_jobs).
         self._asked = account
         self.refresh_bindings()  # the footer's a names the other list now
         self._update_subtitle()
@@ -1050,6 +1432,21 @@ class JobListScreen(Screen):
     def action_toggle_order(self) -> None:
         self._descending = not self._descending
         self._render_jobs(top=True)
+
+    def whole_id(self, key) -> str | None:
+        """The whole id of the job or sub-job on row ``key`` (the Job ID column cuts it short)."""
+        if key in self._job_by_item:
+            return self._job_by_item[key]
+        sub = self._sub_by_item.get(key)  # (job id, sub-job id)
+        if sub:
+            return sub[1] if len(sub) > 1 and sub[1] else sub[0]
+        return None
+
+    def action_copy_text(self) -> None:
+        """``c`` (ctrl+c, a right-click): what the mouse highlighted (text, or the rows a
+        drag picked), else everything the screen shows, the whole list with whole ids."""
+        if not self.app.copy_highlight(self):
+            self.app.copy_everything(self)
 
     def _highlighted(self) -> tuple:
         table = self.query_one("#jobs", DataTable)
@@ -1920,6 +2317,8 @@ class FittedFooter(Footer):
         return units, palette
 
     def _fit(self) -> None:
+        for label in self.query(FooterLabel):
+            label.ALLOW_SELECT = False  # a group's name ("Tabs") isn't text to copy, as the keys aren't
         units, palette = self._units()
         if not units or self.region.width <= 0:
             return
@@ -1981,11 +2380,7 @@ class _ResourceList(ListView):
             moved(new_index)
 
 
-# The footer's one entry for the Resources tab's < and > ("<> Sub-job").
-_SUB_JOBS = Binding.Group("Sub-job", compact=True)
-
-
-class LogScreen(Screen):
+class LogScreen(FollowsPointer, Screen):
     """Read-only Logs and Resource dashboard for one job."""
 
     CSS = """
@@ -2005,21 +2400,26 @@ class LogScreen(Screen):
         # Priority, as on the job list: the keys typed right after / reach the
         # filter box in order (check_action leaves / to a focused text box).
         Binding("/", "filter", "Filter", priority=True),
-        ("L", "cycle_level", "Level"),
+        # l on Logs; elsewhere in the job details l opens Logs (check_action turns this off there).
+        ("l", "cycle_level", "Level"),
+        Binding("L", "cycle_level", "Level", show=False),  # the key it had before
         ("p", "toggle_pause", "Pause"),
         ("s", "save_log", "Save"),
-        ("y", "copy_log", "Copy all"),
-        Binding("c", "copy_text", "Copy sel", show=False),
+        # On every tab: what the mouse highlighted, else everything (see action_copy_text);
+        # ctrl+c and a right-click do the same.
+        ("c", "copy_text", "Copy"),
         ("r", "refresh_sources", "Refresh"),
         Binding("[", "shrink_sources", "Narrower", show=False),
         Binding("]", "grow_sources", "Wider", show=False),
         # Resources: the next window. Declared here, ahead of the sub-job keys, so the
         # footer keeps it there: a subclass's binding for a key takes this one's place.
         Binding("w", "cycle_window", "Window"),
-        # Resources: the previous or next sub-job, one footer entry ("<> Sub-job"), shown
-        # there with two or more sub-jobs (see check_action).
-        Binding("less_than_sign", "resource_sub_job(-1)", "Prev sub-job", key_display="<", group=_SUB_JOBS),
-        Binding("greater_than_sign", "resource_sub_job(1)", "Next sub-job", key_display=">", group=_SUB_JOBS),
+        # Resources: Space shows the next sub-job (round to the first after the last), no Shift
+        # needed; shown there with two or more sub-jobs (see check_action). < and > (and , and .)
+        # still go back and forth.
+        Binding("space", "resource_sub_job(1)", "Sub-job", key_display="space"),
+        Binding("less_than_sign", "resource_sub_job(-1)", "Prev sub-job", key_display="<", show=False),
+        Binding("greater_than_sign", "resource_sub_job(1)", "Next sub-job", key_display=">", show=False),
         Binding("comma", "resource_sub_job(-1)", "Prev sub-job", show=False),
         Binding("full_stop", "resource_sub_job(1)", "Next sub-job", show=False),
         # Resources: back from one GPU's or node's charts to the mean across them (shown while one is).
@@ -2101,6 +2501,7 @@ class LogScreen(Screen):
         self._resource_kind = GPU
         self._resource_kind_pref = GPU
         self._resource_unit: int | None = None
+        self._resource_drawn: tuple | None = None  # (sub-job, view, unit, window) last drawn
         self._resource_on_view = False  # the panel's highlight is on a view's entry, not a unit's
         self._resource_shown: str | None = None  # the sub-job the panel and unit were set for
         self._resource_settled: str | None = None  # ... and whose view was chosen (see _follow_resource_source)
@@ -2149,7 +2550,8 @@ class LogScreen(Screen):
         """Body of the Resource tab (subclasses with more tabs reuse it).
 
         The panel on the left lists the views and the shown view's units; the
-        pane beside it scrolls through the header, the stats and every chart.
+        pane beside it scrolls through the stats and every chart under its header,
+        which stays on top (it names the sub-job, wherever the pane is scrolled).
         """
         with Horizontal(id="resource-body"):
             yield _ResourceList(id="resource-list")
@@ -2167,6 +2569,7 @@ class LogScreen(Screen):
         self._apply_sources_width()
         self._update_subtitle()
         self._load_sources()
+        self._prune_other_metrics()
         after_refresh(self, self._focus_active_tab)
         self.set_interval(self._IDLE_CHECK_SECONDS, self._check_idle)
 
@@ -2215,6 +2618,7 @@ class LogScreen(Screen):
         if event.tabbed_content.active != event.pane.id or not self._screen_open:
             return  # (or a tab key just before a back key: the screen is being removed)
         self._active_tab = event.pane.id or "logs"
+        self.clear_selection()  # what was highlighted is on the tab left behind
         self._sync_footer()
         self.refresh_bindings()  # < and > show on Resources only
         self._update_subtitle()  # the Logs tab's state shows only on Logs
@@ -2835,7 +3239,7 @@ class LogScreen(Screen):
         length (a refresh starting, the age ticking past a minute). Each line drops
         detail until it fits ``width``, in a fixed order (see :func:`_fit_line`).
         On the first, the sub-job's place among the job's sub-jobs goes short
-        (``1 of 2 · < > switch`` to ``1/2``), then the window to its key's name and
+        (``1 of 2 · space switches`` to ``1/2``), then the window to its key's name and
         then away (the stats name it), then the place, then the GPU type (or, in
         the System view, the nodes' CPUs and memory). The first line names the GPUs (requested and
         reporting) in the GPU view, the nodes in the System view. On the second,
@@ -2865,7 +3269,7 @@ class LogScreen(Screen):
         values["label"] = views.sub_job_label(source) if source else ""
         if source in ids and len(ids) > 1:
             values.update(position=f"{ids.index(source) + 1} of {len(ids)}", pos=f"{ids.index(source) + 1}/{len(ids)}")
-            source_forms = [("[b]$label[/b] ($position · < > switch)", 0), ("[b]$label[/b] ($pos)", 0),
+            source_forms = [("[b]$label[/b] ($position · space switches)", 0), ("[b]$label[/b] ($pos)", 0),
                             ("[b]$label[/b]", 0)]
         else:
             source_forms = [("[b]$label[/b]", 0)]
@@ -2950,7 +3354,7 @@ class LogScreen(Screen):
         """
         extra = []
         if len(self._resource_sub_job_ids()) > 1:
-            extra.append("< > sub-job")
+            extra.append("space sub-job")
         resource = self._resource_kind_data()
         if resource is not None and len(resource.units) > 1:
             extra.append("↑↓ GPU" if self._resource_kind == GPU else "↑↓ node")
@@ -2988,8 +3392,8 @@ class LogScreen(Screen):
         gap = self._RESOURCE_CHART_GAP
         column = max(1, (width - gap * (per_row - 1)) // per_row)
         bars = self._resource_bar_rows()
-        sub_job = views.sub_job_label(self._resource_source() or "")
-        bases = [f"{sub_job} · {metric.name} · {window_label(view.name)}" for metric in metrics]
+        # The header, pinned above them, names the sub-job: the titles needn't.
+        bases = [f"{metric.name} · {window_label(view.name)}" for metric in metrics]
         titles = [f"{base} · {view.label}" if view.label else base for base in bases]
         if any(views.cell_width(title) > column for title in titles):
             titles = [views.fit_cells(base, column) for base in bases]
@@ -3039,6 +3443,12 @@ class LogScreen(Screen):
         now = datetime.now(timezone.utc)
         self._follow_resource_source(source)
         resource = self._resource_kind_data() if source else None
+        drawn = (source, self._resource_kind, self._resource_unit, self._resource_range)
+        if drawn != self._resource_drawn:
+            # Another sub-job, view, GPU or node, or window: a highlight would sit over
+            # other text, or past the end of a shorter block.
+            self._resource_drawn = drawn
+            self.clear_selection()
         if self._resource_unit is not None and (resource is None or self._resource_unit not in resource.unit_ids):
             self._resource_unit = None  # not one of this view's units (any more)
             self.refresh_bindings()
@@ -3212,7 +3622,7 @@ class LogScreen(Screen):
         self._render_log_status()
 
     # ─── export / copy ───────────────────────────────────────────────────
-    # The most ``y`` sends to the terminal's clipboard. OSC 52 carries the text
+    # The most ``c`` copies of a log. OSC 52 carries the text
     # base64-encoded in one escape sequence; many terminals drop a much bigger
     # one without a word, and writing it holds the screen up meanwhile.
     _COPY_MAX_BYTES = 1024 * 1024
@@ -3260,10 +3670,10 @@ class LogScreen(Screen):
         safe = "".join(ch if ch.isalnum() or ch in "-_." else "-" for ch in rest).strip(".-") or "log"
         return os.path.expanduser(f"~/cortex-training-{job[:8]}-{safe}.log")
 
-    _EXPORT_NOTE_SECONDS = 15  # how long what s or y did stays on the status line
+    _EXPORT_NOTE_SECONDS = 15  # how long what s did stays on the status line
 
     def _show_export_note(self, text: str) -> None:
-        """UI thread. What s or y did, on the status line (not in the log), for a while."""
+        """UI thread. What s did, on the status line (not in the log), for a while."""
         self._export_note = text
         self._render_log_status()
         if self._export_timer is not None:
@@ -3305,11 +3715,6 @@ class LogScreen(Screen):
             msg = f"save failed: {exc}"
         self._post(self._show_export_note, msg)
 
-    def action_copy_log(self) -> None:
-        if not self._logs_active():
-            return
-        self._copy_log()
-
     @work(thread=True, exclusive=True, group="copy")
     def _copy_log(self) -> None:
         exported = self._take_export()
@@ -3317,7 +3722,7 @@ class LogScreen(Screen):
             return
         _src, _path, text = exported
         if not text:
-            self._post(self._show_export_note, "nothing to copy yet for this sub-job")
+            self._post(self.notify, "nothing to copy yet for this sub-job", timeout=3)
             return
         # Without escape sequences or control characters: pasted into another
         # terminal, those would act there. The newest lines, up to the cap.
@@ -3330,24 +3735,29 @@ class LogScreen(Screen):
                 break
             kept.append(line)
         kept.reverse()
-        if not self._post(self.app.copy_to_clipboard, "\n".join(kept)):
-            return
-        # The terminal may still refuse it (some ignore clipboard writes): say what was sent, not that it landed.
-        if len(kept) < len(lines):
-            msg = (f"sent the last {self._count(len(kept), 'line')} to the terminal's clipboard "
-                   f"(of {len(lines):,}; s saves them all)")
-        else:
-            msg = f"sent {self._count(len(kept), 'line')} to the terminal's clipboard"
-        self._post(self._show_export_note, msg)
+        what = (f"the log's last {self._count(len(kept), 'line')} (of {len(lines):,}; s saves them all)"
+                if len(kept) < len(lines) else f"the whole log ({self._count(len(kept), 'line')})")
+        self._post(self.app.copy_out, "\n".join(kept), what)
 
     def action_copy_text(self) -> None:
-        if not self._logs_active():
+        """``c`` (ctrl+c, a right-click), on every tab: what the mouse highlighted, else
+        everything the tab holds: the log (its newest lines, up to the cap) on Logs; on
+        Resources the panel, the header, every stats row and every chart."""
+        if self.app.copy_highlight(self):
             return
-        if self.get_selected_text() is None:
-            # Say so rather than nothing: c copies a selection, y the whole log.
-            self.notify("Nothing selected: drag over log lines to select them, or press y to copy the whole log.")
-            return
-        super().action_copy_text()
+        if self.query(HelpPanel):
+            self.app.copy_everything(self)  # the key list, with the tab beside it
+        elif self._logs_active():
+            self._copy_log()
+        else:
+            self.app.copy_everything(self, "the Resources tab")
+
+    @work(thread=True, group="prune-metrics")
+    def _prune_other_metrics(self) -> None:
+        # One job's telemetry on disk at a time: opening this job removes every other
+        # job's (it downloads again when that job's Resources tab is next shown).
+        removed = prune_metrics(root=self._metrics_root.parent.parent.parent, keep=self._metrics_root)
+        forget_resource_loaders(removed)
 
     @work(thread=True, exclusive=True, group="sources")
     def _load_sources(self) -> None:
@@ -4835,6 +5245,9 @@ class LogScreen(Screen):
         return sum(len(piece.splitlines()) for piece in pieces)
 
     def _clear_pane(self) -> None:
+        # The pane is drawn again (another sub-job, filter or level): a highlight on the
+        # old lines would sit over other text, at the same line numbers.
+        self.clear_selection()
         self._shown_lines = []
         self._shown_rows = []
         self._rows_total = 0
@@ -5027,7 +5440,8 @@ class CortexTrainingLogTUI(App):
     /* The pane scrolls; its gutter is kept so the width the stats and charts are drawn
        to never changes when it starts or stops scrolling. */
     #resource-pane { height: 1fr; padding: 0 1; scrollbar-gutter: stable; scrollbar-size-vertical: 1; }
-    #resource-status { color: $text-muted; height: auto; }
+    /* Docked: the header stays on top while the stats and charts scroll under it. */
+    #resource-status { color: $text-muted; height: auto; dock: top; }
     #resource-stats { height: auto; margin-top: 1; }
     /* Drawn to the pane's width: a line that is momentarily wider (before a resize
        settles) is clipped, never wrapped into taller charts. */
@@ -5050,11 +5464,21 @@ class CortexTrainingLogTUI(App):
         background: $block-cursor-blurred-background;
         color: $block-cursor-blurred-foreground;
     }
+    /* A note ("copied 3 lines") is one row at the right end of the title row: not
+       over what the screen shows (a press on a note goes to the note, so the text
+       under it couldn't be highlighted while it showed), nor over the footer's keys. */
+    ToastRack { dock: top; align: right top; margin-bottom: 0; scrollbar-size-vertical: 0; }
+    Toast.-information { padding: 0 1; margin-top: 0; width: auto; max-width: 80%; }
     """
     # A priority binding acts as the key arrives, before the focused widget sees it:
     # q quits even while the screens work through a burst of keys. It stands
     # aside while a text box has focus (check_action), so q still types there.
-    BINDINGS = [Binding("q", "quit", "Quit", priority=True)]
+    BINDINGS = [
+        Binding("q", "quit", "Quit", priority=True),
+        # c copies on every screen: each of the TUI's own copies what the mouse highlighted,
+        # else everything it shows (ctrl+c, Textual's key for it, and a right-click do the same).
+        Binding("c", "screen.copy_text", "Copy", show=False),
+    ]
     # How the client connects, set by `cortex-training tui` (never a secret), so
     # the commands the TUI shows to copy connect the same way; None when unknown
     # (the demo, tests). See views.sign_in_options.
@@ -5080,12 +5504,109 @@ class CortexTrainingLogTUI(App):
         self._clients = JobClients(client)
         self._lister = JobLister(client, schema_only=schema_only)
         self._heap_frozen = False
+        # A left-button press that can start a text selection, whether it has moved since,
+        # and whether the mouse-up that ended it was a drag (see on_event, on_text_selected).
+        self._press_at = None
+        self._press_selects = False
+        self._press_moved = False
+        self._copy_selection = False
+        self._copy_note: Notification | None = None  # the last copy's note (see copy_out)
+        self._copy_noted = False  # while copy_out copies: it says what it copied itself
+        self._press_input: Input | None = None  # a text box a left-button press went to
+        self._press_table = False  # a press on a table, which tells its own clicks from its drags
+        self._dragged = False  # the last press moved before its release
+        self._confine: Widget | None = None  # the scrolling area a drag stays in (see _confine_drag)
+        self._footer_down: tuple | None = None  # (footer key, button) pressed (see _footer_click)
         self.title = "cortex training"
 
     def check_action(self, action: str, parameters) -> bool | None:
         if action == "quit" and isinstance(self.focused, Input):
             return False  # a letter in a search, filter or prompt
         return True
+
+    def copy_to_clipboard(self, text: str) -> bool:
+        """The terminal's clipboard (OSC 52, which some terminals ignore) and this
+        machine's (see :mod:`cortex_training.tui.clipboard`). True when this machine's
+        took it. Nothing to copy leaves the clipboard as it was. Textual's own copies
+        (ctrl+c in a text box) come here too, and say so as the TUI's do."""
+        if not text:
+            return False
+        super().copy_to_clipboard(text)
+        local = copy_local(text)
+        if not self._copy_noted:
+            self._note_copy(copied_note(f"{len(text):,} characters", local), local)
+        return local
+
+    _COPY_NOTE_SECONDS = 3
+    _BLOCK_COPY_SECONDS = 0.15  # after a click, when a double or triple click's block is copied
+    _SENT_NOTE_SECONDS = 8  # the note when only the terminal's clipboard got it: longer, with a tip
+
+    def copy_out(self, text: str, what: str) -> None:
+        """Copy ``text`` and say so: ``what`` names it ("3 lines")."""
+        self._copy_noted = True
+        try:
+            local = self.copy_to_clipboard(safe_text(text))
+        finally:
+            self._copy_noted = False
+        self._note_copy(copied_note(what, local), local)
+
+    def _note_copy(self, message: str, local: bool = True) -> None:
+        note = Notification(message, timeout=self._COPY_NOTE_SECONDS if local else self._SENT_NOTE_SECONDS)
+        # One copy's note at a time: the last one's, still showing, would stack beside
+        # it. Added now, not as a message, so two copies in one burst of keys replace
+        # each other too.
+        previous, self._copy_note = self._copy_note, note
+        try:
+            if previous is not None:
+                if previous in self._notifications:
+                    self._unnotify(previous, refresh=False)
+                self._drop_note(previous)
+            self._notifications.add(note)
+            self._refresh_notifications()
+        except Exception:  # noqa: BLE001 - another Textual keeps its notes otherwise: as a message
+            self.post_message(Notify(note))
+
+    def _drop_note(self, note: Notification) -> None:
+        """Remove what holds ``note`` on screen. Textual removes a replaced note but not
+        the row it sat in (its timer would have), and each such empty row pushed the
+        next note one row further down, over the screen."""
+        for screen in self.screen_stack:
+            for rack in screen.query(ToastRack):
+                try:
+                    rack.get_child_by_id(ToastRack._toast_id(note)).remove()
+                except NoMatches:
+                    pass
+
+    def copy_highlight(self, screen: Screen) -> bool:
+        """Copy what the mouse highlighted on ``screen``: text, else the rows a drag
+        picked in a table (see :class:`PickableTable`). False when nothing is."""
+        text = selected_text(screen)
+        if text:
+            lines = text.count("\n") + 1
+            self.copy_out(text, f"{lines:,} lines" if lines > 1 else f"{len(text):,} characters")
+            return True
+        for table in screen.query(PickableTable):
+            found = table.picked_text()
+            if found:
+                self.copy_out(*found)
+                return True
+        return False
+
+    def copy_everything(self, screen: Screen, what: str = "everything on the screen") -> None:
+        """Copy all ``screen`` holds, as text, with what is scrolled out of view (see
+        :func:`cortex_training.tui.clipboard.screen_dump`)."""
+        text = screen_dump(screen)
+        self.copy_out(text, f"{what} ({text.count(chr(10)) + 1 if text else 0:,} lines)")
+
+    def on_text_selected(self, event) -> None:
+        """Highlighting is copying: what a drag over text selected goes to the clipboard
+        when the button comes up, on every screen, so Cmd-V (or right-click, paste)
+        has it. Textual sends this on every mouse-up: a click, or a drag that began on
+        a scrollbar, a table or a note, copies nothing (see on_event)."""
+        if self._copy_selection:
+            self._copy_selection = False
+            if selected_text(self.screen):
+                self.copy_highlight(self.screen)
 
     def action_toggle_keys(self) -> None:
         """``?``: show the keys panel, or close it."""
@@ -5139,7 +5660,15 @@ class CortexTrainingLogTUI(App):
 
     def on_mount(self) -> None:
         # Before any screen starts a worker: quit must not wait for them.
-        asyncio.get_running_loop().set_default_executor(_DaemonThreadExecutor())
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(_DaemonThreadExecutor())
+        # kill and a closed terminal end the app as q does, so what the run downloaded
+        # is still removed when it ends (see __main__).
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                loop.add_signal_handler(signum, self.exit)
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass  # not the main thread, or no such signal here
         if self._freezes_heap():
             # What the imports made (most of the heap until a list arrives) is
             # frozen before any screen exists, so the collections while the first
@@ -5166,7 +5695,192 @@ class CortexTrainingLogTUI(App):
         # move doesn't): LogScreen pauses its live tail after a long gap.
         if isinstance(event, _INPUT_EVENTS) and not event.is_forwarded:
             self.last_input_at = time.monotonic()
-        await super().on_event(event)
+        if not isinstance(event, events.MouseEvent) or event.is_forwarded:
+            await super().on_event(event)
+            return
+        if event.button == 3 and isinstance(event, (events.MouseDown, events.MouseUp)):
+            # A right-click copies, as c does. Textual would take it for a click:
+            # one clears the highlight, and moves a table's cursor or picks an item.
+            if isinstance(event, events.MouseUp):
+                await self.run_action("screen.copy_text")
+            return
+        self._footer_wander(event)
+        if self._footer_click(event):
+            return
+        event = self._confine_drag(event)
+        keep = not self._track_press(event)
+        kept = self.screen.selections
+        if isinstance(event, events.MouseUp) and self._dragged and not self._press_table:
+            # A drag isn't a click: Textual makes one of any press and release on one
+            # widget, which toggled the header, picked a list item or switched a tab.
+            self._mouse_down_widget = None
+        screen = self.screen
+        blank = isinstance(event, events.MouseDown) and self._on_blank(event)
+        if blank:
+            # A press on no text (the empty part of a list or a pane): Textual would
+            # select every widget in the rows dragged over, the charts beside an
+            # empty panel. It selects nothing here, and drops what was highlighted.
+            screen.ALLOW_SELECT = False
+            screen.clear_selection()
+            self._clear_picked()
+            self._press_selects = False
+        try:
+            await super().on_event(event)
+        finally:
+            if blank:
+                del screen.ALLOW_SELECT
+        if keep and kept and not self.screen.selections:
+            self.screen.selections = kept  # a click on a note or the footer: the highlight stays
+        if isinstance(event, events.MouseUp) and not self._dragged:
+            # A double or triple click selects a block (Textual's select-all): copied, as
+            # what a drag selects is, once the click has been handled (a little later
+            # when clicks come in a burst).
+            self.set_timer(self._BLOCK_COPY_SECONDS, partial(self._copy_new_selection, self.screen,
+                                                             self.screen.selections, 5))
+
+    def _footer_wander(self, event: events.MouseEvent) -> None:
+        """A press on a footer key that moves two cells along it, or off its row, is a drag:
+        its release runs nothing, wherever it comes back to."""
+        if self._footer_down is not None and isinstance(event, events.MouseMove):
+            key, button, at = self._footer_down
+            if event.screen_y != at.y or abs(event.screen_x - at.x) >= PickableTable._DRAG_CELLS:
+                self._footer_down = (key, 0, at)  # no button runs it now
+
+    def _footer_click(self, event: events.MouseEvent) -> bool:
+        """A footer key runs when it is clicked: pressed and released on it, the pointer
+        all but still. Textual runs it on the press, so a drag that began on q Quit quit.
+        True for the press and the release there, which nothing else sees (a highlight
+        stays for c Copy)."""
+        if isinstance(event, events.MouseDown):
+            key = self._footer_key_at(event)
+            self._footer_down = (key, event.button, event.screen_offset) if key is not None else None
+            return key is not None
+        if isinstance(event, events.MouseUp) and self._footer_down is not None:
+            (key, button, at), self._footer_down = self._footer_down, None
+            # As on a table's rows: a hand that moved two cells along the key, or off its row, dragged.
+            still = event.screen_y == at.y and abs(event.screen_x - at.x) < PickableTable._DRAG_CELLS
+            if button == 1 and still and self._footer_key_at(event) is key:
+                if getattr(key, "_disabled", False):
+                    self.bell()
+                else:
+                    self.simulate_key(key.key)
+            return True
+        return False
+
+    def _footer_key_at(self, event: events.MouseEvent) -> FooterKey | None:
+        try:
+            widget, _region = self.screen.get_widget_at(event.x, event.y)
+        except Exception:  # noqa: BLE001 - NoWidget: nothing there
+            return None
+        return next((node for node in widget.ancestors_with_self if isinstance(node, FooterKey)), None)
+
+    def _confine_drag(self, event: events.MouseEvent) -> events.MouseEvent:
+        """A drag that starts in a scrolling area (the log, a list, the Resources pane, the
+        preview) stays in it: past its edges the pointer counts as at the edge, where
+        Textual scrolls the area (see :class:`FollowsPointer`). Textual would otherwise
+        select every widget between the two ends, a log from its very first line, and a
+        press on the log's padding took its offset from the top of the log."""
+        if isinstance(event, events.MouseDown):
+            self._confine = None
+            if event.button in (1, 2) and not self.mouse_captured:
+                widget, _offset = self.screen.get_widget_and_offset_at(event.x, event.y)
+                if widget is not None:
+                    self._quiet_keys_panel(widget)
+                if widget is not None and widget.allow_select:
+                    self._confine = scroll_area(widget)
+        area = self._confine
+        if isinstance(event, events.MouseUp):
+            self._confine = None
+        if area is None or not area.is_attached:
+            return event
+        region = scrolling_region(area)
+        if not region:
+            return event
+        x = min(max(event.x, region.x), region.right - 1)
+        y = min(max(event.y, region.y), region.bottom - 1)
+        if (x, y) == (event.x, event.y):
+            return event
+        return event.__class__(event.widget, x, y, event.delta_x, event.delta_y, event.button, event.shift,
+                               event.meta, event.ctrl, screen_x=x, screen_y=y, style=event.style)
+
+    @staticmethod
+    def _quiet_keys_panel(widget: Widget) -> None:
+        """The keys panel's table can't be selected (it is drawn as one Rich table), and a
+        drag from the panel selected what was beside it: the panel takes no drags."""
+        panel = next((node for node in widget.ancestors_with_self if isinstance(node, HelpPanel)), None)
+        if panel is not None and panel.ALLOW_SELECT:
+            for node in (panel, *panel.query("*")):
+                node.ALLOW_SELECT = False
+
+    def _track_press(self, event: events.MouseEvent) -> bool:
+        """Follow a press (left or middle button) to its mouse-up: whether it dragged over
+        text (on_text_selected copies it), or was a click, which drops rows a drag picked
+        in a table, as it drops a highlight. False for a click on a note or the footer."""
+        if event.button not in (1, 2) and not isinstance(event, events.MouseMove):
+            return True
+        if isinstance(event, events.MouseDown):
+            widget, _offset = self.screen.get_widget_and_offset_at(event.x, event.y)
+            self._press_at = event.screen_offset
+            self._press_moved = self._dragged = False
+            self._press_table = isinstance(widget, PickableTable)
+            # A text box selects its own text with the mouse (see on_event's mouse-up).
+            self._press_input = widget if isinstance(widget, Input) else None
+            # As Textual decides it: a selection starts on a widget that allows one.
+            self._press_selects = (widget is not None and widget.allow_select and not self.mouse_captured
+                                   and self.screen.allow_select and self.ALLOW_SELECT)
+            if self._press_selects:
+                self._clear_picked()  # one highlight at a time
+        elif isinstance(event, events.MouseMove):
+            if self._press_at is not None and event.button in (1, 2) and event.screen_offset != self._press_at:
+                self._press_moved = True
+        elif isinstance(event, events.MouseUp):
+            pressed, self._press_at = self._press_at, None
+            self._dragged = pressed is not None and self._press_moved
+            self._copy_selection = self._dragged and self._press_selects
+            box, self._press_input = self._press_input, None
+            if self._dragged and box is not None:
+                # A drag in a text box selected some of its text: copied too, once the box has it.
+                self.call_after_refresh(self._copy_box_selection, box)
+            if pressed is not None and not self._press_moved:
+                if self._on_footer(event):
+                    return False
+                widget, _offset = self.screen.get_widget_and_offset_at(event.x, event.y)
+                if widget is None or not widget.has_class("-textual-system"):
+                    self._clear_picked()  # as Textual keeps a highlight on a scrollbar click
+        return True
+
+    def _on_blank(self, event: events.MouseEvent) -> bool:
+        """Whether ``event`` (as confined) is on no text: an empty part of a list or a pane
+        (not an empty line of the log, which is text with nothing on it)."""
+        if self.mouse_captured:
+            return False
+        widget, offset = self.screen.get_widget_and_offset_at(event.x, event.y)
+        return widget is not None and offset is None and widget.is_container and widget.allow_select
+
+    def _copy_new_selection(self, screen: Screen, after_click, tries: int = 0) -> None:
+        if screen is not self.screen or self._press_at is not None:
+            return  # another screen, or another press since
+        if screen.selections and screen.selections is not after_click:
+            self.copy_highlight(screen)
+        elif tries:  # the click may not have been handled yet
+            self.set_timer(self._BLOCK_COPY_SECONDS, partial(self._copy_new_selection, screen, after_click, tries - 1))
+
+    def _copy_box_selection(self, box: Input) -> None:
+        text = box.selected_text if box.is_attached else ""
+        if text:
+            self.copy_out(text, f"{len(text):,} characters")
+
+    def _clear_picked(self) -> None:
+        for table in self.screen.query(PickableTable):
+            table.clear_picked()
+
+    def _on_footer(self, event: events.MouseEvent) -> bool:
+        """Whether ``event`` is on the footer (out of its keys) or on a note."""
+        try:
+            widget, _region = self.screen.get_widget_at(event.x, event.y)
+        except Exception:  # noqa: BLE001 - NoWidget: nothing there
+            return False
+        return any(isinstance(node, (Footer, Toast)) for node in widget.ancestors_with_self)
 
 
 _INPUT_EVENTS = (events.Key, events.MouseDown, events.MouseScrollDown, events.MouseScrollUp, events.Paste)

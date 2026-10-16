@@ -54,8 +54,10 @@ from textual.widgets import TabPane
 from cortex_training.tui import views as v
 from cortex_training.tui.app import KEYS_BINDING
 from cortex_training.tui.app import FittedFooter
+from cortex_training.tui.app import FollowsPointer
 from cortex_training.tui.app import JobTabs
 from cortex_training.tui.app import LogScreen
+from cortex_training.tui.app import PickableTable
 from cortex_training.tui.app import after_refresh
 from cortex_training.tui.app import call_on_screen
 from cortex_training.tui.app import close_keys_panel
@@ -214,10 +216,15 @@ def _update_if_changed(static: Static, content: Content) -> None:
         static.update(content)
 
 
-class PromptScreen(ModalScreen):
+class PromptScreen(FollowsPointer, ModalScreen):
     """One-line text prompt; dismisses with the entered text, or ``None`` on Esc."""
 
-    BINDINGS = [("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+        # Ahead of the box's own ctrl+c, which copies the text selected in it, and the
+        # box selects its text as the prompt opens: a highlight the mouse made since wins.
+        Binding("ctrl+c", "copy_text", "Copy", show=False, priority=True),
+    ]
 
     def __init__(self, title: str, value: str = "", placeholder: str = "", *, max_length: int = 0) -> None:
         """``max_length``: the most characters the text may have (0: no limit); the hint says so."""
@@ -242,6 +249,17 @@ class PromptScreen(ModalScreen):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self._finish(event.value)
 
+    def action_copy_text(self) -> None:
+        """ctrl+c or a right-click: what the mouse highlighted, else the text selected in
+        the box, else what the prompt shows (as c does on every other screen)."""
+        if self.app.copy_highlight(self):
+            return
+        box = self.query_one(Input)
+        if box.selected_text:
+            self.app.copy_out(box.selected_text, f"{len(box.selected_text):,} characters")
+        else:
+            self.app.copy_everything(self, "the prompt")
+
     def action_cancel(self) -> None:
         self._finish(None)
 
@@ -257,7 +275,7 @@ class PromptScreen(ModalScreen):
 # ─── job preview ─────────────────────────────────────────────────────────────
 
 
-class JobSummaryScreen(Screen):
+class JobSummaryScreen(FollowsPointer, Screen):
     """Preview of one job: identity, config, status, and a sub-job breakdown."""
 
     # Back, quit and the keys panel first: a narrow terminal cuts the footer's end.
@@ -266,6 +284,8 @@ class JobSummaryScreen(Screen):
         Binding("escape", "close_or_back", "Back", show=False),
         ("q", "app.quit", "Quit"),
         KEYS_BINDING,
+        # What the mouse highlighted, else the whole preview (ctrl+c and a right-click too).
+        ("c", "copy_text", "Copy"),
         ("l", "open('logs')", "Logs"),
         ("g", "open('resource')", "Resources"),
         ("n", "rename", "Name job"),
@@ -307,7 +327,7 @@ class JobSummaryScreen(Screen):
             yield Static("", id="fetch")  # reading, refreshing, or why the copy shown is older
             yield Static("", id="health")
             yield Static("", id="subjobs-title")  # names the tab Enter opens
-            yield DataTable(id="subjobs", cursor_type="row", zebra_stripes=True)
+            yield PickableTable(id="subjobs", cursor_type="row", zebra_stripes=True)  # a drag picks rows to copy
             yield Static("", id="glance")
         yield Footer()
 
@@ -749,6 +769,15 @@ class JobSummaryScreen(Screen):
             key = "all"
         return self._scope_by_row.get(key)
 
+    def whole_id(self, key) -> str | None:
+        """The whole id of the sub-job on row ``key``, the job's on the "all" row."""
+        return self._scope_by_row.get(key) or (self._job_id if key == "all" else None)
+
+    def action_copy_text(self) -> None:
+        """``c`` (ctrl+c, a right-click): what the mouse highlighted, else the whole preview."""
+        if not self.app.copy_highlight(self):
+            self.app.copy_everything(self, "the preview")
+
     def action_back(self) -> None:
         if is_shown(self):  # not while still mounting, nor the screen under a pushed one
             self.app.pop_screen()
@@ -791,7 +820,8 @@ class JobSummaryScreen(Screen):
 
 # ─── job detail (tabs) ───────────────────────────────────────────────────────
 
-_LOG_ONLY = {"save_log", "copy_log", "copy_text", "cycle_level", "toggle_pause", "shrink_sources", "grow_sources", "filter"}
+# c copies on every tab (what the mouse highlighted, else everything the tab holds): not here.
+_LOG_ONLY = {"save_log", "cycle_level", "toggle_pause", "shrink_sources", "grow_sources", "filter"}
 # Pane ids match LogScreen's ("logs", "resource"), so its tab logic applies as-is.
 _TAB_IDS = ("logs", "resource")
 _TAB_FOCUS = {"logs": "#sources", "resource": "#resource-list"}
@@ -811,20 +841,21 @@ class JobDetailScreen(LogScreen):
 
     # 2 and 3 are one footer entry ("23 Tabs"), in the places LogScreen keeps for
     # them, after Back and Quit. The preview's letters open the same tabs here;
-    # c copies a selection on Logs (check_action). w takes LogScreen's place for
-    # it, ahead of the Resources tab's sub-job keys.
+    # on Logs, l cycles the level instead (LogScreen's binding comes first, and
+    # check_action turns it off on the other tabs).
+    # w takes LogScreen's place for it, ahead of the Resources tab's sub-job keys.
     _TABS = Binding.Group("Tabs", compact=True)
     BINDINGS = [
         Binding("2", "show_tab('logs')", "Logs", group=_TABS),
         Binding("3", "show_tab('resource')", "Resources", group=_TABS),
+        # On Logs, l cycles the level (check_action turns it off elsewhere, where l opens Logs).
+        Binding("l", "cycle_level", "Level"),
         Binding("l", "show_tab('logs')", "Logs", show=False),
         Binding("g", "show_tab('resource')", "Resources", show=False),
-        Binding("c", "copy_text", "Copy selection", show=False),
         Binding("w", "cycle_window", "Window"),
         # Keep the footer readable next to the tab keys; these still work (? lists them).
         Binding("[", "shrink_sources", "Narrower", show=False),
         Binding("]", "grow_sources", "Wider", show=False),
-        Binding("y", "copy_log", "Copy all", show=False),
     ]
     _DATA_REFRESH_SECONDS = 30
     _STATUS_REFRESH_SECONDS = 60

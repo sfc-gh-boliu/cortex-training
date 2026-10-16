@@ -143,7 +143,7 @@ cortex-training --job JOB_ID load CHECKPOINT_ID --no-poll
 cortex-training tui                          # Open job list (a: all schemas)
 cortex-training tui --schema-only            # Job list of the configured schema only, no a
 cortex-training tui JOB_ID                   # Open job logs
-cortex-training tui --demo                   # Preview with synthetic jobs
+cortex-training tui --debug                  # Synthetic jobs, no connection
 cortex-training download-log JOB_ID --output-dir ./logs
 cortex-training download-log JOB_ID --log-type stdout --output-dir ./logs
 cortex-training download-metrics JOB_ID --output-dir ./metrics
@@ -787,7 +787,7 @@ after about a minute. Pressing `r` while a refresh is still reading says so.
 cortex-training tui                 # opens the job list of the configured database and schema
 cortex-training tui --schema-only   # the same, without a to switch to every database and schema
 cortex-training tui JOB_ID          # opens that job's Logs tab directly
-cortex-training tui --demo          # synthetic jobs, no connection needed
+cortex-training tui --debug         # synthetic jobs, no connection needed
 ```
 
 Without login state, pass connection details the same way as the CLI:
@@ -813,9 +813,9 @@ cortex-training tui \
 Pass `--sub-job-id JOB_ID:training:0` to scope the job details to one matching
 sub-job; without `JOB_ID`, it opens that sub-job's job. An unmatched id is
 shown as an error, with the job's sub-job ids, rather than falling back to a
-different sub-job. `--demo` runs against generated jobs and telemetry, and
+different sub-job. `--debug` runs against generated jobs and telemetry, and
 keeps its names and caches in a temporary directory; the
-title says `(demo)`. Its jobs are in three locations: the configured
+title says `(debug)`. Its jobs are in three locations: the configured
 `CORTEX_TRAINING_DB.PUBLIC`, `TEAM_DB.EXPERIMENTS`, and a lowercase
 `"sandbox"."dev"`. It runs on the wall clock: live jobs keep logging (in the
 service's line format) and reporting GPU samples every 5 seconds, with four
@@ -829,10 +829,10 @@ sub-job, jobs whose status is `SUCCEEDED`, `DONE` or `JOB_STATE_CANCELLED`, an
 `UNKNOWN` job its control plane no longer knows, a 25,000-line saved console,
 and two jobs whose Experiment this role
 can't read: one gone, and one that SQL refuses. Set
-`CORTEX_TRAINING_TUI_DEMO_ACCOUNT_LIST` to `not_deployed`,
+`CORTEX_TRAINING_TUI_DEBUG_ACCOUNT_LIST` to `not_deployed`,
 `disabled`, `forbidden` or `rest_disabled` to preview `a` where the
 account-level list is unavailable, or to `unavailable` for a list that fails
-(503); `--demo --schema-only` works too.
+(503); `--debug --schema-only` works too.
 
 #### Job list
 
@@ -841,18 +841,18 @@ current role can see in the configured database and schema (`list_jobs`).
 Press `a`, or click `a All schemas` in the footer, to list the jobs in every
 database and schema the role can see instead, from the account-level list
 ([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2cortex-training));
-the footer then offers `a This schema`, which goes back. With `--schema-only`
+the footer then offers `a Current schema`, which goes back. With `--schema-only`
 the list never leaves the configured schema and the footer has no `a`. The
 header line starts with when the list was last refreshed (`refreshing…` while
 a refresh reads), then which list is shown:
 
 | Header | The list holds |
 |---|---|
-| `this schema: DB.SCHEMA` | the jobs of the configured database and schema (`list_jobs`), as the list opens |
+| `Current schema: DB.SCHEMA` | the jobs of the configured database and schema (`list_jobs`), as the list opens |
 | `all schemas` | after `a`: the jobs in every database and schema the role can see, from the account-level list; `all schemas (all in DB.SCHEMA)` when every one of them is in the same location |
 | `newest 2,000 + every active job (more exist)` | the same, cut at the newest 2,000 because more exist, plus the active jobs created before those |
 | `first 20 pages: N jobs + every active job (more may exist)` | the same, cut after 20 pages (see below), plus the active jobs |
-| `this schema only: DB.SCHEMA (reason)` | the jobs of the configured database and schema: with `--schema-only`, or in place of the account-level list where it turned unavailable while shown (see below) |
+| `Current schema only: DB.SCHEMA (reason)` | the jobs of the configured database and schema: with `--schema-only`, or in place of the account-level list where it turned unavailable while shown (see below) |
 
 The configured schema's list is read with two retries and a 45-second read
 timeout. After `a`, each refresh reads the account-level list newest first,
@@ -896,7 +896,7 @@ from the last answer (a 503 after a 404, say).
 
 Once every location is shown, a refresh whose account-level list answers 404
 (not there, or not enabled) shows the configured database and schema in its
-place, with the reason in the header: `this schema only:
+place, with the reason in the header: `Current schema only:
 CORTEX_TRAINING_DB.PUBLIC (no account-wide list yet)` or `(account-wide list
 not enabled)`. It reads that schema's list with the same bounds. It asks the
 account-level list again at most every 10 minutes, or when you press `r` once a
@@ -910,7 +910,7 @@ own message, the list asks the configured schema once, and where that answers,
 shows its jobs with `(account-wide list: HTTP 403)` in the header and asks the
 account-level list again every 10 minutes. `--schema-only` lists only the
 configured database and schema and never asks the account-level list: the
-header says `this schema only: DB.SCHEMA (--schema-only)`.
+header says `Current schema only: DB.SCHEMA (--schema-only)`.
 
 If a refresh fails, the list on screen stays, and a red line above it says
 when it failed, why, and since when the list is from, for example `refresh
@@ -1085,9 +1085,10 @@ field help under the search box shows only while the box has focus.
 | `→` / `←` | Unfold the highlighted job's sub-jobs / fold them; on a sub-job row, `←` folds its job and moves to it. Where there is nothing to unfold or fold, they scroll the columns sideways |
 | click `▸` / `▾` | Unfold or fold that job |
 | `e` | Expand or collapse every job's sub-jobs |
-| `a` | All schemas / this schema: switch to the account-level list of every database and schema the role can see (the footer's `a All schemas`), or back to the configured one (`a This schema`); hidden with `--schema-only` |
+| `a` | All schemas / current schema: switch to the account-level list of every database and schema the role can see (the footer's `a All schemas`), or back to the configured one (`a Current schema`); hidden with `--schema-only` |
 | `n` | Name the highlighted job |
-| `r` | Refresh (the list also refreshes every 60 seconds while it is showing); while it shows the configured schema in place of the account-level list (`this schema only: DB.SCHEMA (reason)`), `r` asks that list again once a minute has passed since the last ask |
+| `c` / `ctrl+c` / right-click | Copy what is highlighted (text, or rows a drag picked, with their whole job ids), else every job in the list; the same in the preview |
+| `r` | Refresh (the list also refreshes every 60 seconds while it is showing); while it shows the configured schema in place of the account-level list (`Current schema only: DB.SCHEMA (reason)`), `r` asks that list again once a minute has passed since the last ask |
 | `?` | Show or close the keys panel |
 | `q` | Quit |
 
@@ -1181,12 +1182,12 @@ for the next tab.
 - **Logs** is the live and historical log view described below. Each line is
   tagged with the sub-job being tailed, for example `training:0 │ …`, and its
   wrapped rows line up under its text. Saved logs (`s`) and whole-log copies
-  (`y`) stay untagged.
+  (`c` with nothing highlighted) stay untagged.
 - **Resources** shows telemetry (`download_metrics`) for one sub-job at a
-  time: the one selected on the Logs tab, until `<` or `>` shows the previous
-  or next one. With two or more sub-jobs, the header names the one shown and
-  its place among them (`training #0 (1 of 2 · < > switch)`), and each chart
-  title starts with its name (`training #0 · GPU util % · …`).
+  time: the one selected on the Logs tab, until `Space` shows the next one
+  (`<` and `>` go back and forth). The tab's header names it, and stays at the top while the
+  stats and charts scroll under it; with two or more sub-jobs it also names
+  its place among them (`training #0 (1 of 2 · space switches)`).
   - A panel on the left, sized to its labels as the Logs tab's sub-job list
     is, lists the two views, `GPU Resources` and `System Resources` (the one
     shown is marked `●`), and under them the shown view's units: `ALL`, the
@@ -1244,7 +1245,7 @@ for the next tab.
   - The header is always two lines, so the stats and charts under it never
     move. On a terminal too narrow for all of it, each line drops detail
     instead of wrapping. On the first, the sub-job's place goes short
-    (`1 of 2 · < > switch` becomes `1/2`), then the window to its key's name
+    (`1 of 2 · space switches` becomes `1/2`), then the window to its key's name
     (`10m`), then away, then the place, then the GPU type (in the System
     view, the nodes' CPUs and memory). On the second, the why of the skipped
     rows, the values-change note and the newest sample's time go first, and a
@@ -1285,10 +1286,10 @@ for the next tab.
     (labeled `100%`, `50%` and `0%`); any other metric from 0 to the smallest
     1, 2, 2.5 or 5 × 10^k at or above the sub-job's highest sample of it, on
     any GPU or node (`1000 W`, `500 W`, `0 W`), so its axis doesn't move with
-    the window or the unit shown. Each title names the sub-job, the metric,
-    the window and what the values are (`training #0 · power (W) · last 10m ·
-    mean of 8 GPUs`); on a terminal too narrow for that, every title leaves
-    out what the values are (the stats name it), and a title that still
+    the window or the unit shown. Each title names the metric, the window
+    and what the values are (`power (W) · last 10m · mean of 8 GPUs`); on a
+    terminal too narrow for that, every title leaves out what the values are
+    (the stats name it), and a title that still
     doesn't fit ends in `…`, so the charts of a row stay level. A metric with
     no samples in the window says so in its chart's place.
   - For the mean across GPUs or nodes, min and max are the lowest and highest
@@ -1314,12 +1315,12 @@ for the next tab.
   - `w` cycles the window through 10 minutes (the default, for every job),
     30 minutes, 1 hour, 6 hours, and the whole job.
   - The key help stays at the bottom of the tab, with only the keys that do
-    something there: `w window 10m · 30m · 1h · 6h · all   r refresh   < >
-    sub-job   ↑↓ GPU   a all` (`< >` with two or more sub-jobs, `↑↓` with
+    something there: `w window 10m · 30m · 1h · 6h · all   r refresh   space
+    sub-job   ↑↓ GPU   a all` (`space` with two or more sub-jobs, `↑↓` with
     more than one GPU or node, `a` while one is shown). On a line too narrow
     for all of it, `w window` leaves out the windows' names, then whole
     entries are left out from the end and the line ends in `…`. The footer
-    shows `<` and `>` as one entry (`<> Sub-job`), after `w Window`, and `a`
+    shows `space Sub-job` after `w Window`, and `a`
     (`All GPUs`, `All nodes`) only while one GPU or node is shown; on a
     terminal too narrow for every key, the footer leaves out the keys that
     don't fit whole, from the right (`?` lists every key).
@@ -1337,7 +1338,10 @@ for the next tab.
     fails keeps what is cached and says `cached · refresh failed: …` in the
     warning color, with the error cut to fit the line; the TUI's error log has
     it in full. A job with no sub-jobs says so instead.
-    It is cached under `jobs/<job>/metrics/` in the TUI cache directory. The
+    It is cached under `jobs/<job>/metrics/` in the TUI cache directory, for
+    one job at a time: opening a job's details removes every other job's
+    cached telemetry, which downloads again when that job's Resources tab is
+    next shown (logs and saved consoles stay). The
     selected sub-job downloads first, and each sub-job shows as soon as its
     chunks are in. The first open of a job on a machine downloads the selected
     sub-job's chunks for the window on screen (plus three minutes) first and
@@ -1362,10 +1366,17 @@ polls only while the Logs tab is on screen: on another tab
 it stops and later resumes from where it left
 off, so no lines are lost. While a job runs, its status is also re-read every
 60 seconds, so the view switches to the saved console when the job ends.
-Logs are cached locally so reopening a job replays instantly without
-re-fetching from the server — under `~/.cache/cortex-training/` (or
-`$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`. The same
-directory holds display names and GPU telemetry.
+Logs are cached locally while the TUI runs, so reopening a job in the same
+session replays instantly without re-fetching from the server: under
+`~/.cache/cortex-training/jobs/<job>/` (or `$XDG_CACHE_HOME`), overridable with
+`CORTEX_TRAINING_TUI_CACHE_DIR`. The same directory holds display names and
+telemetry. When the TUI ends (`q`, a crash, `kill`, or a closed terminal), it
+removes everything it downloaded: every job's logs, saved consoles, telemetry
+and tail cursors (`jobs/`); display names stay. While another TUI still runs
+on the same cache, the one that ends leaves the cache to it, and the last one
+to end removes it. A TUI killed outright (`kill -9`) can't clean up, so the
+next one to start removes what it left. `--debug` uses a temporary cache of its
+own, removed when it ends.
 
 The pane draws each line as text only: escape sequences in a line (colours,
 cursor moves, clipboard or title writes) are removed and other control
@@ -1387,8 +1398,8 @@ the summary line under it.
 
 The line under the log pane is the Logs tab's status line. It appears when the
 job read is slow, when the tail is waiting, paused, or restarted, when the
-filter or level hides every line (`no lines match …`), after `s` or `y` (for
-15 seconds), or when the pane doesn't hold a sub-job's oldest lines:
+filter or level hides every line (`no lines match …`), after `s` (for 15
+seconds), or when the pane doesn't hold a sub-job's oldest lines:
 
 - **Reading the job.** The Logs tab reads the job first, for its sub-jobs and
   status. Until that read answers, the pane says `— reading job JOB_ID —`, and
@@ -1483,8 +1494,9 @@ sub-job's first, shown as soon as it is in, then the others' in the
 background, with the chunk count on the status line meanwhile. The pane says
 which sub-job's console comes first, and, for a sub-job you select before its
 console is in, that it comes with the others'. A job that ended more than 10
-minutes earlier keeps that console in the cache (`jobs/<job>/console/`), so
-reopening it is instant. The
+minutes earlier keeps that console in the cache (`jobs/<job>/console/`) for
+the rest of the session, so reopening it is instant (the cache is emptied when
+the TUI ends). The
 kept consoles of all jobs take at most 1 GiB together: past that, the ones
 opened least recently are removed (and downloaded again if opened). A
 console fetched sooner, for example right after the job ended while the view
@@ -1531,28 +1543,58 @@ key (`~/cortex-training-<job8>-<type>-<index>.log`, such as
 characters of the job id) and its own error log
 (`~/.cortex-training-errors.log`). `s` saves the sub-job's saved console, else
 the lines its tail cached, else the execution log the pane shows; with nothing
-to save it says so and writes no file. `y` copies through the terminal (OSC 52),
-which some terminals ignore or limit: it sends the newest lines up to 1 MiB,
-with escape sequences and control characters removed, and says how many it
-sent.
+to save it says so and writes no file.
+
+Copying works on every screen and tab. Highlighting is copying: drag the
+mouse over any text and it is on the clipboard when you let go, so Cmd-V (or
+the terminal's paste) pastes it; a double-click (a block) or a triple-click
+(everything around it) highlights and copies too. A drag that starts in the
+log, a list or a scrolling pane stays in it: held past its top or bottom, it
+scrolls that area and the highlight grows with it. Text can't be highlighted
+in a table, so a drag over table rows (the job list, the preview's sub-jobs)
+picks whole rows instead: they show highlighted and are copied, aligned under
+the column names, with a last column for each whole job or sub-job id (the Job
+ID column cuts it short); held past the table's top or bottom, it scrolls the
+table. A click drops a highlight; a drag is never a click (it doesn't fold a
+job, pick a list entry or run a footer key), and a footer key runs when it is
+clicked, not as it is pressed. Changing what a view shows (another tab,
+sub-job, GPU, node or window) drops its highlight.
+
+`c`, `ctrl+c` and a right-click all copy the same way: what is highlighted
+(again, without clearing it), else everything the view holds, including what
+is scrolled out of view: on Logs the whole log (its newest lines up to 1 MiB);
+on Resources the panel (each GPU's or node's value), the header, every stats
+row and every chart; on the job list every job; in the preview all of it.
+
+The TUI takes the mouse, so the terminal's own selection and its copy key
+(Cmd-C) see nothing; instead, a copy goes to this computer's clipboard
+(`pbcopy` on macOS; `wl-copy`, `xclip` or `xsel` on Linux) and to the
+terminal's (OSC 52, which reaches your own computer's clipboard over SSH,
+where some terminals ignore it). Escape sequences and control characters are
+removed, and a one-line note at the right end of the title row says what was
+copied (`copied 12 lines`), for three seconds; when only the terminal's
+clipboard could take it, the note says so, with a tip, for eight. To select
+with the terminal itself instead, hold a key while dragging: Option in iTerm2,
+Fn in macOS Terminal, Option in VS Code's terminal once
+`terminal.integrated.macOptionClickForcesSelection` is on. With the keys
+panel open, `c` copies its list of keys too.
 
 Keys in the job details view:
 
 | Key | Action |
 |-----|--------|
 | `2` `3` | Logs / Resources tab |
-| `l` `g` | The same tabs, as in the preview |
+| `l` `g` | The same tabs, as in the preview, except `l` on Logs (below) |
 | `t` | Next tab |
 | `w` | Cycle the window (Resources) |
-| `<` / `>` | Previous / next sub-job, when the job has two or more; the view stays, back to `ALL` (Resources) |
+| `Space` | Next sub-job, round to the first after the last, when the job has two or more; the view stays, back to `ALL`. `<` / `>` go back / forward (Resources) |
 | `↑` `↓` | Pick GPU Resources or System Resources, `ALL` or one GPU or node in the panel; the charts follow the highlight (Resources) |
 | `a` | Back to `ALL`, the mean across the view's GPUs or nodes, while one is shown (Resources) |
 | `/` | Filter the current source (Logs) |
-| `L` | Cycle minimum log level (INFO / WARNING / ERROR) (Logs) |
+| `l` | Cycle minimum log level (INFO / WARNING / ERROR) (Logs; `L` works too); elsewhere the Logs tab |
 | `p` | Pause / resume auto-scroll; scroll back freely while paused. Resumes a tail paused for no input (Logs) |
 | `s` | Save the current source to `~/cortex-training-<job8>-<type>-<index>.log` (Logs) |
-| `y` | Copy the log (its newest lines, up to 1 MiB) to the clipboard through the terminal (Logs) |
-| `c` | Copy the current selection, or say there is none (Logs) |
+| `c` / `ctrl+c` / right-click | Copy what is highlighted, else everything the tab holds: the log (its newest lines, up to 1 MiB) on Logs; the panel, header, stats and every chart on Resources (any tab) |
 | `[` / `]` | Narrow / widen the sources panel, which is otherwise sized to its labels; the log keeps at least 40 columns (Logs) |
 | `PgUp` `PgDn` `Home` `End` | Scroll the log, also while the sources panel has the focus (Logs); scroll the stats and charts, also while the panel has the focus (Resources) |
 | `r` | Refresh the visible tab (on Logs, the sub-job list and its tail) |
@@ -1627,9 +1669,9 @@ stays a DSSST1 frame either way.
 ceiling for byte `forward()` `/operation` posts (integer bytes, default 16 MiB,
 minimum 16 KiB). Frames larger than that are split into request chunks.
 
-`CORTEX_TRAINING_TUI_DEMO_ACCOUNT_LIST` (`not_deployed`, `disabled`,
+`CORTEX_TRAINING_TUI_DEBUG_ACCOUNT_LIST` (`not_deployed`, `disabled`,
 `forbidden` or `rest_disabled`; `ok` or unset is the default) makes the
-account-level list of `cortex-training tui --demo` answer as an unavailable one
+account-level list of `cortex-training tui --debug` answer as an unavailable one
 does, to preview what the job list's `a` (all schemas) says then; `unavailable`
 makes it fail (503).
 See [Job TUI](#job-tui).

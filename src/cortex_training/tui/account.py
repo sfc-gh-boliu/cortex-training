@@ -99,7 +99,7 @@ PAGE_LIMIT = "pages"  # a walk read ACCOUNT_LIST_MAX_PAGES pages, and the last o
 # configured schema. The other two (forbidden, rest_disabled) come from gates the
 # per-schema routes share, so the schema's list would most likely fail the same way.
 _FALLBACK_REASONS = frozenset({AccountJobListUnavailable.NOT_DEPLOYED, AccountJobListUnavailable.DISABLED})
-# Short: the header holds the refresh status, then "this schema only: DB.SCHEMA (why)",
+# Short: the header holds the refresh status, then "Current schema only: DB.SCHEMA (why)",
 # and that fits a 140-column terminal with the documented CORTEX_TRAINING_DB.PUBLIC.
 _FALLBACK_WHY = {
     AccountJobListUnavailable.NOT_DEPLOYED: "no account-wide list yet",
@@ -171,8 +171,8 @@ def scope_text(scope: ListScope, *, location: str, only: str = "") -> str:
     ``location`` is the configured ``DB.SCHEMA``; ``only`` is the one
     ``DB.SCHEMA`` every job of an account-wide listing is in, if they share one
     (the list shows no Location column then, so the header names it). For
-    example "this schema: CORTEX_TRAINING_DB.PUBLIC" (the default), "all
-    schemas", "newest 2,000 + every active job (more exist)" or "this schema
+    example "Current schema: CORTEX_TRAINING_DB.PUBLIC" (the default), "all
+    schemas", "newest 2,000 + every active job (more exist)" or "Current schema
     only: CORTEX_TRAINING_DB.PUBLIC (--schema-only)".
     """
     if scope.kind == ACCOUNT:
@@ -182,9 +182,9 @@ def scope_text(scope: ListScope, *, location: str, only: str = "") -> str:
             f"first {scope.pages} pages: {_jobs(scope.walked)}")
         return held + ("" if scope.active_missing else " + every active job") + f" ({_more(scope)})"
     if scope.kind == SCHEMA:
-        return f"this schema: {location}"
+        return f"Current schema: {location}"
     why = "--schema-only" if scope.kind == SCHEMA_ONLY else unavailable_text(scope)
-    return f"this schema only: {location} ({why})"
+    return f"Current schema only: {location} ({why})"
 
 
 def unavailable_text(scope: ListScope) -> str:

@@ -407,6 +407,102 @@ def prune_consoles(*, root: Optional[Path] = None, keep: Optional[Path] = None,
     return removed
 
 
+def prune_metrics(*, keep: Path, root: Optional[Path] = None) -> list:
+    """Remove the cached telemetry (``jobs/<job>/metrics/``) of every job but the
+    one in ``keep``, so the cache holds the telemetry of the job being viewed only.
+    Best effort: what can't be removed now goes next time. Returns the removed
+    directories, resolved."""
+    jobs = (root if root is not None else cache_root()) / "jobs"
+    keep_path = keep.resolve()
+    removed = []
+    for metrics in jobs.glob("*/metrics"):
+        try:
+            path = metrics.resolve()
+        except OSError:
+            continue
+        if path == keep_path:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        removed.append(path)
+    return removed
+
+
+# One empty file per running TUI (named by its pid), so the last one to exit can tell
+# that no other still reads the cache before it removes what was downloaded.
+_SESSIONS = ".sessions"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # it exists; another user's
+    except OSError:
+        return False
+    return True
+
+
+def _other_sessions(root: Path) -> list:
+    """The pids of the other TUIs still running on this cache; markers of ended ones go."""
+    live = []
+    for marker in (root / _SESSIONS).glob("*"):
+        try:
+            pid = int(marker.name)
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        if _pid_alive(pid):
+            live.append(pid)
+        else:
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+    return live
+
+
+def remove_downloads(root: Optional[Path] = None) -> None:
+    """Remove every job's downloaded data (``jobs/``: logs, saved consoles,
+    telemetry, tail cursors). Local job names (``aliases.json``) stay."""
+    shutil.rmtree((root if root is not None else cache_root()) / "jobs", ignore_errors=True)
+
+
+def begin_session(root: Optional[Path] = None) -> Optional[Path]:
+    """Mark this TUI as running on the cache. With no other TUI running, first
+    remove what a session that couldn't clean up (one that was killed) left.
+    Returns this session's marker, for :func:`end_session`."""
+    root = root if root is not None else cache_root()
+    try:
+        if not _other_sessions(root):
+            remove_downloads(root)
+        folder = root / _SESSIONS
+        folder.mkdir(parents=True, exist_ok=True)
+        marker = folder / str(os.getpid())
+        marker.touch()
+        return marker
+    except OSError:
+        return None
+
+
+def end_session(marker: Optional[Path], root: Optional[Path] = None) -> None:
+    """This TUI is done: unmark it and, when no other TUI still runs on the cache,
+    remove every job's downloaded data."""
+    root = root if root is not None else cache_root()
+    if marker is not None:
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+    try:
+        if not _other_sessions(root):
+            remove_downloads(root)
+    except OSError:
+        pass
+
+
 def _note_persist_error(exc: BaseException) -> None:
     global _persist_warned
     if _persist_warned:

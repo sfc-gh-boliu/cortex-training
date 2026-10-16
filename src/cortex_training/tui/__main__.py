@@ -31,14 +31,14 @@ from pathlib import Path
 # config file's poll_interval sets them (the CLI's own fallback, 0.5, is for
 # its result polling).
 _POLL_INTERVAL_DEFAULT = 1.0
-# --demo only: makes the demo's account-wide list answer as the service does
+# --debug only: makes the synthetic jobs' account-wide list answer as the service does
 # where it is unavailable (not_deployed, disabled, forbidden, rest_disabled), so
 # the job list's fallback to the configured schema can be previewed, or fail as
 # when the control plane is down (unavailable, a 503), for the list's error.
-DEMO_ACCOUNT_LIST_ENV = "CORTEX_TRAINING_TUI_DEMO_ACCOUNT_LIST"
+DEBUG_ACCOUNT_LIST_ENV = "CORTEX_TRAINING_TUI_DEBUG_ACCOUNT_LIST"
 _CONNECT_HINT = ("to connect, run 'cortex-training login config.json', set CORTEX_TRAINING_CONFIG, pass "
                  "--config config.json, --connection NAME, --base-url (local/mock), or --host + --pat; "
-                 "or try the TUI without a connection: --demo")
+                 "or try the TUI without a connection: --debug")
 # Retries after a failed read, and the (connect, read) timeout in seconds, for
 # every call the TUI makes (the job list's pages use the same).
 READ_MAX_RETRIES = 2
@@ -141,9 +141,9 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
         ),
     )
     p.add_argument(
-        "--demo",
+        "--debug",
         action="store_true",
-        help="Preview the TUI with synthetic jobs and GPU telemetry (no connection).",
+        help="Run the TUI on synthetic jobs and telemetry, with no connection (to try it or debug it).",
     )
     return p
 
@@ -179,7 +179,7 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
         parser.exit(2, f"{parser.prog}: error: the TUI couldn't load ({exc}); reinstall cortex-training, "
                        f"or pip install --upgrade '{_TEXTUAL_REQUIREMENT}'\n")
 
-    if args.demo:
+    if args.debug:
         if args.poll_interval is None:
             args.poll_interval = _POLL_INTERVAL_DEFAULT
         try:
@@ -229,7 +229,17 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     app = CortexTrainingLogTUI(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=args.poll_interval,
                                schema_only=args.schema_only)
     app.sign_in = _sign_in(cli, args)  # for the commands the TUI shows to copy
-    app.run()
+    from cortex_training.tui.log_cache import begin_session
+    from cortex_training.tui.log_cache import end_session
+
+    # What this session downloads (logs, consoles, telemetry) goes when it ends: q, a
+    # crash, kill or a closed terminal (the app exits on those as on q). The next start
+    # removes what a session that was killed outright left.
+    session = begin_session()
+    try:
+        app.run()
+    finally:
+        end_session(session)
     return app.return_code or 0  # non-zero when the app stopped on an unhandled error
 
 
@@ -279,12 +289,12 @@ def _demo_account_list() -> str | None:
     from cortex_training import AccountJobListUnavailable
     from cortex_training.tui.demo import UNAVAILABLE
 
-    value = (os.environ.get(DEMO_ACCOUNT_LIST_ENV) or "").strip().lower()
+    value = (os.environ.get(DEBUG_ACCOUNT_LIST_ENV) or "").strip().lower()
     if value in ("", "ok"):
         return None
     if value not in (*AccountJobListUnavailable.REASONS, UNAVAILABLE):
         reasons = ", ".join(sorted((*AccountJobListUnavailable.REASONS, UNAVAILABLE)))
-        raise ValueError(f"{DEMO_ACCOUNT_LIST_ENV} must be ok or one of {reasons}, got {value!r}")
+        raise ValueError(f"{DEBUG_ACCOUNT_LIST_ENV} must be ok or one of {reasons}, got {value!r}")
     return value
 
 
@@ -315,7 +325,7 @@ def _run_demo(args, app_class, *, account_list: str | None = None) -> int:
             client.seed_local(aliases=AliasStore())
             app = app_class(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=args.poll_interval,
                             schema_only=args.schema_only)
-            app.title = "cortex training (demo)"  # synthetic jobs: say so on every screen
+            app.title = "cortex training (debug)"  # synthetic jobs: say so on every screen
             app.run()
         finally:
             # In-process callers (and tests) must not keep pointing at the deleted dir.

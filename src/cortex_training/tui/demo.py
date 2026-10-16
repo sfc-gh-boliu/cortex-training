@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Synthetic, offline client for previewing the TUI (``cortex-training tui --demo``).
+"""Synthetic, offline client for trying and debugging the TUI (``cortex-training tui --debug``).
 
 Implements the read-only client methods the TUI calls, returning records in
 the shapes the service returns (job / sub-job metadata,

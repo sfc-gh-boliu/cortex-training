@@ -2232,6 +2232,15 @@ def resource_loader(metrics_root: Path) -> ResourceLoader:
         return loader
 
 
+def forget_resource_loaders(metrics_roots) -> None:
+    """Drop the shared loaders of cache directories whose files were removed, and
+    with them what was read from those files."""
+    keys = {str(Path(root).resolve()) for root in metrics_roots}
+    with _LOADERS_GUARD:
+        for key in keys:
+            _LOADERS.pop(key, None)
+
+
 # ─── GPU type and allocation ─────────────────────────────────────────────────
 # The control plane's rule for what a sub-job adds to its job's GPU request: its
 # config's ``n_gpus``, except that a log_prob sub-job uses none, and a sub-job

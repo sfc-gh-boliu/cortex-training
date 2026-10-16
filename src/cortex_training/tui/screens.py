@@ -13,28 +13,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Job preview, tabbed job detail, and checkpoint screens for the TUI.
+"""Job preview and tabbed job detail screens for the TUI.
 
 Flow: job list → :class:`JobSummaryScreen` (preview + sub-jobs) →
-:class:`JobDetailScreen` (Metrics | Logs | Resources | Checkpoints) for the
-whole job or one sub-job → :class:`CheckpointScreen` for one checkpoint.
+:class:`JobDetailScreen` (Logs | Resources) for the
+whole job or one sub-job.
 
 Everything here is read-only against the service. The only writes are local:
 job display names (:class:`~cortex_training.tui.stores.AliasStore`) and the GPU
-telemetry download cache.
+telemetry download cache. A job's name is its local alias, else the first line
+of the ``comment`` it was created with, else its id; the preview shows the
+whole comment too.
 """
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from datetime import timezone
+from time import monotonic
 
-from rich.markup import escape
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal
+from textual.content import Content
 from textual.containers import Vertical
 from textual.containers import VerticalScroll
 from textual.screen import ModalScreen
@@ -44,19 +47,30 @@ from textual.widgets import Footer
 from textual.widgets import Header
 from textual.widgets import Input
 from textual.widgets import Label
-from textual.widgets import ListItem
-from textual.widgets import ListView
 from textual.widgets import Static
 from textual.widgets import TabbedContent
 from textual.widgets import TabPane
 
 from cortex_training.tui import views as v
+from cortex_training.tui.app import KEYS_BINDING
+from cortex_training.tui.app import JobTabs
 from cortex_training.tui.app import LogScreen
+from cortex_training.tui.app import after_refresh
+from cortex_training.tui.app import call_on_screen
+from cortex_training.tui.app import close_keys_panel
+from cortex_training.tui.app import hanging
+from cortex_training.tui.app import is_shown
+from cortex_training.tui.format import is_active_status
+from cortex_training.tui.format import one_line
+from cortex_training.tui.format import safe_text
 from cortex_training.tui.format import source_label
 from cortex_training.tui.resource import RANGES
+from cortex_training.tui.stores import ALIAS_MAX_CHARS
 from cortex_training.tui.stores import AliasStore
-from cortex_training.tui.stores import MetricsStore
 
+# Rich's grey62, by value: Textual's markup and styles (the preview's Content)
+# don't know that name and would draw the default color instead.
+ENDED_STYLE = "#9e9e9e"
 STATUS_STYLE = {
     "running": "bold green",
     "initializing": "yellow",
@@ -65,9 +79,21 @@ STATUS_STYLE = {
     "queued": "yellow",
     "creating": "yellow",
     "failed": "bold red",
-    "cancelled": "grey62",
-    "canceled": "grey62",
-    "terminated": "grey62",
+    "cancelled": ENDED_STYLE,
+    "canceled": ENDED_STYLE,
+    "terminated": ENDED_STYLE,
+    "done": ENDED_STYLE,
+    "succeeded": ENDED_STYLE,
+    "completed": ENDED_STYLE,
+    "unknown": "yellow",
+}
+# What a waiting job is doing, by state, when the service sends no reason_details.
+_WAITING = {
+    "pending": "waiting to be placed on GPUs",
+    "queued": "waiting to be placed on GPUs",
+    "creating": "waiting to be placed on GPUs",
+    "placing": "waiting for its GPUs to come up",
+    "initializing": "placed on GPUs; loading the model and starting the engines",
 }
 
 
@@ -80,31 +106,151 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+_SUBJOB_COLUMNS = ("Sub-job", "Type", "Status", "Model", "GPUs", "Config")
+_TYPE, _MODEL, _CONFIG = 1, 3, 5
+# How the sub-job table fits a screen narrower than its cells: each layout leaves
+# out some columns, then cuts (column, to this many cells) in order, each only as
+# far as needed, until the table fits. A very long model name gives way first,
+# then the end of each config; then the Type column, which repeats each sub-job's
+# label (and the Type field above), is left out, and the model and the config are
+# cut further. A screen too narrow even for that scrolls the table sideways.
+_TABLE_FITS = (
+    ((), ((_MODEL, 36), (_CONFIG, 24))),
+    ((_TYPE,), ((_MODEL, 36), (_CONFIG, 24), (_MODEL, 10), (_CONFIG, 12))),
+)
+
+
+def _rows_of(content, width: int) -> int:
+    """The screen rows ``content`` takes in ``width`` cells, the ones it wraps onto included."""
+    wrap = getattr(content, "wrap", None)
+    return len(wrap(max(1, width))) if wrap is not None else len(str(content).split("\n"))
+
+
+def _column_widths(labels, rows: list) -> list:
+    """Each column's width with nothing cut: its widest cell, or its label."""
+    return [max([v.cell_width(label)] + [cells[i].cell_len for _key, cells in rows]) for i, label in enumerate(labels)]
+
+
+def fit_columns(labels, rows: list, width: int, pad: int = 2) -> tuple:
+    """The sub-job table fitted to ``width`` cells, as :data:`_TABLE_FITS` says.
+
+    ``rows`` are ``(key, cells)`` with one-line ``Text`` cells, and ``pad`` is
+    the padding each column adds. Returns ``(labels, rows, cut, wider)``: the
+    columns kept and the rows' cells for them (cut with ``…`` where needed),
+    whether anything was cut or left out, and whether the table is still wider
+    than ``width`` (so it scrolls sideways).
+    """
+    natural = _column_widths(labels, rows)
+    for dropped, cuts in _TABLE_FITS:
+        keep = [i for i in range(len(labels)) if i not in dropped]
+        widths = {i: natural[i] for i in keep}
+        over = sum(widths[i] + pad for i in keep) - width
+        for column, least in cuts:
+            if over <= 0:
+                break
+            take = min(over, max(0, widths[column] - least))
+            widths[column] -= take
+            over -= take
+        if over <= 0:
+            break
+    cut = len(keep) < len(labels) or any(widths[i] < natural[i] for i in keep)
+    fitted = [(key, [_fit_text(cells[i], widths[i]) for i in keep]) for key, cells in rows]
+    return [labels[i] for i in keep], fitted, cut, over > 0
+
+
+_SEPARATOR = "  ·  "
+
+
+def fit_line(segments: list, width: int) -> Content:
+    """``(text, style, least)`` segments joined by `` · `` to fit ``width`` cells.
+
+    When cutting the segments that have a ``least`` (the first ones first, down
+    to that many cells, with ``…``) puts the line on one row, they are cut just
+    enough; the others stay whole. Otherwise nothing is cut and the line wraps
+    between segments, so no row ends with a separator. The texts are shown
+    literally, never as markup.
+    """
+    texts = [text for text, _style, _least in segments]
+    sep = v.cell_width(_SEPARATOR)
+    over = sum(v.cell_width(text) for text in texts) + sep * (len(texts) - 1) - width
+    spares = [max(0, v.cell_width(text) - least) if least is not None else 0 for text, _style, least in segments]
+    if 0 < over <= sum(spares):  # cutting gets it onto one row
+        for i, spare in enumerate(spares):
+            if over <= 0:
+                break
+            if spare:
+                cut = min(spare, over)
+                texts[i] = v.fit_cells(texts[i], v.cell_width(texts[i]) - cut)
+                over -= cut
+    rows: list = []
+    for text, (_text, style, _least) in zip(texts, segments):
+        piece = Content.styled(text, style)
+        if rows and rows[-1].cell_length + sep + piece.cell_length <= width:
+            rows[-1] = rows[-1] + Content(_SEPARATOR) + piece
+        else:
+            rows.append(piece)
+    return Content("\n").join(rows)
+
+
+def _fit_text(text: Text, width: int) -> Text:
+    """A one-line cell cut to ``width`` terminal cells, ending in ``…`` when cut
+    (never in ``·…``), its style kept."""
+    if text.cell_len <= width:
+        return text
+    cut = v.fit_cells(text.plain, width)
+    return Text(cut[:-1].rstrip(" ·") + "…", style=text.style)
+
+
+def _update_if_changed(static: Static, content: Content) -> None:
+    """``static.update(content)`` unless it shows exactly that already.
+
+    Textual keeps a widget's old height when an update that changes it comes
+    while an earlier update's layout is still pending (two answers arriving at
+    once), so an update that changes nothing must not leave one pending.
+    """
+    shown = static.content
+    if not (isinstance(shown, Content) and shown.plain == content.plain and shown.spans == content.spans):
+        static.update(content)
+
+
 class PromptScreen(ModalScreen):
     """One-line text prompt; dismisses with the entered text, or ``None`` on Esc."""
 
     BINDINGS = [("escape", "cancel", "Cancel")]
 
-    def __init__(self, title: str, value: str = "", placeholder: str = "") -> None:
+    def __init__(self, title: str, value: str = "", placeholder: str = "", *, max_length: int = 0) -> None:
+        """``max_length``: the most characters the text may have (0: no limit); the hint says so."""
         super().__init__()
         self._title = title
         self._value = value
         self._placeholder = placeholder
+        self._max_length = max_length
+        self._done = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="prompt"):
-            yield Label(self._title, id="prompt-title")
-            yield Input(value=self._value, placeholder=self._placeholder, id="prompt-input")
-            yield Label("Enter to save · Esc to cancel", id="prompt-hint")
+            yield Label(Content(self._title), id="prompt-title")
+            yield Input(value=self._value, placeholder=self._placeholder, id="prompt-input",
+                        max_length=self._max_length)
+            limit = f" · up to {self._max_length} characters" if self._max_length else ""
+            yield Label(f"Enter to save · Esc to cancel{limit}", id="prompt-hint")
 
     def on_mount(self) -> None:
         self.set_focus(self.query_one("#prompt-input", Input))
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        self.dismiss(event.value)
+        self._finish(event.value)
 
     def action_cancel(self) -> None:
-        self.dismiss(None)
+        self._finish(None)
+
+    def _finish(self, value) -> None:
+        # Once. Two quick Enters submit twice, and dismiss() pops whatever screen is
+        # on top: the second would close the screen under this prompt.
+        if self._done or not is_shown(self):
+            return
+        self._done = True
+        self.dismiss(value)
 
 
 # ─── job preview ─────────────────────────────────────────────────────────────
@@ -113,149 +259,485 @@ class PromptScreen(ModalScreen):
 class JobSummaryScreen(Screen):
     """Preview of one job: identity, config, status, and a sub-job breakdown."""
 
+    # Back, quit and the keys panel first: a narrow terminal cuts the footer's end.
     BINDINGS = [
-        ("b", "app.pop_screen", "Back"),
-        ("escape", "app.pop_screen", "Back"),
-        ("m", "open('metrics')", "Metrics"),
+        ("b", "back", "Back"),
+        Binding("escape", "close_or_back", "Back", show=False),
+        ("q", "app.quit", "Quit"),
+        KEYS_BINDING,
         ("l", "open('logs')", "Logs"),
         ("g", "open('resource')", "Resources"),
-        ("c", "open('checkpoints')", "Checkpoints"),
         ("n", "rename", "Name job"),
         ("r", "refresh", "Refresh"),
-        ("q", "app.quit", "Quit"),
+        # One key, two bindings: check_action enables the one that applies, and the
+        # footer shows only that one, and only while a value is too long to show
+        # whole. Last, so a narrow footer cuts it rather than r or q (the comment's
+        # note names the key too).
+        Binding("e", "expand_values", "Full text"),
+        Binding("e", "collapse_values", "Less text"),
     ]
 
     def __init__(self, client, job_id: str, *, job: dict | None = None, aliases: AliasStore | None = None,
-                 metrics: MetricsStore | None = None, poll_interval: float = 1.0) -> None:
+                 poll_interval: float = 1.0, on_job=None) -> None:
+        """``on_job(record)`` is called with the job each time a fresh read of it
+        arrives (the job list then shows that status too)."""
         super().__init__()
         self._client = client
         self._job_id = job_id
         self._job = job or {"job_id": job_id}
+        self._on_job = on_job
         self._aliases = aliases or AliasStore()
-        self._metrics = metrics or MetricsStore()
         self._poll_interval = poll_interval
-        self._checkpoints: list = []
+        # A thread can't be cancelled, so never stack a second fetch.
+        self._loading = False
+        self._fetch_since: float | None = None  # monotonic start of the get_job in flight
+        self._fetched_at: str | None = None  # local HH:MM:SS of the last good get_job answer
+        self._fetch_error: str | None = None  # why the last get_job gave no copy, until one does
         self._scope_by_row: dict = {}
+        self._reread_on_resume = False  # set when the details open over this preview
+        self._expanded = False  # e: every value whole, however long, and the whole sub-job table
+        self._long = False  # some value or table cell is (or, expanded, would be) cut
+        self._table_shown = None  # what the sub-job table holds, so an unchanged refresh leaves it be
 
     def compose(self) -> ComposeResult:
         yield Header()
         with VerticalScroll(id="summary-body"):
             yield Static("", id="preview")
+            yield Static("", id="fetch")  # reading, refreshing, or why the copy shown is older
             yield Static("", id="health")
-            yield Static("[b]Sub-jobs[/b]  [dim](Enter opens details for the highlighted row)[/dim]", id="subjobs-title")
+            yield Static("", id="subjobs-title")  # names the tab Enter opens
             yield DataTable(id="subjobs", cursor_type="row", zebra_stripes=True)
             yield Static("", id="glance")
         yield Footer()
 
+    _REFRESH_SECONDS = 60
+
     def on_mount(self) -> None:
         table = self.query_one("#subjobs", DataTable)
-        table.add_columns("Sub-job", "Type", "Status", "Model", "GPUs", "Configuration")
         self._refresh_view()
         self._load()
-        self.set_focus(table)
+        # Focus without scrolling: on a short terminal a long comment would put the
+        # preview's top (the name and comment) above the screen, out of reach of the
+        # keys, which all go to the table.
+        self.set_focus(table, scroll_visible=False)
+        self.set_interval(self._REFRESH_SECONDS, self._refresh_tick)
+        self.set_interval(1, self._fetch_tick)
+
+    def _refresh_tick(self) -> None:
+        # Keep a live job's status and times current while the preview is showing.
+        if self.app.screen is self and v.is_live(self._job):
+            self._load()
 
     def on_screen_resume(self) -> None:
         self._refresh_view()
+        # Back from the details, which may have seen the status move on: re-read the job
+        # now. Not after the rename prompt: a live get_job can take minutes to answer.
+        reread, self._reread_on_resume = self._reread_on_resume, False
+        if reread and v.is_live(self._job):
+            self._start_fetch()
 
     @property
     def _display_name(self) -> str:
         return v.display_name(self._job, self._aliases.all())
 
+    _LABEL_WIDTH = 15  # "  " + a 12-column label + " "
+
+    def _value_width(self) -> int:
+        """Columns left for a preview value after its label (100 before the first layout)."""
+        try:
+            width = self.query_one("#preview", Static).size.width
+        except Exception:  # noqa: BLE001 - not mounted yet
+            width = 0
+        return max(20, (width or 100) - self._LABEL_WIDTH)
+
+    def _value_lines(self, value: str) -> list:
+        """A preview value (the comment, a long GPU line) as the rows it takes,
+        wrapped to the value column by terminal cells, so wide (CJK, emoji) text
+        stays in it. Printable first: a control character would break the count."""
+        width = self._value_width()
+        return [row for line in v.printable(value).split("\n") for row in v.wrap_cells(line, width)]
+
+    def _cut_rows(self, rows: list, keep: int) -> list:
+        """The first ``keep`` rows, the last ending in ``…``: the value goes on."""
+        kept = rows[:keep]
+        kept[-1] = v.fit_cells(f"{kept[-1].rstrip()} …", self._value_width())
+        return kept
+
+    def _value_block(self, rows: list) -> str:
+        """Rows of a value, the continuation rows under the value column."""
+        return ("\n" + " " * self._LABEL_WIDTH).join(rows)
+
+    # Without e, a value other than the comment shows at most this many rows. The
+    # comment gets the rows the rest of the preview leaves on the screen, and at
+    # least the fewest here, so every field shows when the preview opens.
+    _VALUE_ROWS = 3
+    _COMMENT_ROWS_MIN = 3
+    # The line under a value cut short: how many rows it has left, and the key.
+    _MORE = "\n" + " " * _LABEL_WIDTH + "[dim](+$more rows · e shows the whole {what})[/dim]"
+    # Rows outside the parts measured in _rows_besides: the header and footer, the
+    # body's top and bottom padding, and the health line's margins, the bottom one
+    # shared with the sub-jobs title's top margin (adjacent margins collapse; the
+    # app's CSS for #summary-body, #health, #subjobs-title).
+    _CHROME_ROWS = 2 + 2 + 2
+
+    def _rows_besides(self, fields: list, health: Content, title: Content, table_rows: int, glance: Content) -> int:
+        """The screen rows everything but the comment takes (``table_rows``: the
+        sub-job table's, its header and any sideways scrollbar included)."""
+        width = self._value_width() + self._LABEL_WIDTH
+        fetch = self.query_one("#fetch", Static)
+        lines = [*fields, health, title, *([fetch.render()] if fetch.display else [])]
+        return (self._CHROME_ROWS + sum(_rows_of(line, width) for line in lines) + table_rows
+                + _rows_of(glance, width - 2))  # the glance's padding
+
+    def _comment_rows(self, rows: list, besides: int) -> tuple:
+        """``(rows to show, rows left out, too long)`` for the comment: all of it
+        when it fits in the screen rows the rest leaves (or with e), else as many
+        as do (at least a few), with one more for the note that says so."""
+        room = (self.size.height or self.app.size.height) - besides
+        if len(rows) <= max(room, self._COMMENT_ROWS_MIN):
+            return rows, 0, False
+        if self._expanded:
+            return rows, 0, True
+        keep = max(self._COMMENT_ROWS_MIN, room - 1)
+        return self._cut_rows(rows, keep), len(rows) - keep, True
+
+    def check_action(self, action: str, parameters) -> bool | None:
+        if action == "expand_values":
+            return self._long and not self._expanded
+        if action == "collapse_values":
+            return self._long and self._expanded
+        return True
+
+    def action_expand_values(self) -> None:
+        self._expanded = True
+        self._refresh_view()
+        self.refresh_bindings()
+
+    def action_collapse_values(self) -> None:
+        self._expanded = False
+        self._refresh_view()
+        self.refresh_bindings()
+
     def _refresh_view(self) -> None:
         job = self._job
-        self.app.sub_title = f"job preview  ·  {self._display_name or self._job_id}"
+        if self.app.screen is self:  # a late load must not retitle the details on top
+            self.app.sub_title = f"job preview  ·  {v.shown_name(job, self._aliases.all())}"
         now = _now()
         rows = []
-        for label, value in v.summary_fields(job, self._display_name, now):
+        name = self._display_name
+        if not name:
+            hint = "no name · press n to name this job"
+        elif v.alias_of(job, self._aliases.all()):
+            hint = "local name on this machine · n renames"
+        else:
+            hint = "from the job's comment"
+        name_hint = f"  [dim]({hint})[/dim]"
+        # Keep the one-line name and its hint on one line of the preview (cells, not characters).
+        name = v.one_line(name, max(20, self._value_width() - v.cell_width(hint) - 4)) if name else name
+        # Values (names, comments, ids) are user or server text: pass them as
+        # $variables so they are shown literally, never parsed as markup.
+        comment = None  # (its place in rows, its rows): it gets what the rest leaves
+        long = False
+        for label, value in v.summary_fields(job, name, now):
+            more = 0  # rows of the value left out
             if label == "Status":
                 word = v.status_word(job.get("status"))
                 style = STATUS_STYLE.get(word, "")
-                live = "  [green]● live[/green]" if v.is_live(job) else "  [dim]historical[/dim]"
-                value_markup = f"[{style}]{escape(value)}[/]{live}" if style else escape(value) + live
-            elif label == "Name" and not self._display_name:
-                value_markup = f"[dim]{escape(value)}[/dim]"
+                if v.is_unknown(job):  # no live state: the health line below says why
+                    live = "  [yellow]? status unavailable[/yellow]"
+                else:
+                    live = "  [green]● live[/green]" if v.is_live(job) else "  [dim]historical[/dim]"
+                value_markup = (f"[{style}]$value[/]" if style else "$value") + live
+            elif label == "Name":
+                value_markup = ("[b]$value[/b]" if name else "[dim]$value[/dim]") + name_hint
             else:
-                value_markup = f"[b]{escape(value)}[/b]" if label in ("Name", "Job ID") else escape(value)
-            rows.append(f"  [dim]{label:<12}[/dim] {value_markup}")
-        self.query_one("#preview", Static).update("\n".join(rows))
-        self.query_one("#health", Static).update(self._health_markup())
+                # A long value (the comment, a GPU line naming another job) continues under the column.
+                lines = self._value_lines(value)
+                if label == "Comment":
+                    comment = (len(rows), lines)
+                    continue
+                if len(lines) > self._VALUE_ROWS:
+                    long = True
+                    if not self._expanded:
+                        more = len(lines) - self._VALUE_ROWS
+                        lines = self._cut_rows(lines, self._VALUE_ROWS)
+                value = self._value_block(lines)
+                # A cut value says so under it, with the key that shows the rest (a
+                # narrow footer has no room for that key).
+                value_markup = (("[b]$value[/b]" if label == "Job ID" else "$value")
+                                + (self._MORE.format(what="value") if more else ""))
+            rows.append(Content.from_markup(f"  [dim]{label:<12}[/dim] {value_markup}", value=value, more=str(more)))
+        self._render_fetch()
+        width = self._value_width() + self._LABEL_WIDTH
+        # Wrapped lines of the health line continue under its text, after the "  ✖ " lead-in.
+        health = hanging(self._health(), width, 4)
+        self.query_one("#health", Static).update(health)
 
         table = self.query_one("#subjobs", DataTable)
-        table.clear()
+        subjob_rows = self._subjob_rows(job)
+        table_width = self._table_width(table, len(subjob_rows))
+        labels, fitted, cut, wider = fit_columns(_SUBJOB_COLUMNS, subjob_rows, table_width, 2 * table.cell_padding)
+        if self._expanded:  # every column, every cell whole: the table scrolls sideways when it must
+            labels, fitted = list(_SUBJOB_COLUMNS), subjob_rows
+            wider = sum(w + 2 * table.cell_padding for w in _column_widths(labels, fitted)) > table_width
+        long = long or cut
+        self._show_table(table, labels, fitted, wider)
+        # The keys for a table that is cut to fit, or wider than the screen (short, as in
+        # the key line at the bottom, to keep to one row on an 80-column screen).
+        hints = ["Enter opens Logs for the highlighted row"]
+        if cut:
+            hints.append("e fit to screen" if self._expanded else "e whole table")
+        if wider:
+            hints.append("← → scroll")
+        title = self._subjobs_title(hints, width)
+        self.query_one("#subjobs-title", Static).update(title)
+        glance = self._glance()
+        _update_if_changed(self.query_one("#glance", Static), glance)
+        if comment is not None:
+            # The whole comment when the screen has the rows for it, else its start and a note.
+            at, lines = comment
+            limit = table.styles.max_height
+            table_rows = len(fitted) + 1 + (1 if wider else 0)  # its header, and its sideways scrollbar
+            if limit is not None and limit.is_cells:
+                table_rows = min(table_rows, int(limit.value))
+            shown, more, too_long = self._comment_rows(
+                lines, self._rows_besides(rows, health, title, table_rows, glance))
+            long = long or too_long
+            note = self._MORE.format(what="comment") if more else ""
+            rows.insert(at, Content.from_markup(f"  [dim]{'Comment':<12}[/dim] $value{note}",
+                                                value=self._value_block(shown), more=str(more)))
+        self.query_one("#preview", Static).update(Content("\n").join(rows))
+        if long != self._long:
+            self._long = long
+            self.refresh_bindings()  # e appears in the footer, or goes
+
+    _TITLE = "Sub-jobs  ("
+
+    def _subjobs_title(self, hints: list, width: int) -> Content:
+        """``Sub-jobs  (hint · hint)`` in ``width`` cells: a row breaks between two
+        hints (without the ``·``) and goes on under the first hint; only a hint too
+        long for a row of its own breaks inside."""
+        indent = v.cell_width(self._TITLE)
+        rows = [self._TITLE + hints[0]]
+        for hint in hints[1:]:
+            if v.cell_width(rows[-1]) + v.cell_width(f" · {hint})") <= width:
+                rows[-1] += f" · {hint}"
+            else:
+                rows.append(" " * indent + hint)
+        rows[-1] += ")"
+        text = Content("\n").join(hanging(Content(row), width, indent) for row in rows).plain
+        bold = len("Sub-jobs")
+        return Content.styled(text[:bold], "bold") + Content.styled(text[bold:], "dim")
+
+    def _show_table(self, table: DataTable, labels: list, rows: list, wider: bool) -> None:
+        """Put these columns and rows in the sub-job table, unless it already holds them
+        (so a refresh that changes nothing keeps its cursor and sideways scroll)."""
+        shown = (tuple(labels), wider,
+                 tuple((key, tuple((cell.plain, str(cell.style)) for cell in cells)) for key, cells in rows))
+        if shown == self._table_shown:
+            return
+        self._table_shown = shown
+        # Sideways scrolling only for a table wider than the screen. Setting overflow
+        # also has Textual re-check the scrollbar, which it otherwise does only when a
+        # size changes; a table refitted to exactly its width would keep a stale one.
+        table.styles.overflow_x = "auto" if wider else "hidden"
+        keep = table.cursor_row
+        # Columns too: a column only ever widens, so one cut to fit would stay as wide
+        # as its widest cell so far (before the first layout, or on a wider screen).
+        table.clear(columns=True)
+        table.add_columns(*labels)
+        for key, cells in rows:
+            table.add_row(*cells, key=key)
+        table.move_cursor(row=min(keep, table.row_count - 1), animate=False)  # keep the row on refresh
+
+    def _subjob_rows(self, job: dict) -> list:
+        """The sub-job table's rows as ``(key, cells)``; also maps each row to its scope."""
         self._scope_by_row = {"all": None}
-        table.add_row(Text("▸ entire job", style="bold"), v.job_type_label(job), status_text(job.get("status")),
-                      ", ".join(v.job_models(job)) or "—", str(v.total_gpus(job) or "—"),
-                      Text("whole job: every sub-job's metrics, logs, GPUs and checkpoints", style="dim"), key="all")
-        for i, sj in enumerate(v.sub_jobs(job)):
+        # Text cells: a plain str cell is parsed as markup.
+        rows = [("all", [Text("▸ entire job", style="bold"), Text(v.job_type_label(job)), status_text(job.get("status")),
+                         Text(", ".join(v.job_models(job)) or "—"), Text(v.job_gpu_cell(job, "requested")),
+                         Text("all sub-jobs", style="dim")])]
+        subs = v.sub_jobs(job)
+        if v.is_unknown(job):
+            # Live sub-job state is unavailable (the line above has the service's sentence):
+            # say so instead of showing no sub-jobs.
+            rows.append(("note", [Text("  ? status unavailable", style="yellow"), Text(""), Text("UNKNOWN", style="yellow"),
+                                  Text(""), Text(""), Text("configs at creation" if subs else
+                                                           "the service sent no sub-job configs", style="dim")]))
+        for i, sj in enumerate(subs):
             key = f"sj-{i}"
             self._scope_by_row[key] = sj.get("sub_job_id")
-            table.add_row(f"  {v.sub_job_label(sj)}", str(sj.get("job_type") or "").lower(), status_text(sj.get("status")),
-                          str(sj.get("model_name") or "—"), str(v.sub_job_gpus(sj) or "—"),
-                          v.subjob_config_summary(sj), key=key)
-        self.query_one("#glance", Static).update(self._glance_markup())
+            config = v.subjob_config_summary(sj)
+            target = v.multiplex_target(sj)
+            if target:
+                # After the config, which a narrow table keeps; the GPUs line names the host in full.
+                config = " · ".join(p for p in (config, f"runs on {v.short_sub_job_id(target)}") if p)
+            # Its type as the list spells it (log_prob, as the sub-job id does), beside its label.
+            rows.append((key, [Text(f"  {v.sub_job_label(sj)}"), Text(v.sub_job_type(sj)),
+                               status_text(sj.get("status")), Text(str(sj.get("model_name") or "—")),
+                               Text(v.sub_job_gpu_text(sj)), Text(config)]))
+        return rows
 
-    def _health_markup(self) -> str:
+    def _table_width(self, table: DataTable, rows: int) -> int:
+        """The cells the sub-job table has for its columns: its width, less a vertical
+        scrollbar when its rows (and header) are more than it shows."""
+        # Before the first layout: the screen less the body's padding, the table's
+        # margins and the body's scrollbar gutter (kept whether or not it scrolls).
+        width = table.size.width or max(40, self.app.size.width - 6)
+        limit = table.styles.max_height
+        if limit is not None and limit.is_cells and rows + 1 > limit.value:
+            width -= table.styles.scrollbar_size_vertical
+        return width
+
+    def on_resize(self, event) -> None:
+        if self.query_one("#subjobs", DataTable).columns:  # mounted: re-wrap the comment, refit the table
+            after_refresh(self, self._refresh_view)
+
+    # Keys the sub-job table moves its cursor with.
+    _TABLE_MOVES = {"up", "down", "pageup", "pagedown", "ctrl+home", "ctrl+end"}
+
+    def on_key(self, event) -> None:
+        # The preview opens at its top (name and comment) and the keys go to the
+        # sub-job table, which a long comment can push below the screen: bring the
+        # table into view once its cursor moves, and go back to the top on up from
+        # its first row, or ctrl+home.
+        table = self.query_one("#subjobs", DataTable)
+        if self.focused is not table or event.key not in self._TABLE_MOVES:
+            return
+        body = self.query_one("#summary-body", VerticalScroll)
+        if event.key == "ctrl+home" or (event.key == "up" and table.cursor_row <= 0):
+            body.scroll_home(animate=False)
+        else:
+            after_refresh(self, body.scroll_to_widget, table, animate=False)
+
+    def _health(self) -> Content:
         job = self._job
         word = v.status_word(job.get("status"))
-        reason = str(job.get("reason") or "").strip()
+        reason, details = v.collapse(job.get("reason") or ""), v.collapse(job.get("reason_details") or "")
+        if word == "failed" and not reason:
+            reason = "not reported"  # a failure always gets its reason line
+        # The service's words, one way for every state: "reason: X — details", the
+        # details alone without a reason, or nothing.
+        why = ("  reason: [b]$reason[/b]" if reason else "") + ((" — $details" if reason else "  $details")
+                                                                 if details else "")
+
+        def line(lead: str, tail: str = "", **values) -> Content:
+            return Content.from_markup(f"  {lead}{why}{tail}", reason=reason, details=details, **values)
+
         if word == "failed":
-            return f"  [bold red]✖ Job failed[/]  reason: [b]{escape(reason or 'not reported')}[/b]  — check Logs (l) for the failing sub-job"
+            # A job that never got GPUs has no logs to check (placement_timeout and the like).
+            hint = ("it never got GPUs, so no sub-job started or wrote logs" if v.never_started(job)
+                    else "check Logs (l) for the failing sub-job")
+            return line("[bold red]✖ Job failed[/]", "  — $hint", hint=hint)
         if word in ("cancelled", "canceled"):
-            return f"  [grey62]■ Cancelled[/]  {escape(reason)}"
+            return line(f"[{ENDED_STYLE}]■ Cancelled[/]")
         if word == "terminated":
-            return f"  [grey62]■ Terminated by the platform[/]  {escape(reason)}"
-        if word in ("placing", "pending", "queued", "initializing", "creating"):
-            return f"  [yellow]◔ {word.capitalize()}[/] — waiting for GPUs or loading the model"
+            return line(f"[{ENDED_STYLE}]■ Terminated by the platform[/]")
+        if word in ("succeeded", "completed", "done"):
+            return line(f"[{ENDED_STYLE}]■ Completed[/]")
+        if word in _WAITING:
+            # The service says why a job waits (e.g. quota_filled) and, often, how far
+            # off it is; without that, what the state means.
+            return line(f"[yellow]◔ {word.capitalize()}[/]", "" if details else " — $doing", doing=_WAITING[word])
         if word == "running":
-            return "  [green]● Running[/] — logs stream live; metrics, resources and checkpoints refresh automatically"
-        return ""
+            return Content.from_markup(
+                "  [green]● Running[/] — logs stream live; resources refresh automatically")
+        if word == "unknown":
+            # The service could not read the job's live state: it may still be running,
+            # unless the service says the control plane has no record of the job.
+            text = v.status_unavailable_text(job)
+            hint = "" if "not found" in text.lower() else " — the job may still be running"
+            return Content.from_markup(f"  [yellow]? $text[/]{hint}", text=text)
+        # A status this client doesn't know: the service's reason, if it sent one.
+        return Content.from_markup("  " + why.lstrip(), reason=reason, details=details) if why else Content("")
 
-    def _glance_markup(self) -> str:
-        bits = []
-        catalog = v.metric_catalog(self._metrics.load(self._job_id))
-        loss = v.primary_loss(catalog)
-        if loss:
-            at = f" @ step {loss.min_step}" if loss.min_step is not None else ""
-            bits.append(f"[dim]{loss.label}[/dim] latest [b]{v.fmt_metric(loss.latest)}[/b] · min [b]{v.fmt_metric(loss.minimum)}[/b]{at}")
-        elif catalog:
-            bits.append(f"[dim]{len(catalog)} client-logged metric(s)[/dim]")
-        else:
-            bits.append("[dim]no client-logged training metrics on this machine[/dim]")
-        if self._checkpoints:
-            latest = v.sort_checkpoints(self._checkpoints, "time")[0]
-            step = v.checkpoint_step(latest)
-            kinds = {v.checkpoint_kind(c) for c in self._checkpoints}
-            bits.append(f"[dim]checkpoints[/dim] [b]{len(self._checkpoints)}[/b] ({', '.join(sorted(kinds))}) · latest "
-                        f"{escape(str(latest.get('checkpoint_id')))}" + (f" @ step {step}" if step is not None else ""))
-        else:
-            bits.append("[dim]no checkpoints saved[/dim]")
-        return "\n[b]At a glance[/b]\n  " + "\n  ".join(bits) + (
-            "\n\n[dim]m metrics · l logs · g resources · c checkpoints · n name this job · b back[/dim]"
-        )
+    def _glance(self) -> Content:
+        return Content.from_markup("\n[dim]l logs · g resources · n name this job · b back[/dim]")
 
-    @work(thread=True, exclusive=True, group="summary")
     def _load(self) -> None:
-        try:
-            job = self._client.get_job(self._job_id)
-        except Exception:  # noqa: BLE001 - keep the list row's copy
-            job = None
-        try:
-            cps = self._client.list_checkpoints(self._job_id)
-        except Exception:  # noqa: BLE001 - optional
-            cps = []
-        try:
-            self.app.call_from_thread(self._apply, job if isinstance(job, dict) and job else None,
-                                      cps if isinstance(cps, list) else [])
-        except RuntimeError:
-            pass
+        self._start_fetch()
 
-    def _apply(self, job, cps) -> None:
+    def _start_fetch(self) -> None:
+        if not self._loading:
+            self._loading = True
+            self._fetch_since = monotonic()
+            self._fetch_job()
+        self._render_fetch()  # "refreshing…", or how long the read in flight has taken
+
+    @work(thread=True, group="summary")
+    def _fetch_job(self) -> None:
+        try:
+            job, error = self._client.get_job(self._job_id), None
+        except Exception as exc:  # noqa: BLE001 - said under the fields; the copy on screen stays
+            job, error = None, v.collapse(v.describe_error(exc))
+        if not (isinstance(job, dict) and job):
+            job, error = None, error or "the service sent an empty answer"
+        self._post(self._apply_job, job, error)
+
+    def _post(self, fn, *args) -> None:
+        call_on_screen(self, fn, *args)
+
+    def _apply_job(self, job: dict | None, error: str | None = None) -> None:
+        self._loading = False
+        self._fetch_since = None
         if job:
-            self._job = {**self._job, **job}
-        self._checkpoints = cps
+            # The service's fields come only from the fresh answer: a reason it stopped sending disappears.
+            self._job = v.refresh_job(self._job, job)
+            self._fetched_at, self._fetch_error = time.strftime("%H:%M:%S"), None
+            if self._on_job is not None:
+                self._on_job(self._job)
+        else:
+            self._fetch_error = error or "the service sent an empty answer"
         self._refresh_view()
 
+    # A read in flight longer than this shows how long it has taken (the client
+    # retries a failing answer for about a minute).
+    _FETCH_SLOW_SECONDS = 5
+
+    def _fetch_tick(self) -> None:
+        if self._loading and self.app.screen is self:
+            self._render_fetch()
+
+    def _fetch_line(self) -> Content:
+        """The line under the fields: a read in flight, the last one's failure, or when the copy was read."""
+        took = ""
+        if self._loading and self._fetch_since is not None:
+            seconds = int(monotonic() - self._fetch_since)
+            took = f" ({seconds}s)" if seconds >= self._FETCH_SLOW_SECONDS else ""
+        error, at = self._fetch_error or "", self._fetched_at or ""
+        if self._loading:
+            if error:
+                return Content.from_markup(f"  [dim]refreshing…{took}[/dim]  [yellow](last try: $error)[/yellow]",
+                                           error=error)
+            if at:
+                return Content.from_markup(f"  [dim]refreshing…{took}  (last read at $at)[/dim]", at=at)
+            return Content.from_markup(f"  [dim]reading the job from the service…{took}[/dim]")
+        if error:
+            # The fields above are the last good copy: this preview's, or the job list's.
+            if at:
+                return Content.from_markup("  [yellow]couldn't refresh: $error; showing the copy read at $at[/yellow]",
+                                           error=error, at=at)
+            return Content.from_markup("  [yellow]couldn't read the job: $error; showing the job list's copy[/yellow]",
+                                       error=error)
+        if at:
+            return Content.from_markup("  [dim]read from the service at $at[/dim]", at=at)
+        return Content("")
+
+    def _render_fetch(self) -> None:
+        try:
+            line = self.query_one("#fetch", Static)
+        except Exception:  # noqa: BLE001 - not mounted, or already removed
+            return
+        content = self._fetch_line()
+        line.display = bool(content.plain)  # no blank row before the first read
+        # A long error continues under its text, after the two-cell indent.
+        line.update(hanging(content, self._value_width() + self._LABEL_WIDTH, 4))
+
     def action_refresh(self) -> None:
+        if self._loading:
+            # The read is in flight (a thread can't be cancelled): say so, not nothing.
+            self.notify("Still reading this job; r asks again once it answers.")
+            return
         self._load()
 
     def _highlighted_scope(self):
@@ -266,67 +748,92 @@ class JobSummaryScreen(Screen):
             key = "all"
         return self._scope_by_row.get(key)
 
+    def action_back(self) -> None:
+        if is_shown(self):  # not while still mounting, nor the screen under a pushed one
+            self.app.pop_screen()
+
+    def action_close_or_back(self) -> None:
+        """Esc: close the keys panel when it is open, else go back."""
+        if is_shown(self) and not close_keys_panel(self):
+            self.app.pop_screen()
+
     def action_open(self, tab: str) -> None:
-        self._open_detail(self._highlighted_scope(), tab)
+        if is_shown(self):
+            self._open_detail(self._highlighted_scope(), tab)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        self._open_detail(self._scope_by_row.get(event.row_key.value), "metrics")
+        # Not a second quick Enter, after the first opened the details.
+        if is_shown(self) and event.row_key.value in self._scope_by_row:  # not the "status unavailable" line
+            self._open_detail(self._scope_by_row[event.row_key.value], "logs")
 
     def _open_detail(self, sub_job_id, tab: str) -> None:
+        self._reread_on_resume = True
         self.app.push_screen(
             JobDetailScreen(self._client, self._job_id, job=self._job, sub_job_id=sub_job_id, initial_tab=tab,
-                            aliases=self._aliases, metrics=self._metrics, poll_interval=self._poll_interval)
+                            aliases=self._aliases, poll_interval=self._poll_interval)
         )
 
     def action_rename(self) -> None:
+        if not is_shown(self):
+            return
+
         def done(value):
             if value is not None:
-                self._aliases.set(self._job_id, value)
+                # A name that only repeats the comment's first line stores no alias.
+                self._aliases.set(self._job_id, v.alias_to_store(self._job, value))
                 self._refresh_view()
 
-        self.app.push_screen(PromptScreen(f"Display name for {self._job_id}", self._display_name, "e.g. qwen3-8b lora sweep #3"), done)
+        current, placeholder = v.rename_prompt(self._job, self._aliases.all())
+        self.app.push_screen(PromptScreen(f"Display name for {self._job_id}", current, placeholder,
+                                          max_length=ALIAS_MAX_CHARS), done)
 
 
 # ─── job detail (tabs) ───────────────────────────────────────────────────────
 
-_METRIC_WINDOWS = [("time", 3600.0), ("time", 6 * 3600.0), ("time", 86400.0), ("all",)]
 _LOG_ONLY = {"save_log", "copy_log", "copy_text", "cycle_level", "toggle_pause", "shrink_sources", "grow_sources", "filter"}
 # Pane ids match LogScreen's ("logs", "resource"), so its tab logic applies as-is.
-_TAB_IDS = ("metrics", "logs", "resource", "checkpoints")
-_TAB_FOCUS = {"metrics": "#metriclist", "logs": "#sources", "resource": "#resource-table", "checkpoints": "#cptable"}
+_TAB_IDS = ("logs", "resource")
+_TAB_FOCUS = {"logs": "#sources", "resource": "#resource-table"}
 
 
 class JobDetailScreen(LogScreen):
-    """Metrics | Logs | Resources | Checkpoints for a job, optionally scoped to one sub-job.
+    """Logs | Resources for a job, optionally scoped to one sub-job.
 
     Extends :class:`LogScreen`, so the Logs tab keeps its live tail, cache,
     saved-console fallback, filter, level, pause, save, and copy behavior, and
-    the Resources tab is LogScreen's GPU view of the sub-job selected in Logs.
+    the Resources tab is LogScreen's GPU view of one sub-job at a time: the one
+    selected in Logs until ``<`` or ``>`` picks another.
 
     Textual runs a handler such as ``on_mount`` for every class in the MRO, so
     the handlers here never call ``super()`` for them.
     """
 
+    # 2 and 3 are one footer entry ("23 Tabs"), in the places LogScreen keeps for
+    # them, after Back and Quit. The preview's letters open the same tabs here;
+    # c copies a selection on Logs, and m switches the chart on a Resources tab
+    # that shows one chart at a time (check_action).
+    _TABS = Binding.Group("Tabs", compact=True)
     BINDINGS = [
-        Binding("1", "show_tab('metrics')", "Metrics"),
-        Binding("2", "show_tab('logs')", "Logs"),
-        Binding("3", "show_tab('resource')", "Resources"),
-        Binding("4", "show_tab('checkpoints')", "Checkpoints"),
+        Binding("2", "show_tab('logs')", "Logs", group=_TABS),
+        Binding("3", "show_tab('resource')", "Resources", group=_TABS),
+        Binding("m", "resource_chart", "Busy/memory chart", show=False),
+        Binding("l", "show_tab('logs')", "Logs", show=False),
+        Binding("g", "show_tab('resource')", "Resources", show=False),
+        Binding("c", "copy_text", "Copy selection", show=False),
         Binding("w", "cycle_window", "Window"),
-        Binding("W", "custom_window", "Custom window"),
-        Binding("x", "toggle_axis", "Step/time"),
-        Binding("o", "cycle_cp_sort", "Sort"),
-        # Keep the footer readable next to the tab keys; these still work.
+        # Keep the footer readable next to the tab keys; these still work (? lists them).
         Binding("[", "shrink_sources", "Narrower", show=False),
         Binding("]", "grow_sources", "Wider", show=False),
         Binding("y", "copy_log", "Copy all", show=False),
-        Binding("c", "copy_text", "Copy sel", show=False),
     ]
     _DATA_REFRESH_SECONDS = 30
-    _RESOURCE_KEYS = "w window 5m · 15m · 1h · 6h · all   r refresh   ·   shows the sub-job selected in Logs (2)"
+    _STATUS_REFRESH_SECONDS = 60
+    _SUBTITLE_REASON = False  # the summary line shows reason and reason_details
+    _RESOURCE_KEYS = f"w window {' · '.join(RANGES)}   r refresh"
+    _RESOURCE_KEYS_NARROW = "w window   r refresh"  # the header names the window shown
 
     def __init__(self, client, job_id, *, job: dict | None = None, sub_job_id=None, initial_tab: str = "logs",
-                 aliases: AliasStore | None = None, metrics: MetricsStore | None = None, poll_interval=1.0,
+                 aliases: AliasStore | None = None, poll_interval=1.0,
                  job_status=None) -> None:
         super().__init__(client, job_id, sub_job_id=sub_job_id, poll_interval=poll_interval,
                          job_status=job_status or (job or {}).get("status"))
@@ -335,64 +842,106 @@ class JobDetailScreen(LogScreen):
         self._initial_tab = initial_tab if initial_tab in _TAB_IDS else "logs"
         self._active_tab = self._initial_tab
         self._aliases = aliases or AliasStore()
-        self._metrics_store = metrics or MetricsStore()
-        self._metric_records: list = []
-        self._metric_key: str | None = None
-        self._metric_window: tuple = _METRIC_WINDOWS[0]
-        self._metric_axis = "step"
-        self._checkpoints: list = []
-        self._cp_loaded = False
-        self._cp_loading = False
-        self._cp_error: str | None = None
-        self._cp_sort = "time"
-        self._cp_rows: dict = {}
 
     # ── layout ──
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("", id="summary")
-        with TabbedContent(initial=self._initial_tab, id="job-tabs"):
-            with TabPane("Metrics", id="metrics"):
-                yield Static("", id="metric-head")
-                with Horizontal(id="metrics-body"):
-                    yield ListView(id="metriclist")
-                    with VerticalScroll(id="metric-pane"):
-                        yield Static("", id="metric-chart")
+        with JobTabs(initial=self._initial_tab, id="job-tabs"):
             with TabPane("Logs", id="logs"):
                 yield from self._compose_logs()
             with TabPane("Resources", id="resource"):
                 yield from self._compose_resource()
-            with TabPane("Checkpoints", id="checkpoints"):
-                yield Static("", id="cp-head")
-                yield DataTable(id="cptable", cursor_type="row", zebra_stripes=True)
-                yield Static("", id="cp-foot")
         yield Footer(id="footer")
 
     def on_mount(self) -> None:
         self._render_summary_line()
-        self._load_metrics()
-        if self._initial_tab == "checkpoints":
-            self._load_checkpoints()
         self.set_interval(self._DATA_REFRESH_SECONDS, self._auto_refresh_data)
-        self.set_interval(10, self._auto_refresh_metrics)
+        self.set_interval(self._STATUS_REFRESH_SECONDS, self._refresh_status)
 
     def on_screen_resume(self) -> None:
-        self._update_subtitle()  # a pushed checkpoint view or prompt replaced it
+        self._update_subtitle()  # a screen pushed over this one may have replaced it
+
+    # The fewest cells the name and the models are cut to so the summary line fits on one row.
+    _SUMMARY_LEAST = 12
 
     def _render_summary_line(self) -> None:
-        name = v.display_name(self._job, self._aliases.all())
-        scope = f"sub-job {self._scope}" if self._scope else "all sub-jobs"
-        head = f"[b]{escape(name)}[/b]  ·  " if name else ""
-        self._set_summary(f"{head}{escape(v.job_id_of(self._job) or self._job_id)}  ·  {scope}  ·  "
-                          f"{escape(v.job_type_label(self._job))}  ·  {escape(', '.join(v.job_models(self._job)) or '—')}")
+        job = self._job
+        # Short here: this line also carries the id, scope, type, models and reason;
+        # the preview shows the whole name.
+        name = v.one_line(v.display_name(job, self._aliases.all()), 48)
+        job_id = v.job_id_of(job) or self._job_id
+        # A sub-job's id starts with its job's (JOB_ID:TYPE:INDEX): name it once.
+        if not self._scope:
+            ids = [job_id, "all sub-jobs"]
+        elif str(self._scope).startswith(f"{job_id}:"):
+            ids = [f"sub-job {self._scope}"]
+        else:
+            ids = [job_id, f"sub-job {self._scope}"]
+        # Why the job is where it is, in the service's words: reason and reason_details,
+        # or the sentence it sends when the job's status is unavailable.
+        why = v.status_unavailable_text(job) if v.is_unknown(job) else v.reason_text(job)
+        word = v.status_word(job.get("status"))
+        style = "red" if word == "failed" else "yellow" if v.is_live(job) else ENDED_STYLE
+        # Where the job is (its calls go there), when the account-wide list says it is
+        # somewhere other than the configured location.
+        elsewhere = getattr(self.app, "job_elsewhere", None)
+        location = v.location_label(job) if not callable(elsewhere) or elsewhere(job) else ""
+        least = self._SUMMARY_LEAST
+        # The name, then the models, are cut to keep the line on one row; the ids,
+        # the location and the reason stay whole.
+        segments = [*([(name, "bold", least)] if name else []), *((text, "", None) for text in ids),
+                    (v.job_type_label(job), "", None), (", ".join(v.job_models(job)) or "—", "", least),
+                    *([(location, "", None)] if location else []), *([(why, style, None)] if why else [])]
+        self._set_summary(fit_line(segments, self._summary_width()))
+
+    def _summary_width(self) -> int:
+        """The cells the summary line has: the screen's, less its padding, before the first layout."""
+        try:
+            width = self.query_one("#summary", Static).size.width
+        except Exception:  # noqa: BLE001 - not mounted, or already removed
+            width = 0
+        return width or max(40, self.app.size.width - 2)
 
     def _on_job_loaded(self, job: dict) -> None:
-        self._job = {**self._job, **job}
+        # The service's fields come only from the fresh answer, so a reason (or
+        # reason_details) it stopped sending disappears from this line and the subtitle.
+        self._job = v.refresh_job(self._job, job)
+        if job.get("status"):
+            self._job_reason = job.get("reason")
+            self._update_subtitle()
         self._render_summary_line()
 
     def _live(self) -> bool:
         # LogScreen keeps _job_status current (get_job, and the tail seeing the job end).
         return v.is_live({"status": self._job_status or self._job.get("status")})
+
+    def _refresh_status(self) -> None:
+        # The tail pauses off the Logs tab, so it can't be what notices the job ending.
+        if self.app.screen is self and self._live():
+            self._fetch_status()
+
+    @work(thread=True, exclusive=True, group="status")
+    def _fetch_status(self) -> None:
+        try:
+            job = self._client.get_job(self._job_id)
+        except Exception:  # noqa: BLE001 - keep the current view; the next tick retries
+            return
+        if isinstance(job, dict) and job.get("status"):
+            self._post(self._apply_status, job)
+
+    def _apply_status(self, job: dict) -> None:
+        ended = is_active_status(self._job_status) and not is_active_status(job.get("status"))
+        # Status, reason and sub-job statuses come from this job as they are now:
+        # a reason the service stopped sending (a job that left pending) is gone.
+        # (_take_job also redraws the summary line from it.)
+        self._take_job(job)
+        if ended and self._current_source:
+            # Show the saved console now, as the tail would after its next error.
+            self._start_tail(self._current_source, user=False)
+            return
+        # A Logs tab waiting for the job (or its sub-job) to start tails it once it can.
+        self._resume_waiting_tail()
 
     # ── tabs & bindings ──
     def action_show_tab(self, tab: str) -> None:
@@ -413,303 +962,72 @@ class JobDetailScreen(LogScreen):
         except Exception:  # noqa: BLE001 - not mounted yet
             pass
 
-    def _other_tab_shown(self, tab: str) -> None:
-        self._focus_active_tab()
-        if tab == "metrics":
-            self.call_after_refresh(self._render_metric_chart)  # it was sized while hidden
-        elif tab == "checkpoints" and not self._cp_loaded:
-            self._load_checkpoints()
-
     def check_action(self, action: str, parameters):
         tab = self._active_tab
+        if action == "filter" and isinstance(self.focused, Input):
+            return False  # / is a priority key (see LogScreen): in a text box it is typed
         if action in _LOG_ONLY:
             return tab == "logs"
         if action == "resource_range":
-            return False  # 1-4 pick tabs here; w cycles the GPU window
+            return False  # digits pick tabs here, not windows; w cycles the GPU window
+        if action == "resource_chart":
+            # Only while the pane shows one of the two charts; elsewhere, and while both
+            # are shown (where switching would change nothing), m does nothing.
+            return tab == "resource" and self._resource_single
         if action == "cycle_window":
-            return tab in ("metrics", "resource")
-        if action in ("custom_window", "toggle_axis"):
-            return tab == "metrics"
-        if action == "cycle_cp_sort":
-            return tab == "checkpoints"
+            return tab == "resource"
+        if action == "resource_sub_job":
+            # < and >: on Resources, with another sub-job to switch to.
+            return tab == "resource" and len(self._resource_sub_job_ids()) > 1
+        if action == "resource_all_gpus":
+            return tab == "resource" and self._resource_gpu is not None
         return True
 
-    def _display(self, line: str) -> str:
-        # Tag every log line with the sub-job it came from; banners stay as-is.
-        if not self._current_source or line.startswith(("— ", "[")) or line == "No log output is available.":
-            return line
-        tag = source_label(self._current_source).replace(" #", ":")
-        return f"{tag} │ {line}"
+    def _line_prefixes(self) -> tuple[str, str]:
+        # Tag every log line with the sub-job being tailed, and line its later
+        # rows (wrapped, or a traceback's lines) up under its text; the TUI's
+        # own status lines stay as they are (LogScreen._prefixes).
+        if not self._current_source:
+            return "", ""
+        tag = one_line(safe_text(source_label(self._current_source).replace(" #", ":")))
+        return f"{tag} │ ", f"{' ' * v.cell_width(tag)} │ "
 
-    def action_refresh_sources(self) -> None:
-        # r refreshes what the visible tab shows; Logs and Resources keep LogScreen's behavior.
-        if self._active_tab == "metrics":
-            self._load_metrics()
-        elif self._active_tab == "checkpoints":
-            self._load_checkpoints()
-        else:
-            super().action_refresh_sources()
+    def _ended_job(self) -> dict:
+        """This view's copy of the job with the newest status and reason (the tail
+        can see the job end before the next get_job refreshes the copy)."""
+        job = {**self._job, "status": self._job_status or self._job.get("status")}
+        if self._job_reason is not None:
+            job["reason"] = self._job_reason
+        return job
+
+    def _never_started(self) -> bool:
+        return v.never_started(self._ended_job())
+
+    def _no_log_output(self) -> str:
+        # A job that never got GPUs (placement_timeout and the like) wrote no logs: say why.
+        if self._never_started():
+            return f"No log output: {v.never_started_text(self._ended_job())}."
+        return super()._no_log_output()
 
     def _auto_refresh_data(self) -> None:
-        # Only the visible tab polls, and only while the job is live.
+        # Only the visible tab polls, and only while the job is live. Resources waits
+        # until the status check sees the shown sub-job running: before that it has no samples.
         if self.app.screen is not self or not self._live():
             return
-        if self._resource_active():
+        if self._resource_active() and self._resource_polls():
             self._start_resource_refresh(force=True)
-        elif self._active_tab == "checkpoints":
-            self._load_checkpoints()
-
-    def _auto_refresh_metrics(self) -> None:
-        if self.app.screen is self and self._active_tab == "metrics" and self._live():
-            self._load_metrics()
 
     # ── windows ──
+    def _resource_job(self) -> dict:
+        return self._job  # the Resources header's GPU type and requested GPUs
+
     def action_cycle_window(self) -> None:
         if self._resource_active():
             names = list(RANGES)
             i = names.index(self._resource_range) if self._resource_range in names else -1
             self.action_resource_range(names[(i + 1) % len(names)])
-            return
-        i = _METRIC_WINDOWS.index(self._metric_window) if self._metric_window in _METRIC_WINDOWS else -1
-        self._metric_window = _METRIC_WINDOWS[(i + 1) % len(_METRIC_WINDOWS)]
-        self._render_metric_chart()
-
-    def action_custom_window(self) -> None:
-        hint = "30m, 2h, 1d, all, steps:100-500"
-
-        def done(value):
-            if value is None:
-                return
-            win = v.parse_window(value)
-            if win is None:
-                self.notify(f"Couldn't read window “{escape(value)}”. Try {hint}.", severity="warning")
-                return
-            self._metric_window = win
-            self._render_metric_chart()
-
-        self.app.push_screen(PromptScreen("Metrics window", "", hint), done)
-
-    def action_toggle_axis(self) -> None:
-        self._metric_axis = "time" if self._metric_axis == "step" else "step"
-        self._render_metric_chart()
-
-    # ── metrics tab ──
-    @work(thread=True, exclusive=True, group="metrics")
-    def _load_metrics(self) -> None:
-        records = self._metrics_store.load(self._job_id)
-        if self._scope:
-            records = [r for r in records if not r.get("sub_job_id") or r.get("sub_job_id") == self._scope]
-        self._post(self._apply_metrics, records)
-
-    async def _apply_metrics(self, records: list) -> None:
-        self._metric_records = records
-        catalog = v.metric_catalog(records)
-        lv = self.query_one("#metriclist", ListView)
-        keys = [m.key for m in catalog]
-        if self._metric_key not in keys:
-            loss = v.primary_loss(catalog)
-            self._metric_key = loss.key if loss else (keys[0] if keys else None)
-        await lv.clear()
-        family = None
-        index = None
-        for i, info in enumerate(catalog):
-            if info.family != family:
-                family = info.family
-                lv.append(ListItem(Label(f"[b dim]{family}[/]"), disabled=True))
-            lv.append(ListItem(Label(f"{escape(info.label):<26} [b]{v.fmt_metric(info.latest):>9}[/b]"), id=f"metric-{i}"))
-            if info.key == self._metric_key:
-                index = len(lv) - 1
-        if index is not None:
-            lv.index = index
-        self._render_metric_head(catalog)
-        self._render_metric_chart()
-
-    def _render_metric_head(self, catalog: list) -> None:
-        head = self.query_one("#metric-head", Static)
-        if not catalog:
-            head.update("")
-            return
-        loss = v.primary_loss(catalog)
-        bits = []
-        if loss:
-            at = f" (step {loss.min_step})" if loss.min_step is not None else ""
-            bits.append(f"[b]{loss.label}[/b]  latest [b green]{v.fmt_metric(loss.latest)}[/]  ·  min [b]{v.fmt_metric(loss.minimum)}[/]{at}")
-        bits.append(f"{len(catalog)} metric(s) logged on this machine  ·  {len(self._metric_records)} record(s)")
-        head.update("  " + "     ".join(bits))
-
-    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
-        if event.list_view.id != "metriclist" or event.item is None or not (event.item.id or "").startswith("metric-"):
-            return
-        catalog = v.metric_catalog(self._metric_records)
-        idx = int(event.item.id.split("-", 1)[1])
-        if idx < len(catalog) and catalog[idx].key != self._metric_key:
-            self._metric_key = catalog[idx].key
-            self._render_metric_chart()
-
-    def _render_metric_chart(self) -> None:
-        try:
-            chart = self.query_one("#metric-chart", Static)
-        except Exception:  # noqa: BLE001 - not mounted
-            return
-        if not self._metric_records or not self._metric_key:
-            chart.update(
-                "[b]No client-logged metrics for this job on this machine.[/b]\n\n"
-                "The service does not keep per-step training metrics. Recipes run from this\n"
-                "machine record them automatically; from your own loop call:\n\n"
-                "  [b]from cortex_training.tui.stores import MetricsStore[/b]\n"
-                f'  [b]MetricsStore().append("{escape(self._job_id)}", {{"train_loss": loss}}, step=step)[/b]'
-            )
-            return
-        catalog = {m.key: m for m in v.metric_catalog(self._metric_records)}
-        info = catalog.get(self._metric_key)
-        pts = v.window_points(v.metric_points(self._metric_records, self._metric_key), self._metric_window)
-        if self._metric_axis == "step":
-            pts = [p for p in pts if p[1] is not None]
-            xs, x_fmt, axis = [p[1] for p in pts], (lambda s: f"step {int(s)}"), "training step"
-        else:
-            pts = [p for p in pts if p[0] is not None]
-            xs, x_fmt, axis = [p[0] for p in pts], v.fmt_clock, "wall-clock time"
-        ys = [p[2] for p in pts]
-        try:
-            width = max(40, self.query_one("#metric-pane").size.width - 2)
-            height = max(8, self.query_one("#metric-pane").size.height - 7)
-        except Exception:  # noqa: BLE001 - not laid out yet
-            width, height = 90, 14
-        stats = v.series_stats(ys)
-        title = f"[b]{escape(info.label if info else self._metric_key)}[/b]  [dim]({escape(self._metric_key)} · {info.family if info else ''})[/dim]"
-        sub = (f"window: [b]{v.window_label(self._metric_window)}[/b]  ·  x: [b]{axis}[/b]  ·  {len(ys)} point(s)  ·  "
-               f"latest [b]{v.fmt_metric(stats['latest'])}[/b]  min {v.fmt_metric(stats['min'])}  max {v.fmt_metric(stats['max'])}")
-        body = v.render_chart(xs, ys, width=width, height=height, x_fmt=x_fmt) if ys else ["(no points in this window — press w to widen it)"]
-        chart.update(title + "\n" + sub + "\n\n[cyan]" + escape("\n".join(body)) + "[/cyan]\n\n"
-                     "[dim]↑/↓ pick a metric · w cycle 1h / 6h / 24h / full job · W custom window · x step ↔ time[/dim]")
 
     def on_resize(self, event) -> None:
-        # LogScreen.on_resize also runs (log re-wrap, Resources); redraw the chart here.
-        if self._active_tab == "metrics":
-            self.call_after_refresh(self._render_metric_chart)
-
-    # ── checkpoints tab ──
-    def _load_checkpoints(self) -> None:
-        # A thread can't be cancelled, so never stack a second listing on a slow one.
-        if self._cp_loading:
-            return
-        self._cp_loading = True
-        self._fetch_checkpoints()
-
-    @work(thread=True, group="checkpoints")
-    def _fetch_checkpoints(self) -> None:
-        try:
-            cps = self._client.list_checkpoints(self._job_id)
-            error = None
-        except Exception as exc:  # noqa: BLE001 - surfaced in the tab
-            cps, error = None, f"{type(exc).__name__}: {exc}"
-        self._post(self._apply_checkpoints, cps if isinstance(cps, list) else None, error)
-
-    def _apply_checkpoints(self, cps, error) -> None:
-        self._cp_loading = False
-        if cps is not None:
-            self._checkpoints = cps
-        self._cp_loaded = True
-        self._cp_error = error
-        self._render_checkpoints()
-
-    def _cp_sorts(self) -> tuple:
-        # Sorting by step only means something when some checkpoint carries one.
-        if any(v.checkpoint_step(c) is not None for c in self._checkpoints):
-            return v.CHECKPOINT_SORTS
-        return tuple(k for k in v.CHECKPOINT_SORTS if k != "step")
-
-    def action_cycle_cp_sort(self) -> None:
-        sorts = self._cp_sorts()
-        i = sorts.index(self._cp_sort) if self._cp_sort in sorts else -1
-        self._cp_sort = sorts[(i + 1) % len(sorts)]
-        self._render_checkpoints()
-
-    def _render_checkpoints(self) -> None:
-        table = self.query_one("#cptable", DataTable)
-        cps = v.sort_checkpoints(self._checkpoints, self._cp_sort)
-        metric_keys = v.checkpoint_metric_keys(cps)
-        has_step = any(v.checkpoint_step(c) is not None for c in cps)
-        selected = None
-        if table.row_count:
-            try:
-                selected = self._cp_rows.get(table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value)
-            except Exception:  # noqa: BLE001 - no cursor row
-                selected = None
-        table.clear(columns=True)
-        table.add_columns("Checkpoint ID", "Type", *(["Step"] if has_step else []), "Created", *metric_keys)
-        self._cp_rows = {}
-        cursor = 0
-        for i, cp in enumerate(cps):
-            kind = v.checkpoint_kind(cp)
-            kind_cell = Text("◆ resumable", style="bold green") if kind == "resumable" else (
-                Text("○ weights-only", style="bold cyan") if kind == "weights-only" else Text(kind))
-            step = v.checkpoint_step(cp)
-            key = f"cp-{i}"
-            self._cp_rows[key] = cp
-            if selected is not None and cp.get("checkpoint_id") == selected.get("checkpoint_id"):
-                cursor = i
-            table.add_row(str(cp.get("checkpoint_id") or "?"), kind_cell,
-                          *(["—" if step is None else str(step)] if has_step else []),
-                          v.fmt_ts(cp.get("created_at")), *[v.fmt_metric(v._as_float(cp.get(k))) for k in metric_keys], key=key)
-        if cps:
-            table.move_cursor(row=cursor, animate=False)
-        counts = {k: sum(1 for c in cps if v.checkpoint_kind(c) == k) for k in ("resumable", "weights-only")}
-        head = (f"  [b]{len(cps)}[/b] checkpoint(s)  ·  [green]◆ {counts['resumable']} resumable[/green] "
-                f"[dim](weights + optimizer, resume training)[/dim]  ·  [cyan]○ {counts['weights-only']} weights-only[/cyan] "
-                f"[dim](HF weights, serve / export)[/dim]  ·  sorted by [b]{self._cp_sort}[/b]")
-        self.query_one("#cp-head", Static).update(head)
-        foot = f"[dim]Enter inspect · o sort by {' / '.join(self._cp_sorts())} · r refresh"
-        if self._live():
-            foot += f" · new checkpoints appear automatically (every {self._DATA_REFRESH_SECONDS}s)"
-        foot += "[/dim]"
-        if not cps:
-            foot = ("  [dim]No checkpoints saved by this job yet.[/dim]\n" if self._cp_loaded else "  Loading…\n") + foot
-        if self._cp_error:
-            foot = f"  [yellow]list_checkpoints failed: {escape(self._cp_error)}[/yellow]\n" + foot
-        self.query_one("#cp-foot", Static).update(foot)
-
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if event.data_table.id != "cptable":
-            return
-        cp = self._cp_rows.get(event.row_key.value)
-        if cp:
-            self.app.push_screen(CheckpointScreen(cp, self._job, v.display_name(self._job, self._aliases.all())))
-
-
-# ─── checkpoint detail ───────────────────────────────────────────────────────
-
-
-class CheckpointScreen(Screen):
-    """Expanded view of one checkpoint: fields, origin, config, fetch and deploy."""
-
-    BINDINGS = [
-        ("b", "app.pop_screen", "Back"),
-        ("escape", "app.pop_screen", "Back"),
-        ("y", "copy_instructions", "Copy commands"),
-        ("q", "app.quit", "Quit"),
-    ]
-
-    def __init__(self, checkpoint: dict, job: dict, name: str) -> None:
-        super().__init__()
-        self._cp = checkpoint
-        self._job = job
-        self._job_name = name
-        self._sections = v.checkpoint_details(checkpoint, job, name)
-
-    def compose(self) -> ComposeResult:
-        yield Header()
-        with VerticalScroll(id="cp-detail"):
-            for title, lines in self._sections:
-                yield Static(f"[b]{escape(title)}[/b]", classes="cp-title")
-                yield Static(escape("\n".join(lines)), classes="cp-section")
-        yield Footer()
-
-    def on_mount(self) -> None:
-        kind = v.checkpoint_kind(self._cp)
-        self.app.sub_title = f"checkpoint {self._cp.get('checkpoint_id')}  ·  {kind}"
-
-    def action_copy_instructions(self) -> None:
-        text = "\n".join(line for title, lines in self._sections[3:] for line in [f"# {title}", *lines])
-        self.app.copy_to_clipboard(text)
-        self.notify("Fetch and deploy commands copied to the clipboard.")
+        # LogScreen.on_resize also runs (log re-wrap, Resources); refit the summary
+        # line here.
+        self.call_after_refresh(self._render_summary_line)

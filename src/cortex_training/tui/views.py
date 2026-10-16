@@ -15,28 +15,33 @@
 
 """Pure view-model helpers for the TUI's job list, summary, and detail tabs.
 
-Search, sorting, summary fields, GPU and training-metric series, checkpoint
-details, and plain-text charts. Like ``format.py`` this never imports
+Search, sorting, and summary fields. Like ``format.py`` this never imports
 ``textual``, so every rule here is unit-testable without the TUI installed.
 """
 
 from __future__ import annotations
 
-import json
+import functools
 import math
 import re
 import shlex
+import unicodedata
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import datetime
-from datetime import timezone
 from typing import Any
 from typing import Iterable
 from typing import Optional
 
-from cortex_training.tui.format import _ACTIVE_STATUSES
-from cortex_training.tui.format import _num
-from cortex_training.tui.format import _subjob_config
+import requests
+from rich.cells import cell_len
+
+from cortex_training.tui.format import ACTIVE_STATUSES
+from cortex_training.tui.format import compact_number
+from cortex_training.tui.format import subjob_config
+from cortex_training.tui.format import local_time
+from cortex_training.tui.format import parse_ts  # noqa: F401 - views.parse_ts for the screens
+from cortex_training.tui.format import printable
 from cortex_training.tui.format import source_label
 
 RETENTION_DAYS = 183  # six months of job history
@@ -44,25 +49,10 @@ RETENTION_DAYS = 183  # six months of job history
 # ─── time ────────────────────────────────────────────────────────────────────
 
 
-def parse_ts(raw: Any) -> Optional[datetime]:
-    """Parse an ISO-8601 timestamp (nanosecond precision allowed) as aware UTC."""
-    if not raw:
-        return None
-    s = str(raw).strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    # Python's fromisoformat takes at most 6 fractional digits.
-    s = re.sub(r"(\.\d{6})\d+", r"\1", s)
-    try:
-        dt = datetime.fromisoformat(s)
-    except ValueError:
-        return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
-
 def fmt_ts(raw: Any) -> str:
+    """A timestamp as local ``YYYY-MM-DD HH:MM``; ``—`` when missing, unparseable or out of range."""
     dt = raw if isinstance(raw, datetime) else parse_ts(raw)
-    return dt.astimezone().strftime("%Y-%m-%d %H:%M") if dt else "—"
+    return (local_time(dt) if dt else "") or "—"
 
 
 def fmt_duration(seconds: Optional[float]) -> str:
@@ -81,11 +71,26 @@ def fmt_duration(seconds: Optional[float]) -> str:
     return f"{s}s"
 
 
+# A time at most this far ahead of this computer's clock reads "just now": the
+# service's clock and this one rarely agree to the second.
+CLOCK_SKEW_SECONDS = 300
+
+
 def fmt_ago(raw: Any, now: datetime) -> str:
+    """How long before ``now`` the time ``raw`` was, e.g. ``4m 05s ago``; ``—`` without one.
+
+    A time slightly ahead of ``now`` (clock skew) is ``just now``; one further
+    ahead says how far it is ahead of this computer's clock.
+    """
     dt = raw if isinstance(raw, datetime) else parse_ts(raw)
     if not dt:
         return "—"
-    return f"{fmt_duration((now - dt).total_seconds())} ago"
+    seconds = (now - dt).total_seconds()
+    if seconds < 0:
+        if -seconds <= CLOCK_SKEW_SECONDS:
+            return "just now"
+        return f"{fmt_duration(-seconds)} ahead of this computer's clock"
+    return f"{fmt_duration(seconds)} ago"
 
 
 # ─── job fields ──────────────────────────────────────────────────────────────
@@ -95,58 +100,508 @@ def status_word(status: Any) -> str:
     return (str(status or "").strip() or "?").removeprefix("JOB_STATE_").lower()
 
 
+def describe_error(exc: BaseException) -> str:
+    """A failed call for display, on one printable line: the HTTP status and the
+    service's message, not the URL.
+
+    requests' own text ("500 Server Error: ... for url: <full URL>") repeats the
+    host, database and schema and never includes the service's explanation.
+    The message is the service's (or the stage's) text, so it is made printable
+    (:func:`collapse`) before any screen draws it. A request that timed out
+    says how long it waited ("no answer from the service within 45 s").
+    """
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(exc, requests.exceptions.Timeout):
+        return _timeout_text(exc)
+    if not isinstance(status, int):
+        return collapse(f"{type(exc).__name__}: {exc}")
+    try:
+        body = response.json()
+        message = str(body.get("message") or body.get("error") or "") if isinstance(body, dict) else ""
+    except Exception:  # noqa: BLE001 - not JSON
+        message = ""
+    reason = str(getattr(response, "reason", "") or "")
+    return collapse(f"HTTP {status}" + (f" {reason}" if reason else "") + (f": {message}" if message else ""))
+
+
+# How long a timed-out request waited, as urllib3 says it: "(read timeout=45.0)".
+_TIMEOUT_SECONDS = re.compile(r"(?:read|connect) timeout=([0-9]+(?:\.[0-9]+)?)")
+
+
+def _timeout_text(exc: BaseException) -> str:
+    """A request that timed out, in a few words: how long it waited, not the connection pool's text."""
+    found = _TIMEOUT_SECONDS.search(str(exc))
+    within = f" within {float(found.group(1)):g} s" if found else " in time"
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return f"couldn't connect to the service{within} (ConnectTimeout)"
+    return f"no answer from the service{within} ({type(exc).__name__})"
+
+
+# The service's 500 when it can't resolve the job's Experiment for the caller: the
+# checkpoint routes say "... or not authorized for the training job", and the
+# experiment-run route that saved logs and GPU metrics start with says "... for
+# job <id>", which a deleted Experiment gets too.
+EXPERIMENT_ACCESS_MARKER = "Linked experiment is not found or not authorized"
+_EXPERIMENT_NOT_FOUND = "Linked experiment is not found"
+_ASK = "ask for access to the Experiment, or use the role that created the job"
+# What each way of being refused means for the tabs (see experiment_access).
+_EXPERIMENT_HINTS = {
+    "denied": f"this role can't read the job's Experiment (saved logs, GPU metrics and checkpoints live there); {_ASK}",
+    "missing": ("this role can't read the job's Experiment, or it no longer exists (saved logs, GPU metrics and "
+                f"checkpoints live there); {_ASK}"),
+    # The service still lists the checkpoints: only the SQL on the Experiment is refused.
+    "sql": f"this role can't read the job's Experiment, where saved logs and GPU metrics live (the checkpoints command works); {_ASK}",
+}
+
+
+def experiment_access(exc: BaseException) -> Optional[str]:
+    """How ``exc`` says this role can't read the job's Experiment, or None.
+
+    - ``"denied"``: the service's 500 ``Linked experiment is not found or not
+      authorized ...`` (the checkpoint routes);
+    - ``"missing"``: the experiment-run route's 500 ``Linked experiment is not
+      found for job ...``: the Experiment is hidden from this role, or gone;
+    - ``"sql"``: Snowflake refusing the SQL LIST or GET on the Experiment (a
+      ``MONITOR``-only role): saved logs and GPU metrics can't be read, and the
+      service still lists the checkpoints.
+
+    The service's message is in the HTTP reply, not in ``str(exc)``, so both are
+    read. A refusal about another object (a warehouse, a schema) is None even
+    when its message names the Experiment.
+    """
+    text = f"{exc}\n{_reply_text(exc)}"
+    if EXPERIMENT_ACCESS_MARKER in text:
+        return "denied"
+    if _EXPERIMENT_NOT_FOUND in text:
+        return "missing"
+    if _EXPERIMENT_SQL_DENIED.search(text):
+        return "sql"
+    return None
+
+
+def experiment_access_hint(exc: BaseException) -> str | None:
+    """The one-line explanation when ``exc`` means this role can't read the job's Experiment
+    (see :func:`experiment_access`), else None."""
+    kind = experiment_access(exc)
+    return _EXPERIMENT_HINTS[kind] if kind else None
+
+
 def is_live(job: Any) -> bool:
-    """Strictly a recognized active state (unknown counts as historical here)."""
-    return isinstance(job, dict) and status_word(job.get("status")) in _ACTIVE_STATUSES
+    """A recognized active state, or the service's UNKNOWN.
+
+    The service answers UNKNOWN when it could not read a job's live state, so
+    the job may well still be running, unless the service says the control
+    plane has no record of the job (:func:`job_not_found`). Other unrecognized
+    strings count as historical.
+    """
+    word = status_word(job.get("status")) if isinstance(job, dict) else ""
+    return word in ACTIVE_STATUSES or (word == "unknown" and not job_not_found(job))
+
+
+def job_not_found(job: Any) -> bool:
+    """An UNKNOWN job whose reason says the control plane has no record of it
+    (``Job status unavailable: the job was not found in the Control Plane``):
+    it isn't running, so it isn't live."""
+    if not (isinstance(job, dict) and status_word(job.get("status")) == "unknown"):
+        return False
+    return "not found" in " ".join(collapse(job.get(key) or "") for key in ("reason", "reason_details")).lower()
 
 
 def job_id_of(job: dict) -> str:
     return str(job.get("job_id") or job.get("id") or "")
 
 
+def is_unknown(job: Any) -> bool:
+    """The service's UNKNOWN: it could not read the job's live state from the control plane."""
+    return isinstance(job, dict) and status_word(job.get("status")) == "unknown"
+
+
+# ─── names and comments ──────────────────────────────────────────────────────
+
+NAME_WIDTH = 80  # a one-line name is cut to this many terminal cells
+# printable (from format.py, so the Logs tab's one-line helper uses the same rule)
+# replaces the characters a terminal would act on, or that reorder or hide the
+# text around them, with U+FFFD, and keeps at most format.MAX_COMBINING_MARKS
+# combining diacritics on one character.
+
+
+def collapse(text: Any) -> str:
+    """``text`` printable on one line: each run of whitespace, newlines too, as one space."""
+    return " ".join(printable(text if text is not None else "").split())
+
+
+def printable_data(value: Any) -> Any:
+    """``value`` (decoded JSON) with every string in it, dict keys too, made :func:`printable`.
+
+    Numbers, booleans and None are returned as they are. A string with nothing
+    to replace is returned as it is, so a large job list costs little.
+    """
+    if isinstance(value, str):
+        return value if value.isprintable() else printable(value)
+    if isinstance(value, dict):
+        return {printable_data(key): printable_data(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [printable_data(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(printable_data(item) for item in value)
+    return value
+
+
+def cell_width(text: str) -> int:
+    """The terminal cells ``text`` takes: wide (CJK, emoji) characters take two."""
+    return cell_len(text)
+
+
+def _cut_cells(text: str, width: int) -> str:
+    """The longest start of ``text`` that fits in ``width`` cells, never splitting
+    a character; ``""`` when even the first one is wider.
+
+    Each candidate start is measured whole with ``cell_len`` (a binary search on
+    its length), so wide and combining characters count as the terminal draws
+    them. (Not ``rich.cells.chop_cells``: before rich 13.7 it returns its pieces
+    in reverse order.)
+    """
+    if width <= 0 or not text:
+        return ""
+    if cell_len(text) <= width:
+        return text
+    fits, too_long = 0, len(text)  # text[:fits] fits in width; text[:too_long] does not
+    while too_long - fits > 1:
+        mid = (fits + too_long) // 2
+        if cell_len(text[:mid]) <= width:
+            fits = mid
+        else:
+            too_long = mid
+    return text[:fits]
+
+
+def fit_cells(text: str, width: int) -> str:
+    """``text`` cut to at most ``width`` terminal cells, ending in ``…`` when cut."""
+    if cell_len(text) <= width:
+        return text
+    return _cut_cells(text, width - 1).rstrip() + "…"
+
+
+def wrap_cells(line: str, width: int) -> list:
+    """One line of text wrapped to rows of at most ``width`` terminal cells.
+
+    It breaks between words where it can and inside a word where it must, and
+    it counts cells, not characters, so wide (CJK, emoji) text stays inside
+    the width. The line's own indentation is kept on its first row.
+    """
+    width = max(2, width)
+    body = line.lstrip(" ")
+    indent = line[: len(line) - len(body)]
+    row = indent if cell_len(indent) < width else ""
+    rows: list = []
+    for token in re.findall(r"\S+|\s+", body):
+        if token.isspace():
+            if row.strip():
+                row += token  # between words; dropped where the row breaks
+            continue
+        while token:
+            if cell_len(row) + cell_len(token) <= width:
+                row += token
+                break
+            if row.strip():  # the word starts the next row
+                rows.append(row.rstrip())
+                row = ""
+                continue
+            head = _cut_cells(token, width - cell_len(row))
+            if not head:  # not even one character fits after the indent
+                row = ""
+                head = _cut_cells(token, width) or token[0]
+            rows.append(row + head)
+            row, token = "", token[len(head):]
+    rows.append(row.rstrip())
+    return rows
+
+
+def _text_lines(text: Any) -> tuple:
+    """The non-blank lines of ``text``, printable, whitespace collapsed."""
+    return _lines_of(printable(text or ""))
+
+
+@functools.lru_cache(maxsize=4096)
+def _lines_of(s: str) -> tuple:
+    return tuple(line for line in (" ".join(part.split()) for part in s.split("\n")) if line)
+
+
+def first_line(text: Any) -> str:
+    """The first non-blank line of ``text``, whitespace collapsed, never cut."""
+    lines = _text_lines(text)
+    return lines[0] if lines else ""
+
+
+def one_line(text: Any, width: int = NAME_WIDTH) -> str:
+    """The first non-blank line of ``text``, whitespace collapsed, ellipsized.
+
+    The ellipsis marks a line cut at ``width`` terminal cells and also a text
+    that goes on past its first line.
+    """
+    lines = _text_lines(text)
+    if not lines:
+        return ""
+    first, more = lines[0], len(lines) > 1
+    if cell_len(first) > (width - 2 if more else width):
+        return _cut_cells(first, max(1, width - 1)).rstrip() + "…"
+    return f"{first} …" if more else first
+
+
+def comment_of(job: Any) -> str:
+    """The job's create-time ``comment`` (all of it, printable), or ``""``."""
+    raw = job.get("comment") if isinstance(job, dict) else None
+    return printable(raw).strip() if raw is not None else ""
+
+
+def alias_of(job: dict, aliases: Optional[dict] = None) -> str:
+    """The job's local display name (set with ``n``), or ``""``."""
+    return one_line((aliases or {}).get(job_id_of(job)) or "")
+
+
 def display_name(job: dict, aliases: Optional[dict] = None) -> str:
-    """Local alias first, then a server-side ``comment``; empty when neither."""
-    jid = job_id_of(job)
-    alias = (aliases or {}).get(jid)
-    if alias:
-        return alias
-    comment = job.get("comment")
-    return str(comment).strip() if comment else ""
+    """Local alias first, then the first line of the server-side ``comment``;
+    empty when neither."""
+    return alias_of(job, aliases) or one_line(comment_of(job))
+
+
+def search_name(job: dict, aliases: Optional[dict] = None) -> str:
+    """The name search matches: the job's whole local alias, else the whole first
+    line of its comment. Unlike :func:`display_name` it is never cut, so the end
+    of a long (or wide-character) name can be found too."""
+    return first_line((aliases or {}).get(job_id_of(job)) or "") or first_line(comment_of(job))
+
+
+def rename_prompt(job: dict, aliases: Optional[dict] = None) -> tuple:
+    """``(value, placeholder)`` for the rename prompt.
+
+    It starts with the job's alias, whole. Without one it starts empty, and the
+    placeholder shows the first line of the comment, which is already the job's
+    name, so Enter keeps that name instead of copying it into an alias.
+    """
+    alias = first_line((aliases or {}).get(job_id_of(job)) or "")
+    comment = first_line(comment_of(job))
+    return alias, fit_cells(comment, 70) if comment else "e.g. qwen3-8b lora sweep #3"
+
+
+def alias_to_store(job: dict, typed: Any) -> str:
+    """The alias to keep for a name typed in the rename prompt; ``""`` for none.
+
+    A name that only repeats the first line of the job's comment is not kept:
+    without an alias, that line is the job's name already.
+    """
+    name = collapse(typed)
+    return "" if name == first_line(comment_of(job)) else name
+
+
+def shown_name(job: dict, aliases: Optional[dict] = None) -> str:
+    """What the list and preview call a job: its display name, else its job id."""
+    return display_name(job, aliases) or job_id_of(job)
+
+
+# ─── sub-jobs ────────────────────────────────────────────────────────────────
+
+# Sub-job type as the id's middle segment: the create-time type
+# ``log_probability`` is ``log_prob`` there.
+_ID_TYPES = {"training": "training", "sampling": "sampling", "log_probability": "log_prob", "log_prob": "log_prob"}
+
+
+def sub_job_kind(sj: dict) -> str:
+    """``training``, ``sampling`` or ``log_prob``; ``""`` when the entry names no known type."""
+    raw = str(sj.get("job_type") or sj.get("type") or "").strip().lower().removeprefix("job_type_")
+    return _ID_TYPES.get(raw, "")
 
 
 def sub_jobs(job: dict) -> list:
-    return [s for s in job.get("sub_jobs") or [] if isinstance(s, dict)]
+    """The job's sub-job entries.
+
+    When the service can't reach the control plane it answers UNKNOWN and lists
+    only the configs it stored, with no sub-job ids. For such a row (and no
+    other) the ids are derived the way the control plane assigns them,
+    ``JOB_ID:TYPE:INDEX`` with INDEX the zero-based count of that type in
+    submission order, but only when the row carries all of that: a job id, and
+    a known type on every entry, none of which has an id of its own. An entry
+    left with neither an id nor a type is labelled ``config #N``, its place in
+    the list, never by its contents.
+    """
+    subs = [s for s in job.get("sub_jobs") or [] if isinstance(s, dict)]
+    for sj in subs:
+        if not (sj.get("sub_job_id") or sj.get("id")):
+            break
+    else:
+        if not is_unknown(job):
+            return subs  # the usual row (every entry has its id): nothing to derive or label
+    kinds = [sub_job_kind(s) for s in subs]
+    jid = job_id_of(job)
+    if subs and is_unknown(job) and jid and all(kinds) and not any(s.get("sub_job_id") for s in subs):
+        counts: dict = {}
+        derived = []
+        for sj, kind in zip(subs, kinds):
+            derived.append({**sj, "sub_job_id": f"{jid}:{kind}:{counts.get(kind, 0)}"})
+            counts[kind] = counts.get(kind, 0) + 1
+        return derived
+    return [sj if kind or sj.get("sub_job_id") or sj.get("id") else {**sj, "label": f"config #{i}"}
+            for i, (sj, kind) in enumerate(zip(subs, kinds))]
+
+
+def sub_job_type(sj: Any) -> str:
+    """A sub-job's type as the list shows it: ``training``, ``sampling`` or ``log_prob``
+    (the id's spelling, as the Logs tab tags it), else the type it names, lowercase."""
+    if not isinstance(sj, dict):
+        return ""
+    return sub_job_kind(sj) or str(sj.get("job_type") or sj.get("type") or "").strip().lower().removeprefix("job_type_")
 
 
 def sub_job_label(sj: Any) -> str:
-    """``training #0`` style label; the API spells job types in upper case."""
+    """``training #0`` style label (``log_prob #0``, as the sub-job id spells it), printable on
+    one line; the API spells job types in upper case.
+
+    An id may also come from a cached directory name, not the service's
+    printable answer, so the label is made printable here too.
+    """
     if isinstance(sj, dict):
-        sj = {**sj, "job_type": str(sj.get("job_type") or sj.get("type") or "").lower() or None}
-    return source_label(sj)
+        sj = {**sj, "job_type": sub_job_type(sj) or None}
+    return collapse(source_label(sj))
 
 
 def job_types(job: dict) -> list:
-    types = [str(s.get("job_type") or s.get("type") or "").lower() for s in sub_jobs(job)]
+    """Each sub-job's type, as :func:`sub_job_type` spells it."""
+    return [t for t in (sub_job_type(s) for s in sub_jobs(job)) if t]
+
+
+def _raw_job_types(job: dict) -> list:
+    """Each sub-job's type as the API spells it (``log_probability``), lowercase."""
+    types = [str(s.get("job_type") or s.get("type") or "").strip().lower().removeprefix("job_type_")
+             for s in sub_jobs(job)]
     return [t for t in types if t]
 
 
+# A job of more than one kind of sub-job: the kinds, shortened, in this order.
+_SHORT_KINDS = {"training": "train", "sampling": "sample", "log_prob": "logprob"}
+
+
 def job_type_label(job: dict) -> str:
-    types = job_types(job)
-    if "training" in types and "sampling" in types:
-        return "train+sample"
-    return ", ".join(dict.fromkeys(types)) or "—"
+    """``training``, ``sampling`` or ``log_prob`` for a job of one kind; ``train+sample``,
+    ``train+logprob`` and so on for a job of several."""
+    kinds = list(dict.fromkeys(job_types(job)))
+    if len(kinds) > 1 and all(kind in _SHORT_KINDS for kind in kinds):
+        return "+".join(_SHORT_KINDS[kind] for kind in _SHORT_KINDS if kind in kinds)
+    return ", ".join(kinds) or "—"
+
+
+def short_model(name: Any) -> str:
+    """A model name without its organization, as the list's Model column shows it
+    (``Qwen/Qwen3-8B`` → ``Qwen3-8B``)."""
+    return str(name or "").split("/")[-1]
+
+
+def _gpu_count(cfg: dict) -> int:
+    """A config's ``n_gpus`` as a whole number; 0 when it is missing or not a finite number
+    (JSON's ``1e999`` reads as infinity)."""
+    count = _as_float(cfg.get("n_gpus"))
+    return int(count) if count is not None else 0
 
 
 def sub_job_gpus(sj: dict) -> int:
-    cfg = _subjob_config(sj)
-    try:
-        return int(float(cfg.get("n_gpus") or 0))
-    except (TypeError, ValueError):
+    return _gpu_count(subjob_config(sj))
+
+
+_CONFIG_KEYS = {"training": "training_config", "sampling": "inference_config", "log_prob": "inference_config"}
+
+
+def _type_config(sj: dict, kind: Optional[str] = None) -> dict:
+    """The sub-job's own config block: ``training_config`` for training,
+    ``inference_config`` for sampling and log_prob (``kind``, when the caller
+    already has it, is :func:`sub_job_kind`)."""
+    key = _CONFIG_KEYS.get(sub_job_kind(sj) if kind is None else kind)
+    cfg = sj.get(key) if key else None
+    return cfg if isinstance(cfg, dict) else subjob_config(sj)
+
+
+def _multiplex_id(cfg: dict) -> str:
+    value = cfg.get("multiplex_job_id")
+    return collapse(value) if value else ""
+
+
+def multiplex_target(sj: dict) -> str:
+    """The sub-job this one is multiplexed onto (its config's ``multiplex_job_id``),
+    whose GPUs it runs on; ``""`` when it has GPUs of its own. Printable, on one line."""
+    return _multiplex_id(_type_config(sj))
+
+
+def requested_gpus(sj: dict) -> int:
+    """GPUs this sub-job adds to its job's request, by the control plane's rule:
+    its ``n_gpus``, except that a ``log_prob`` sub-job uses none and a sub-job
+    multiplexed onto another sub-job adds none (it shares that one's GPUs)."""
+    kind = sub_job_kind(sj)
+    if kind == "log_prob":
         return 0
+    cfg = _type_config(sj, kind)
+    if _multiplex_id(cfg):
+        return 0
+    return _gpu_count(cfg)
 
 
 def total_gpus(job: dict) -> int:
-    return sum(sub_job_gpus(s) for s in sub_jobs(job))
+    """The GPUs a job requested: :func:`requested_gpus` summed over its sub-jobs.
+
+    This is the request, not the allocation, which the job record does not
+    carry (placement can round up to whole nodes).
+    """
+    return sum(requested_gpus(s) for s in sub_jobs(job))
+
+
+def sub_job_gpu_text(sj: dict) -> str:
+    """A sub-job's GPU cell: what it requested, or ``shared`` when it runs on
+    another sub-job's GPUs. A multiplexed sub-job requests none of its own,
+    whatever its config's ``n_gpus`` says, which is how the job's GPU line and
+    the Resources tab count it too."""
+    if multiplex_target(sj):
+        return "shared"
+    return str(requested_gpus(sj) or ("0" if sub_job_kind(sj) == "log_prob" else "—"))
+
+
+def short_sub_job_id(sub_job_id: str) -> str:
+    """A ``JOB_ID:TYPE:INDEX`` id with its job id cut to 8 characters, such as
+    ``0a1b2c3d…:training:0``; any other id as it is."""
+    job_id, sep, rest = str(sub_job_id).partition(":")
+    return f"{job_id[:8]}…:{rest}" if sep and rest and len(job_id) > 9 else str(sub_job_id)
+
+
+def job_gpu_cell(job: dict, unit: str = "") -> str:
+    """A job's GPU cell: what it requested (``8 H200``, ``8 requested``), else
+    ``shared`` when it runs only on another job's GPUs, ``0`` when its only
+    sub-jobs are log_prob ones (which use none), else ``—``."""
+    total = total_gpus(job)
+    if total:
+        return f"{total} {unit}".rstrip()
+    subs = sub_jobs(job)
+    if any(multiplex_target(s) for s in subs):
+        return "shared"
+    return "0" if any(sub_job_kind(s) == "log_prob" for s in subs) else "—"
+
+
+def gpu_request_text(job: dict) -> str:
+    """The preview's GPU line, e.g. ``10 × H200 requested  (8 training #0 + 2 sampling #0)``."""
+    subs = sub_jobs(job)
+    total = total_gpus(job)
+    hw = str(job.get("hardware") or "").strip()
+    shared = [s for s in subs if multiplex_target(s)]
+    log_prob = [s for s in subs if sub_job_kind(s) == "log_prob"]
+    if total:
+        head = f"{total} × {hw} requested" if hw else f"{total} requested"
+    elif shared:
+        head = "no GPUs of its own requested"
+    elif log_prob:
+        head = "0 requested"
+    else:
+        return "—"
+    own = [f"{requested_gpus(s)} {sub_job_label(s)}" for s in subs if requested_gpus(s)]
+    notes = [" + ".join(own)] if len(own) > 1 or (own and shared) else []
+    notes += [f"{sub_job_label(s)} runs on the GPUs of {multiplex_target(s)}" for s in shared]
+    notes += [f"{sub_job_label(s)} uses none" for s in log_prob]
+    return head + (f"  ({'; '.join(notes)})" if notes else "")
 
 
 def job_models(job: dict) -> list:
@@ -154,15 +609,19 @@ def job_models(job: dict) -> list:
 
 
 def owner(job: dict) -> str:
-    user = job.get("submitted_by") or ""
-    role = job.get("owner_role") or ""
+    """``USER (ROLE)``; ``role ROLE`` when the job records no submitting user, so a
+    role is never taken for a user name; ``—`` when neither."""
+    user = collapse(job.get("submitted_by") or "")
+    role = collapse(job.get("owner_role") or "")
     if user and role:
         return f"{user} ({role})"
-    return str(user or role or "—")
+    if role:
+        return f"role {role}"
+    return user or "—"
 
 
 def training_method(sj: dict) -> str:
-    cfg = _subjob_config(sj)
+    cfg = subjob_config(sj)
     return "lora" if isinstance(cfg.get("peft_config"), dict) else "full"
 
 
@@ -181,58 +640,144 @@ def within_retention(job: dict, now: datetime, days: int = RETENTION_DAYS) -> bo
 
 def subjob_config_summary(sj: dict) -> str:
     """Compact human summary of one sub-job's create-time config."""
-    cfg = _subjob_config(sj)
+    cfg = subjob_config(sj)
     bits = []
     opt = cfg.get("optimizer")
     if isinstance(opt, dict):
         o = str(opt.get("name") or "")
         if opt.get("lr") is not None:
-            o = f"{o} lr={_num(opt['lr'])}".strip()
+            o = f"{o} lr={compact_number(opt['lr'])}".strip()
         if o:
             bits.append(o)
     for key, label in (("train_batch_size", "bs"), ("max_seq_len", "seq")):
         if cfg.get(key) is not None:
-            bits.append(f"{label}={_num(cfg[key])}")
+            bits.append(f"{label}={compact_number(cfg[key])}")
     peft = cfg.get("peft_config")
     if isinstance(peft, dict):
         lora = "LoRA"
         if peft.get("r") is not None:
-            lora += f" r={_num(peft['r'])}"
+            lora += f" r={compact_number(peft['r'])}"
         if peft.get("lora_alpha") is not None:
-            lora += f" α={_num(peft['lora_alpha'])}"
+            lora += f" α={compact_number(peft['lora_alpha'])}"
         bits.append(lora)
     elif str(sj.get("job_type") or "").lower() == "training":
         bits.append("full-param")
     if cfg.get("gpu_memory_utilization") is not None:
-        bits.append(f"mem={_num(cfg['gpu_memory_utilization'])}")
+        bits.append(f"mem={compact_number(cfg['gpu_memory_utilization'])}")
     return " · ".join(bits)
 
 
 def summary_fields(job: dict, name: str, now: datetime) -> list:
-    """(label, value) rows for the job preview, in display order."""
+    """(label, value) rows for the job preview, in display order.
+
+    ``name`` is the one-line display name; without one the row shows the job
+    id. A job with a ``comment`` also gets a ``Comment`` row with all of it,
+    unless the name already shows all of it. A time the job record lacks is
+    ``—``, with no "ago" after it.
+    """
     models = job_models(job)
-    hw = job.get("hardware") or "—"
-    gpus = total_gpus(job)
-    split = " + ".join(f"{sub_job_gpus(s)} {sub_job_label(s)}" for s in sub_jobs(job) if sub_job_gpus(s))
+    elapsed = job_elapsed(job, now)
+    # Elapsed runs from creation, so it includes any time spent queued or placing.
+    if is_unknown(job):
+        note = "includes queue time; status unavailable"
+    elif is_live(job):
+        note = f"includes queue time; {status_word(job.get('status'))}, so far"
+    else:
+        note = "includes queue time"
+    comment = comment_of(job)
+    location = location_label(job)
+    # The age only beside a time that is shown: a dash has none.
+    updated, ago = fmt_ts(job.get("updated_at")), fmt_ago(job.get("updated_at"), now)
     return [
-        ("Name", name or "— (press n to name this job)"),
+        ("Name", name or job_id_of(job)),
+        *([("Comment", comment)] if comment and comment != name else []),
         ("Job ID", job_id_of(job)),
+        *([("Location", location)] if location else []),
         ("Status", status_word(job.get("status")).upper()),
         ("Model", ", ".join(models) or "—"),
         ("Type", job_type_label(job)),
         ("Owner", owner(job)),
-        ("GPUs", f"{gpus} × {hw}" + (f"  ({split})" if split and len(sub_jobs(job)) > 1 else "")),
+        ("GPUs", gpu_request_text(job)),
         ("Created", fmt_ts(job.get("created_at"))),
-        ("Elapsed", fmt_duration(job_elapsed(job, now)) + ("  (running)" if is_live(job) else "")),
-        ("Last update", f"{fmt_ts(job.get('updated_at'))}  ({fmt_ago(job.get('updated_at'), now)})"),
+        ("Elapsed", fmt_duration(elapsed) + (f"  ({note})" if elapsed is not None else "")),
+        ("Last update", f"{updated}  ({ago})" if "—" not in (updated, ago) else updated),
     ]
+
+
+def reason_text(job: dict) -> str:
+    """``reason`` and ``reason_details`` on one printable line, ``""`` when neither.
+
+    For example ``quota_filled — needs 8 GPUs; 64 currently active``.
+    """
+    parts = [collapse(job.get(key) or "") for key in ("reason", "reason_details")]
+    return " — ".join(p for p in parts if p)
+
+
+# Failure reasons that mean the job never got GPUs, so no sub-job started or
+# wrote logs: every ``placement_*`` reason (``placement_timeout``,
+# ``placement_too_large``, ``placement_failed``) and these.
+PRE_START_REASONS = frozenset({"hardware_unavailable", "pending_timeout"})
+# Sub-job states before placement: a sub-job still in one never got GPUs.
+_UNPLACED = frozenset({"pending", "queued", "creating", "placing"})
+
+
+def never_started(job: Any) -> bool:
+    """An ended job that never got GPUs, so it has no logs to show.
+
+    It failed with a reason that says so (``placement_*``, or one of
+    :data:`PRE_START_REASONS`), or every sub-job the service lists for it is
+    still in a state before placement.
+    """
+    if not isinstance(job, dict) or is_live(job):
+        return False
+    reason = str(job.get("reason") or "").strip().lower()
+    if status_word(job.get("status")) == "failed" and (reason.startswith("placement_") or reason in PRE_START_REASONS):
+        return True
+    words = [status_word(sj.get("status")) for sj in sub_jobs(job)]
+    return bool(words) and all(word in _UNPLACED for word in words)
+
+
+def never_started_text(job: dict) -> str:
+    """Why a job that :func:`never_started` has no logs, as a clause, for example
+    ``the job never got GPUs (reason: placement_timeout), so no sub-job started or wrote logs``."""
+    ended = {"cancelled": "was cancelled and ", "canceled": "was cancelled and ",
+             "terminated": "was terminated and "}.get(status_word(job.get("status")), "")
+    reason = collapse(job.get("reason") or "")
+    why = f" (reason: {reason})" if reason else ""
+    return f"the job {ended}never got GPUs{why}, so no sub-job started or wrote logs"
+
+
+def status_unavailable_text(job: dict) -> str:
+    """What to say for an UNKNOWN job, using the sentence the service sends in
+    ``reason`` (``Job status unavailable: Control Plane is unavailable``)."""
+    reason = reason_text(job)
+    if reason.lower().startswith("job status unavailable"):
+        return reason
+    return f"status unavailable: {reason or 'the service could not read the live state'}"
+
+
+# Fields the service recomputes on every get: a fresh answer replaces them as a
+# whole, so one it stopped sending (a cleared reason) disappears. created_at is
+# not one: it never changes, and an UNKNOWN answer leaves it out.
+SERVICE_FIELDS = ("status", "reason", "reason_details", "updated_at", "state_changed_at", "sub_jobs")
+
+
+def refresh_job(current: Optional[dict], fresh: dict) -> dict:
+    """``current`` (say, a list row) updated with a fresh ``get_job`` answer.
+
+    The service-owned :data:`SERVICE_FIELDS` come only from ``fresh``; other
+    fields the row had and the answer lacks (``database_name``, ``created_at``)
+    are kept.
+    """
+    kept = {k: val for k, val in (current or {}).items() if k not in SERVICE_FIELDS}
+    return {**kept, **fresh}
 
 
 # ─── search ──────────────────────────────────────────────────────────────────
 
 # field -> help text; the field names users type in the search box.
 SEARCH_FIELDS = {
-    "name": "display name",
+    "name": "display name or comment",
     "id": "job id",
     "status": "job status",
     "owner": "submitting user or owning role",
@@ -240,7 +785,7 @@ SEARCH_FIELDS = {
     "model": "model name",
     "method": "full / lora",
     "gpu": "GPU type (H200, B200, B300)",
-    "gpus": "total GPU count",
+    "gpus": "requested GPU count",
     "optimizer": "optimizer name",
     "lr": "learning rate",
     "batch": "train batch size",
@@ -248,7 +793,13 @@ SEARCH_FIELDS = {
     "lora_r": "LoRA rank",
     "lora_alpha": "LoRA alpha",
     "dtype": "dtype",
+    "db": "database name (= and != by SQL identifier rules)",
+    "schema": "schema name (= and != by SQL identifier rules)",
 }
+# Fields that name where a job is. A row without a location (the configured
+# schema's own list) is in the configured database and schema, which the
+# caller passes as ``home``.
+_LOCATION_FIELDS = ("db", "schema")
 _FIELD_ALIASES = {
     "hardware": "gpu",
     "hw": "gpu",
@@ -267,9 +818,26 @@ _FIELD_ALIASES = {
     "user": "owner",
     "job_type": "type",
     "model_name": "model",
+    "database": "db",
+    "database_name": "db",
+    "schema_name": "schema",
 }
 _OPS = (">=", "<=", "!=", ":", "=", ">", "<")
 _TOKEN = re.compile(r"^([A-Za-z_][\w.]*)(>=|<=|!=|:|=|>|<)(.+)$")
+# One search token: runs of anything but blanks and quotes, and quoted pieces.
+_RAW_TOKEN = re.compile(r"""(?:[^\s"']+|"[^"]*"|'[^']*')+""")
+_WHOLLY_QUOTED = re.compile(r"""^(?:"[^"]*"|'[^']*')$""")
+
+
+def fold(text: Any) -> str:
+    """``text`` as search compares it: NFKC-normalized (``é`` written either way,
+    fullwidth ``ｗｉｄｅ`` as ``wide``) and case-folded."""
+    return _fold(text if isinstance(text, str) else str(text))
+
+
+@functools.lru_cache(maxsize=8192)
+def _fold(s: str) -> str:
+    return unicodedata.normalize("NFKC", s).casefold()
 
 
 @dataclass
@@ -277,35 +845,107 @@ class Query:
     terms: list = field(default_factory=list)
     filters: list = field(default_factory=list)  # (field, op, value)
     errors: list = field(default_factory=list)
+    # (key, op, value, key as typed) of filters on a key that is no search field:
+    # each one is an error until resolve_query finds the key as a member of a job.
+    unknown: list = field(default_factory=list)
 
     @property
     def empty(self) -> bool:
         return not self.terms and not self.filters
 
 
+def _tokens(text: str) -> list:
+    """``(token, quoted)`` pairs: shell-like words, ``quoted`` when the whole token was in quotes."""
+    text = text or ""
+    raw = _RAW_TOKEN.findall(text)
+    if "".join("".join(raw).split()) != "".join(text.split()):  # an unbalanced quote: plain words, as typed
+        return [(tok, False) for tok in text.split()]
+    out = []
+    for tok in raw:
+        try:
+            words = shlex.split(tok)
+        except ValueError:
+            words = [tok]
+        out.append((" ".join(words), bool(_WHOLLY_QUOTED.match(tok))))
+    return out
+
+
 def parse_query(text: str) -> Query:
     """Free-text words plus ``field<op>value`` filters (ops ``: = != > >= < <=``).
 
     A dotted field (``training_config.optimizer.lr``) is an advanced filter that
-    reads that member of each sub-job's config directly.
+    reads that member of a job, its sub-jobs and their configs. A key that is no
+    search field is an error here; :func:`resolve_query` makes it a filter on that
+    member when a loaded job has it (``seed=42``, ``ep_size>1``). A token in
+    quotes is a plain word, so ``"training:0"`` searches that text.
     """
     q = Query()
-    try:
-        tokens = shlex.split(text or "")
-    except ValueError:
-        tokens = (text or "").split()
-    for tok in tokens:
-        m = _TOKEN.match(tok)
+    for tok, quoted in _tokens(text):
+        m = None if quoted else _TOKEN.match(tok)
         if not m:
-            q.terms.append(tok.lower())
+            if tok:
+                q.terms.append(fold(tok))
             continue
         key, op, value = m.group(1).lower(), m.group(2), m.group(3)
         key = _FIELD_ALIASES.get(key, key)
         if key not in SEARCH_FIELDS and "." not in key:
             q.errors.append(f"unknown field '{m.group(1)}'")
+            q.unknown.append((key, op, value, m.group(1)))
             continue
         q.filters.append((key, op, value))
     return q
+
+
+def _member_keys(job: dict) -> set:
+    """The lowercase member names a job has at the top level of its record, its sub-jobs and their configs."""
+    keys = {str(k).lower() for k in job}
+    for sj in sub_jobs(job):
+        keys.update(str(k).lower() for k in sj)
+        keys.update(str(k).lower() for k in subjob_config(sj))
+    return keys
+
+
+def _config_paths(job: dict, key: str, prefix: str = "", obj: Any = None, depth: int = 0) -> set:
+    """Dotted paths, from a sub-job, of every config member named ``key`` below the top level."""
+    found: set = set()
+    if obj is None:
+        for sj in sub_jobs(job):
+            for top, cfg in sj.items():
+                if isinstance(cfg, dict):
+                    found |= _config_paths(job, key, str(top), cfg, 1)
+        return found
+    if depth > 6 or not isinstance(obj, dict):
+        return found
+    for k, v in obj.items():
+        path = f"{prefix}.{k}"
+        if str(k).lower() == key:
+            found.add(path)
+        if isinstance(v, dict):
+            found |= _config_paths(job, key, path, v, depth + 1)
+    return found
+
+
+def resolve_query(query: Query, jobs: Iterable[dict]) -> Query:
+    """``query`` with each key that is no search field made a filter on that member
+    (of the job record, a sub-job, or a sub-job's config), where a job in ``jobs``
+    has it. A key no job has stays an error, with the dotted paths that end in it
+    as a hint (``ep_size`` → ``training_config.ep_size`` when only nested)."""
+    if not query.unknown:
+        return query
+    jobs = [j for j in jobs if isinstance(j, dict)]
+    present: set = set()
+    for job in jobs:
+        present |= _member_keys(job)
+    filters, errors, unknown = list(query.filters), [], []
+    for key, op, value, typed in query.unknown:
+        if key in present:
+            filters.append((key, op, value))
+            continue
+        paths = sorted({p for job in jobs[:2000] for p in _config_paths(job, key)})[:3]
+        hint = f" (did you mean {' or '.join(paths)}?)" if paths else ""
+        errors.append(f"unknown field '{typed}'{hint}")
+        unknown.append((key, op, value, typed))
+    return Query(terms=list(query.terms), filters=filters, errors=errors, unknown=unknown)
 
 
 def _dig(obj: Any, path: list) -> list:
@@ -321,19 +961,45 @@ def _dig(obj: Any, path: list) -> list:
     return []
 
 
-def field_values(job: dict, key: str, name: str = "") -> list:
-    """All values a job carries for a search field (one per sub-job when relevant)."""
-    if "." in key:
+def _scalars(values: Iterable) -> list:
+    """``values`` with each list replaced by its scalar elements (at any depth); dicts dropped.
+
+    So a list member such as ``target_modules`` or ``betas`` matches when one of its elements does.
+    """
+    out: list = []
+    for value in values:
+        if isinstance(value, list):
+            out.extend(_scalars(value))
+        elif not isinstance(value, dict):
+            out.append(value)
+    return out
+
+
+def _location_name(job: dict, key: str, home: Optional[tuple]) -> Optional[str]:
+    """The stored database (``db``) or schema name of ``job``, else of ``home``; None when neither says."""
+    names = location_names(job) or home
+    return None if names is None else names[0 if key == "db" else 1]
+
+
+def field_values(job: dict, key: str, name: str = "", *, home: Optional[tuple] = None) -> list:
+    """All values a job carries for a search field (one per sub-job when relevant).
+
+    ``home`` is the configured ``(database_name, schema_name)``, where a row
+    that names no location of its own is.
+    """
+    if "." in key or key not in SEARCH_FIELDS:
+        # A dotted path, or (after resolve_query) a member name: read it from the
+        # job record, each sub-job, and each sub-job's config.
         path = key.split(".")
         found = _dig(job, path)
         for sj in sub_jobs(job):
             found.extend(_dig(sj, path))
-            found.extend(_dig(_subjob_config(sj), path))
-        return [v for v in found if not isinstance(v, (dict, list))]
+            found.extend(_dig(subjob_config(sj), path))
+        return _scalars(found)
     subs = sub_jobs(job)
-    cfgs = [_subjob_config(s) for s in subs]
+    cfgs = [subjob_config(s) for s in subs]
     if key == "name":
-        return [name] if name else []
+        return [v for v in dict.fromkeys((name, comment_of(job))) if v]
     if key == "id":
         return [job_id_of(job)] + [str(s.get("sub_job_id") or "") for s in subs]
     if key == "status":
@@ -341,9 +1007,11 @@ def field_values(job: dict, key: str, name: str = "") -> list:
     if key == "owner":
         return [str(v) for v in (job.get("submitted_by"), job.get("owner_role")) if v]
     if key == "type":
-        return job_types(job)
+        # The short kind the list shows (log_prob) and the type as the API spells it (log_probability).
+        return list(dict.fromkeys([*job_types(job), *_raw_job_types(job)]))
     if key == "model":
-        return job_models(job)
+        # The whole name, and the part after the organization that the Model column shows.
+        return list(dict.fromkeys(name for model in job_models(job) for name in (model, short_model(model))))
     if key == "method":
         return [training_method(s) for s in subs if str(s.get("job_type") or "").lower() == "training"]
     if key == "gpu":
@@ -352,6 +1020,11 @@ def field_values(job: dict, key: str, name: str = "") -> list:
         return [total_gpus(job)]
     if key == "dtype":
         return [s["dtype"] for s in subs if s.get("dtype")]
+    if key in _LOCATION_FIELDS:
+        stored = _location_name(job, key, home)
+        if stored is None:
+            return []
+        return list(dict.fromkeys((stored, sql_identifier(stored))))  # as stored, and as SQL quotes it
     if key in ("optimizer", "lr"):
         opts = [c.get("optimizer") for c in cfgs if isinstance(c.get("optimizer"), dict)]
         return [o.get("name" if key == "optimizer" else "lr") for o in opts if o.get("name" if key == "optimizer" else "lr") is not None]
@@ -370,7 +1043,7 @@ def _as_float(v: Any) -> Optional[float]:
         return None
     try:
         f = float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return f if math.isfinite(f) else None
 
@@ -384,7 +1057,7 @@ def _compare(actual: Any, op: str, wanted: str) -> bool:
             ">": a > w and not close, ">=": a >= w or close,
             "<": a < w and not close, "<=": a <= w or close,
         }[op]
-    sa, sw = str(actual).lower(), wanted.lower()
+    sa, sw = fold(actual), fold(wanted)
     if op == ":":
         return sw in sa
     if op == "=":
@@ -395,21 +1068,74 @@ def _compare(actual: Any, op: str, wanted: str) -> bool:
 
 
 def search_haystack(job: dict, name: str) -> str:
-    bits = [name, job_id_of(job), status_word(job.get("status")), owner(job), job.get("hardware") or ""]
-    bits += job_types(job) + job_models(job)
-    return " ".join(str(b) for b in bits).lower()
+    """What plain search words match in ``job``, folded (see :func:`fold`): the
+    name, the whole comment, ids, status, owner, GPU type, job type (as the list
+    shows it, ``train+sample``, and as the API spells it), and models."""
+    # The comment is searched whole, and also when a local alias is the name shown.
+    bits = [name, comment_of(job), job_id_of(job), status_word(job.get("status")), owner(job),
+            job.get("hardware") or "", job_type_label(job)]
+    bits += job_types(job) + _raw_job_types(job) + job_models(job)
+    bits += [s.get("sub_job_id") or "" for s in sub_jobs(job)]  # ids copied from logs or --sub-job-id
+    return fold(" ".join(str(b) for b in bits))
 
 
-def job_matches_query(job: dict, query: Query, name: str = "") -> bool:
+def location_words(job: dict) -> list:
+    """A row's location as plain words search it: as shown (``"ml"."dev"``) and bare (``ml.dev``), lowercase.
+
+    A search box turns a typed ``"ml"."dev"`` into ``ml.dev`` (the quotes group
+    words), so both spellings find it.
+    """
+    names = location_names(job)
+    if names is None:
+        return []
+    return list(dict.fromkeys((fold(location_label(job)), fold(printable(f"{names[0]}.{names[1]}")))))
+
+
+def _starts_a_name(term: str, words: list) -> bool:
+    """``term`` occurs in ``words`` at the start of a database or schema name.
+
+    Not anywhere: the documented database ``CORTEX_TRAINING_DB`` contains
+    "training", which would then match every job in it.
+    """
+    for text in words:
+        at = text.find(term)
+        while at != -1:
+            if at == 0 or text[at - 1] in '."':
+                return True
+            at = text.find(term, at + 1)
+    return False
+
+
+def _same_name(stored: str, wanted: str) -> bool:
+    """``wanted`` names ``stored``: written exactly as stored, or as an identifier that resolves to
+    it by SQL rules (``team_db`` is ``TEAM_DB``, ``'"ml"'`` is ``ml``; ``ML`` is not ``ml``)."""
+    return wanted == stored or identifier_name(wanted) == stored
+
+
+def job_matches_query(job: dict, query: Query, name: str = "", *, home: Optional[tuple] = None,
+                      hay: Optional[str] = None) -> bool:
+    """Whether ``job`` matches every word and filter of ``query``.
+
+    ``home`` is the configured ``(database_name, schema_name)``, for ``db`` and
+    ``schema`` filters on a row that names no location of its own. ``hay`` is
+    :func:`search_haystack` of ``job`` and ``name`` when the caller keeps it.
+    """
     if query.errors:
         return False  # a typo'd field should surface, not silently match everything
     if query.empty:
         return True
-    hay = search_haystack(job, name)
-    if any(t not in hay for t in query.terms):
+    if hay is None:
+        hay = search_haystack(job, name)
+    places = location_words(job)
+    if any(t not in hay and not _starts_a_name(t, places) for t in query.terms):
         return False
     for key, op, value in query.filters:
-        values = field_values(job, key, name)
+        if key in _LOCATION_FIELDS and op in ("=", "!="):
+            stored = _location_name(job, key, home)
+            if (stored is not None and _same_name(stored, value)) != (op == "="):
+                return False
+            continue
+        values = field_values(job, key, name, home=home)
         if op == "!=":
             if any(not _compare(v, op, value) for v in values):
                 return False
@@ -419,12 +1145,40 @@ def job_matches_query(job: dict, query: Query, name: str = "") -> bool:
     return True
 
 
-def no_match_message(text: str, query: Query, searched: int) -> str:
-    lines = [f"No jobs match “{text}” among {searched} job(s) in the last 6 months."]
+def no_match_message(text: str, query: Query, searched: int, *, cut: str = "", older: Iterable[str] = (),
+                     fields: bool = True) -> str:
+    """Why a search found nothing, one point per line (every line after the first
+    starts with two spaces; a caller wraps each under its own start).
+
+    ``cut`` says what the list holds when it doesn't hold every job, for example
+    "the newest 2,000 of the last 6 months and every active job; more exist".
+    ``older`` are the ids of jobs older than six months, which the list hides,
+    that the search matches. ``fields``: list the search fields and what other
+    keys read, when a key is unknown (False where the search help on screen
+    lists them).
+    """
+    older = list(older)
+    if cut:
+        lines = [f"No jobs match “{text}” among the {searched:,} job(s) loaded: {cut}.",
+                 "  Search covers only the loaded jobs. To search all of one schema's jobs: --database DB "
+                 "--schema SCHEMA --schema-only."]
+    else:
+        lines = [f"No jobs match “{text}” among {searched:,} job(s) in the last 6 months."]
+    if older:
+        many = len(older) > 1
+        lines.append(f"  {len(older):,} older job{'s' if many else ''} match{'' if many else 'es'} (the list hides "
+                     f"jobs older than 6 months): cortex-training tui {older[0]} opens {'the newest' if many else 'it'}.")
     if query.errors:
-        lines.append("  " + "; ".join(query.errors) + ".  Fields: " + ", ".join(SEARCH_FIELDS))
+        lines.append("  " + "; ".join(query.errors) + ".")
+        if fields:
+            lines.append("  Fields: " + ", ".join(SEARCH_FIELDS) + "; any other key reads that member of a job, its "
+                         "sub-jobs or their configs (seed=42), and a dotted one a nested member "
+                         "(training_config.optimizer.lr<1e-4).")
+        if any(op == ":" for _key, op, _value, _typed in query.unknown):
+            lines.append("  To search for text with a colon in it, quote it: \"training:0\".")
     if query.terms:
-        lines.append("  Words match name, id, status, owner, GPU type, job type and model (case-insensitive).")
+        lines.append("  Words match name, comment, id, sub-job id, status, owner, GPU type, job type, model, and "
+                     "the start of a location's database or schema name (case-insensitive).")
     if query.filters:
         lines.append("  Filters must all match; try fewer, or ':' for a partial match (model:qwen).")
     lines.append("  Esc clears the search.")
@@ -434,7 +1188,12 @@ def no_match_message(text: str, query: Query, searched: int) -> str:
 # ─── sorting ─────────────────────────────────────────────────────────────────
 
 SORT_KEYS = ("created", "updated", "status")
-_STATUS_ORDER = ["running", "initializing", "placing", "pending", "queued", "creating", "failed", "cancelled", "terminated"]
+_STATUS_ORDER = ["running", "initializing", "placing", "pending", "queued", "creating", "unknown", "failed", "done",
+                 "cancelled", "terminated"]
+# Other spellings of a status, sorted with it.
+_STATUS_SPELLINGS = {"succeeded": "done", "completed": "done", "canceled": "cancelled"}
+_STATUS_RANK = {**{s: i for i, s in enumerate(_STATUS_ORDER)},
+                **{s: _STATUS_ORDER.index(same) for s, same in _STATUS_SPELLINGS.items()}}
 
 
 def _epoch(raw: Any) -> float:
@@ -445,408 +1204,173 @@ def _epoch(raw: Any) -> float:
 def sort_job_list(jobs: Iterable[dict], key: str = "created", descending: bool = True) -> list:
     jobs = [j for j in jobs if isinstance(j, dict)]
     if key == "status":
-        rank = {s: i for i, s in enumerate(_STATUS_ORDER)}
+        rank = _STATUS_RANK
         by_created = sorted(jobs, key=lambda j: _epoch(j.get("created_at")), reverse=True)
         return sorted(
             by_created,
-            key=lambda j: rank.get(status_word(j.get("status")), len(rank)),
+            key=lambda j: rank.get(status_word(j.get("status")), len(_STATUS_ORDER)),
             reverse=not descending,
         )
     field_name = "updated_at" if key == "updated" else "created_at"
     return sorted(jobs, key=lambda j: _epoch(j.get(field_name)), reverse=descending)
 
 
-# ─── GPU resources ───────────────────────────────────────────────────────────
-
-GIB = 1024**3
-
-
-@dataclass
-class GpuSample:
-    t: float  # epoch seconds
-    util: float  # mean GPU compute utilization across GPUs, %
-    mem_pct: float  # framebuffer used / total across GPUs, %
-    mem_used: float  # bytes, summed
-    mem_total: float  # bytes, summed
-    gpus: int
+def sort_direction(key: str, descending: bool) -> str:
+    """Say in words which jobs come first under ``sort_job_list(key, descending)``."""
+    if key == "status":
+        return "running first" if descending else "ended first"
+    return "newest first" if descending else "oldest first"
 
 
-def gpu_series(records: Iterable[dict]) -> list:
-    """Aggregate per-GPU telemetry rows (``gpu.jsonl``) into one sample per tick."""
-    buckets: dict = {}
-    for r in records:
-        if not isinstance(r, dict):
-            continue
-        dt = parse_ts(r.get("sample_ts"))
-        if not dt:
-            continue
-        t = round(dt.timestamp())
-        b = buckets.setdefault(t, {"util": [], "used": 0.0, "total": 0.0, "gpus": set()})
-        if (u := _as_float(r.get("gpu_util_pct"))) is not None:
-            b["util"].append(u)
-        used, free = _as_float(r.get("fb_used_bytes")), _as_float(r.get("fb_free_bytes"))
-        if used is not None and free is not None:
-            b["used"] += used
-            b["total"] += used + free
-        b["gpus"].add(r.get("gpu_uuid") or r.get("global_gpu_index"))
-    out = []
-    for t in sorted(buckets):
-        b = buckets[t]
-        util = sum(b["util"]) / len(b["util"]) if b["util"] else 0.0
-        mem_pct = 100.0 * b["used"] / b["total"] if b["total"] else 0.0
-        out.append(GpuSample(t, util, mem_pct, b["used"], b["total"], len(b["gpus"])))
-    return out
+# ─── locations, copied commands and access ───────────────────────────────────
+
+_PLAIN_IDENTIFIER = re.compile(r"[A-Z_][A-Z0-9_$]*")
 
 
-def sample_interval(records: Iterable[dict]) -> Optional[float]:
-    for r in records:
-        if isinstance(r, dict) and (v := _as_float(r.get("sample_interval_s"))):
-            return v
-    return None
+def sql_identifier(name: str) -> str:
+    """``name`` as a SQL identifier: bare when it is a plain uppercase name, else double-quoted.
 
-
-def series_stats(values: list) -> dict:
-    if not values:
-        return {"min": None, "avg": None, "max": None, "latest": None}
-    return {"min": min(values), "avg": sum(values) / len(values), "max": max(values), "latest": values[-1]}
-
-
-def window_samples(samples: list, seconds: Optional[float], end: Optional[float] = None) -> list:
-    """Samples in the trailing window ending at ``end`` (default: last sample)."""
-    if not samples or seconds is None:
-        return list(samples)
-    end = end if end is not None else samples[-1].t
-    return [s for s in samples if s.t >= end - seconds]
-
-
-def parse_window(text: str) -> Optional[tuple]:
-    """``10m`` / ``2h`` / ``1d`` / ``90s`` → ("time", seconds); ``all`` → ("all",);
-    ``steps:100-500`` → ("steps", 100, 500). ``None`` when unparseable."""
-    s = (text or "").strip().lower()
-    if s in ("all", "full", "job"):
-        return ("all",)
-    m = re.fullmatch(r"steps?\s*[:=]?\s*(\d+)\s*-\s*(\d+)", s)
-    if m:
-        lo, hi = int(m.group(1)), int(m.group(2))
-        return ("steps", min(lo, hi), max(lo, hi))
-    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([smhd])", s)
-    if m:
-        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
-        return ("time", float(m.group(1)) * mult)
-    return None
-
-
-def window_label(win: tuple) -> str:
-    if win[0] == "all":
-        return "full job"
-    if win[0] == "steps":
-        return f"steps {win[1]}–{win[2]}"
-    return f"last {fmt_duration(win[1]).replace(' 00s', '').replace(' 00m', '')}"
-
-
-# ─── training metrics ────────────────────────────────────────────────────────
-
-# canonical key -> (label, family, recognized raw names). Order = display order.
-KNOWN_METRICS = {
-    "train_loss": ("training loss", "SFT · common", ("train_loss", "train_nll", "loss", "avg_loss", "train/loss", "train_mean_nll")),
-    "val_loss": ("validation loss", "SFT · common", ("val_loss", "eval_loss", "validation_loss", "val_nll", "test/nll", "test_nll")),
-    "learning_rate": ("learning rate", "SFT · common", ("learning_rate", "lr", "last_lr", "optim/lr")),
-    "grad_norm": ("gradient norm", "SFT · common", ("grad_norm", "gradient_norm", "optim/grad_norm")),
-    "step_time": ("step time (s)", "SFT · common", ("step_time", "time_total", "time/step", "time/total")),
-    "tokens_per_s": ("token throughput (tok/s)", "SFT · common", ("tokens_per_s", "tokens_per_second", "throughput", "tok_per_s")),
-    "policy_loss": ("policy loss", "RL", ("policy_loss", "pg_loss", "loss/policy")),
-    "reward": ("reward", "RL", ("reward", "reward_mean", "env/all/reward/total", "mean_reward")),
-    "kl": ("KL divergence", "RL", ("kl", "kl_divergence", "kl_div", "approx_kl", "optim/kl_sample_train_v1")),
-    "entropy": ("entropy", "RL", ("entropy", "policy_entropy", "optim/entropy")),
-    "clip_frac": ("clip fraction", "RL", ("clip_frac", "clip_fraction", "clipfrac")),
-    "completion_len": ("completion length (tok)", "RL", ("completion_len", "completion_length", "response_length", "env/all/ac_tokens_per_turn")),
-    "eval_success": ("eval success rate", "RL", ("eval_success", "eval_success_rate", "success_rate", "eval/accuracy", "test/correct")),
-}
-_RAW_TO_CANON = {raw: canon for canon, (_, _, raws) in KNOWN_METRICS.items() for raw in raws}
-_BOOKKEEPING = {"step", "ts", "sub_job_id", "rank", "progress", "global_steps", "sft_model_calls", "sft_packed_rows"}
-LOSS_KEYS = ("train_loss", "policy_loss", "val_loss")
-
-
-@dataclass
-class MetricInfo:
-    key: str  # raw key in the records
-    label: str
-    family: str  # SFT · common | RL | other
-    count: int
-    latest: float
-    minimum: float
-    min_step: Optional[int]
-
-
-def canonical_metric(raw: str) -> Optional[str]:
-    return _RAW_TO_CANON.get(str(raw).lower())
-
-
-def metric_catalog(records: Iterable[dict]) -> list:
-    """Every numeric metric seen, known metrics first (in canonical order)."""
-    stats: dict = {}
-    for rec in records:
-        if not isinstance(rec, dict):
-            continue
-        step = rec.get("step")
-        for k, v in rec.items():
-            if k in _BOOKKEEPING or (f := _as_float(v)) is None:
-                continue
-            s = stats.setdefault(k, {"n": 0, "latest": f, "min": f, "min_step": step})
-            s["n"] += 1
-            s["latest"] = f
-            if f < s["min"]:
-                s["min"], s["min_step"] = f, step
-    order = list(KNOWN_METRICS)
-
-    def rank(k: str) -> tuple:
-        canon = canonical_metric(k)
-        return (order.index(canon), k) if canon else (len(order), k.lower())
-
-    out = []
-    for k in sorted(stats, key=rank):
-        canon = canonical_metric(k)
-        label, family, _ = KNOWN_METRICS[canon] if canon else (k, "other", ())
-        s = stats[k]
-        out.append(MetricInfo(k, label, family, s["n"], s["latest"], s["min"], s["min_step"]))
-    return out
-
-
-def primary_loss(catalog: list) -> Optional[MetricInfo]:
-    for canon in LOSS_KEYS:
-        for info in catalog:
-            if canonical_metric(info.key) == canon:
-                return info
-    return None
-
-
-def metric_points(records: Iterable[dict], key: str) -> list:
-    """(epoch_seconds | None, step | None, value) for one metric, in record order."""
-    pts = []
-    for rec in records:
-        if not isinstance(rec, dict) or (v := _as_float(rec.get(key))) is None:
-            continue
-        dt = parse_ts(rec.get("ts"))
-        step = rec.get("step")
-        pts.append((dt.timestamp() if dt else None, int(step) if isinstance(step, (int, float)) else None, v))
-    return pts
-
-
-def window_points(points: list, win: tuple) -> list:
-    if win[0] == "all" or not points:
-        return list(points)
-    if win[0] == "steps":
-        return [p for p in points if p[1] is not None and win[1] <= p[1] <= win[2]]
-    times = [p[0] for p in points if p[0] is not None]
-    if not times:
-        return list(points)
-    end = max(times)
-    return [p for p in points if p[0] is not None and p[0] >= end - win[1]]
-
-
-def fmt_metric(v: Optional[float]) -> str:
-    if v is None:
-        return "—"
-    if v == 0:
-        return "0"
-    a = abs(v)
-    if a >= 1e5 or a < 1e-3:
-        return f"{v:.2e}"
-    if a >= 100:
-        return f"{v:,.0f}"
-    return f"{v:.4g}"
-
-
-# ─── checkpoints ─────────────────────────────────────────────────────────────
-
-CHECKPOINT_SORTS = ("time", "step", "type")
-_CP_KNOWN = {"checkpoint_id", "checkpoint_type", "created_at", "global_steps", "global_step", "step"}
-
-
-def checkpoint_kind(cp: dict) -> str:
-    t = str(cp.get("checkpoint_type") or "").lower().replace("_", "-")
-    return {"weights-only": "weights-only", "weightsonly": "weights-only", "resumable": "resumable"}.get(t, t or "unknown")
-
-
-def checkpoint_step(cp: dict) -> Optional[int]:
-    for k in ("global_steps", "global_step", "step"):
-        if (v := _as_float(cp.get(k))) is not None:
-            return int(v)
-    m = re.search(r"global_step(\d+)", str(cp.get("checkpoint_id") or "") + str(cp.get("checkpoint_tag") or ""))
-    return int(m.group(1)) if m else None
-
-
-def checkpoint_metric_keys(cps: Iterable[dict]) -> list:
-    """Numeric quality metrics carried on checkpoint records (loss first)."""
-    keys: dict = {}
-    for cp in cps:
-        for k, v in cp.items():
-            if k not in _CP_KNOWN and _as_float(v) is not None and k not in ("version",):
-                keys[k] = True
-    return sorted(keys, key=lambda k: (0 if "loss" in k else 1, k))
-
-
-def sort_checkpoints(cps: Iterable[dict], key: str = "time", descending: bool = True) -> list:
-    cps = [c for c in cps if isinstance(c, dict)]
-    if key == "step":
-        return sorted(cps, key=lambda c: (checkpoint_step(c) if checkpoint_step(c) is not None else -1), reverse=descending)
-    if key == "type":
-        by_time = sorted(cps, key=lambda c: _epoch(c.get("created_at")), reverse=True)
-        return sorted(by_time, key=lambda c: checkpoint_kind(c), reverse=not descending)
-    return sorted(cps, key=lambda c: _epoch(c.get("created_at")), reverse=descending)
-
-
-def _training_sub_job(job: dict) -> Optional[dict]:
-    for sj in sub_jobs(job):
-        if str(sj.get("job_type") or "").lower() == "training":
-            return sj
-    return None
-
-
-def checkpoint_details(cp: dict, job: dict, name: str) -> list:
-    """(section title, lines) for the expanded checkpoint view."""
-    jid = job_id_of(job)
-    cid = str(cp.get("checkpoint_id") or "CHECKPOINT_ID")
-    kind = checkpoint_kind(cp)
-    train = _training_sub_job(job) or {}
-    fields = [f"{k}: {_num(v) if isinstance(v, float) else v}" for k, v in sorted(cp.items())]
-    step = checkpoint_step(cp)
-    if step is not None and "global_steps" not in cp:
-        fields.append(f"global_step (from tag): {step}")
-    origin = [
-        f"job id:      {jid}",
-        f"job name:    {name or '—'}",
-        f"sub-job:     {train.get('sub_job_id') or '—'}  (parent job {jid})",
-        f"model:       {train.get('model_name') or ', '.join(job_models(job)) or '—'}",
-        f"job status:  {status_word(job.get('status')).upper()}",
-    ]
-    cfg = {k: v for k, v in train.items() if k not in ("status", "sub_job_id")}
-    config_lines = json.dumps(cfg, indent=2, sort_keys=True).splitlines() if cfg else ["(training sub-job config unavailable)"]
-    fetch = [
-        "List this job's checkpoints:",
-        f"  cortex-training checkpoints {jid}",
-        "Export short-lived download URLs for every file (Python SDK):",
-        "  import os, urllib.request",
-        "  from cortex_training import CortexTrainingClient",
-        "  client = CortexTrainingClient.from_connection_name()",
-        f'  files = client.export_checkpoint("{jid}", "{cid}")["files"]',
-        "  for f in files:  # each has filename (may include a folder), url, size_bytes",
-        '      os.makedirs(os.path.dirname(f["filename"]) or ".", exist_ok=True)',
-        '      urllib.request.urlretrieve(f["url"], f["filename"])',
-        "URLs expire (see expires_at); export again when they do.",
-    ]
-    if kind == "weights-only":
-        deploy = [
-            "Batch inference (spins up a sampling job, generates, cancels):",
-            "  python -m recipes.inference.generate config=CONFIG.json \\",
-            f"    job_config=JOB_CONFIG source_job_id={jid} \\",
-            f'    checkpoint_id={cid} prompt="..."',
-            "Streaming endpoint (stays up until you cancel it):",
-            "  python -m recipes.inference.serve config=CONFIG.json \\",
-            f"    job_config=JOB_CONFIG source_job_id={jid} checkpoint_id={cid}",
-            "  then client.generate_stream(ENDPOINT_JOB_ID, prompts=[...]); cortex-training cancel ENDPOINT_JOB_ID",
-            "Or set on any sampling sub-job:",
-            f'  "source_checkpoint_info": {{"checkpoint_id": "{cid}", "source_job_id": "{jid}"}}',
-        ]
-    else:
-        deploy = [
-            "Resumable checkpoints hold weights + optimizer state and cannot serve inference directly.",
-            "Resume training by setting on the new job's training sub-job:",
-            f'  "source_checkpoint_info": {{"checkpoint_id": "{cid}", "source_job_id": "{jid}"}}',
-            "Add training_config.load_optimizer_states=false for weights only (needed when DP size changes).",
-            "For inference, save a weights-only checkpoint from a job resumed from this one.",
-        ]
-    return [
-        ("Checkpoint", fields),
-        ("Originating job", origin),
-        ("Training configuration when saved", config_lines),
-        ("Fetch / export the weights", fetch),
-        ("Deploy for inference" if kind == "weights-only" else "Resume or deploy", deploy),
-    ]
-
-
-# ─── plain-text charts ───────────────────────────────────────────────────────
-
-_BLOCKS = " ▁▂▃▄▅▆▇█"
-
-
-def render_chart(
-    xs: list,
-    ys: list,
-    *,
-    width: int,
-    height: int,
-    y_min: Optional[float] = None,
-    y_max: Optional[float] = None,
-    y_fmt=fmt_metric,
-    x_fmt=str,
-) -> list:
-    """Filled column chart with a y-axis and first/last x labels.
-
-    ``xs`` are numbers in any order (a recipe re-attached to a job restarts its
-    step counter). Columns are equal x-buckets; a bucket's value is the mean of
-    its points, and empty buckets stay blank.
+    ``CortexTrainingClient.for_job``'s rule: ``TEAM_DB`` stays bare, ``ml`` becomes ``"ml"``.
     """
-    gutter = 9
-    plot_w = max(4, width - gutter - 1)
-    height = max(2, height)
-    if not ys:
-        return ["(no data in this window)"]
-    pairs = sorted(zip(xs, ys), key=lambda p: p[0])
-    xs, ys = [p[0] for p in pairs], [p[1] for p in pairs]
-    lo = min(ys) if y_min is None else y_min
-    hi = max(ys) if y_max is None else y_max
-    if hi <= lo:
-        hi, lo = lo + (abs(lo) * 0.1 or 1.0), lo - (abs(lo) * 0.1 if y_min is None else 0)
-    x0, x1 = xs[0], xs[-1]
-    span = (x1 - x0) or 1.0
-    sums = [0.0] * plot_w
-    counts = [0] * plot_w
-    for x, y in zip(xs, ys):
-        col = min(plot_w - 1, int((x - x0) / span * plot_w))
-        sums[col] += y
-        counts[col] += 1
-    cols = [sums[i] / counts[i] if counts[i] else None for i in range(plot_w)]
-    # Sparse series (fewer points than columns) leave regular holes; carry the
-    # previous value across short gaps so a steady signal reads as steady.
-    max_gap = max(1, int(plot_w / max(1, len(ys)) * 2) + 1)
-    last, gap = None, 0
-    for i, c in enumerate(cols):
-        if c is not None:
-            last, gap = c, 0
-        elif last is not None:
-            gap += 1
-            if gap <= max_gap:
-                cols[i] = last
-    units = [None if v is None else max(0.0, min(1.0, (v - lo) / (hi - lo))) * height * 8 for v in cols]
-    rows = []
-    for r in range(height):
-        level = height - 1 - r  # 0 = bottom row
-        line = []
-        for u in units:
-            if u is None:
-                line.append(" ")
-                continue
-            fill = u - level * 8
-            line.append("█" if fill >= 8 else _BLOCKS[max(0, int(round(fill)))] if fill > 0 else " ")
-        if r == 0:
-            label = y_fmt(hi)
-        elif r == height - 1:
-            label = y_fmt(lo)
-        elif r == height // 2:
-            label = y_fmt((hi + lo) / 2)
-        else:
-            label = ""
-        rows.append(f"{label:>{gutter - 1}} ┤" + "".join(line))
-    rows.append(" " * (gutter - 1) + " └" + "─" * plot_w)
-    left, right = x_fmt(x0), x_fmt(x1)
-    rows.append(" " * (gutter + 1) + left + right.rjust(max(1, plot_w - len(left))))
-    return rows
+    return name if _PLAIN_IDENTIFIER.fullmatch(name) else '"' + name.replace('"', '""') + '"'
 
 
-def fmt_clock(epoch: float) -> str:
-    return datetime.fromtimestamp(epoch).strftime("%H:%M")
+_sql_identifier = sql_identifier  # the older private name
 
 
-def fmt_pct(v: Optional[float]) -> str:
-    return "—" if v is None else f"{v:.0f}%"
+def identifier_name(text: str) -> str:
+    """The name a SQL identifier resolves to: a ``"quoted"`` one exactly, any other uppercase.
+
+    The inverse of :func:`sql_identifier`: ``"ml"`` is ``ml``, ``team_db`` is ``TEAM_DB``.
+    """
+    text = text.strip()
+    if len(text) >= 2 and text.startswith('"') and text.endswith('"'):
+        return text[1:-1].replace('""', '"')
+    return text.upper()
+
+
+def location_names(job: Any) -> Optional[tuple]:
+    """``(database_name, schema_name)`` of a row from the account-wide list, else None.
+
+    Only that list names a job's location (both names, as stored, unquoted); the
+    configured schema's own list and ``get_job`` don't, and a job without one is
+    in the configured database and schema.
+    """
+    if not isinstance(job, dict):
+        return None
+    db, sch = job.get("database_name"), job.get("schema_name")
+    if isinstance(db, str) and db and isinstance(sch, str) and sch:
+        return db, sch
+    return None
+
+
+def client_location(client: Any) -> Optional[tuple]:
+    """``(database_name, schema_name)`` a client is bound to, resolved from its identifiers;
+    None when it doesn't say (a demo or test client's attributes may be anything)."""
+    db, sch = getattr(client, "database", None), getattr(client, "schema", None)
+    if isinstance(db, str) and db.strip() and isinstance(sch, str) and sch.strip():
+        return identifier_name(db), identifier_name(sch)
+    return None
+
+
+def location_label(job: Any) -> str:
+    """``DB.SCHEMA`` of a row that names its location, each name quoted when SQL
+    needs it (``TEAM_DB.EXPERIMENTS``, ``"ml"."dev"``); ``""`` without one."""
+    names = location_names(job)
+    if names is None:
+        return ""
+    return printable(f"{sql_identifier(names[0])}.{sql_identifier(names[1])}")
+
+
+def cli_options(*, database: Optional[str] = None, schema: Optional[str] = None,
+                connection: Optional[str] = None, config: Optional[str] = None, host: Optional[str] = None,
+                base_url: Optional[str] = None) -> list:
+    """The CLI's global options that reach one job: how it connects (``--connection
+    NAME``, a profile; ``--config FILE``; ``--host HOST``, with a PAT; or
+    ``--base-url URL``), then ``--database DB`` and ``--schema SCHEMA``, each
+    value quoted for the shell.
+
+    The copyable commands use these, so a command copied for a job in another
+    database and schema reaches that job, not the configured location. An
+    option whose value is unknown is left out.
+    """
+    found = (("--connection", connection), ("--config", config), ("--host", host), ("--base-url", base_url),
+             ("--database", database), ("--schema", schema))
+    return [f"{flag} {shlex.quote(value)}" for flag, value in found if isinstance(value, str) and value]
+
+
+def cli_command(arguments: str, **location: Optional[str]) -> str:
+    """``cortex-training [global options] ARGUMENTS`` on one line; see :func:`cli_options`."""
+    return " ".join(["cortex-training", *cli_options(**location), arguments])
+
+
+def _reply_text(exc: BaseException) -> str:
+    """The body of the reply an HTTP error carries; empty for anything else."""
+    try:
+        text = getattr(getattr(exc, "response", None), "text", "")
+    except Exception:  # noqa: BLE001 - an unreadable body
+        return ""
+    return text if isinstance(text, str) else ""
+
+
+# How Snowflake refuses SQL on the job's Experiment for this role (the LIST and
+# GET that read saved logs and GPU metrics): "003001 (42501): SQL access control
+# error: Insufficient privileges to operate on experiment 'NAME'", "Experiment
+# 'NAME' does not exist or not authorized", or the same said of a
+# snow://experiment/ path. The refusal itself must be about the Experiment, so a
+# denial about some other object (a warehouse, a schema) keeps its own text even
+# when the message names the Experiment elsewhere.
+_EXPERIMENT_SQL_DENIED = re.compile(
+    r"insufficient privileges to operate on experiment\b"
+    r"|\bexperiment(?:\s+run)?\s+(?:'[^']*'|\"[^\"]*\"|[^\s'\"]+)\s+does not exist or not authorized"
+    r"|snow://experiment/[^\s'\"]*['\"]?:?\s+does not exist or not authorized",
+    re.IGNORECASE)
+# A 403 refuses this role when its reply says so in Snowflake's words. An empty or
+# unrelated 403 (a proxy or a network gate can send one) keeps the standard text.
+_PRIVILEGE_REFUSAL = re.compile(r"privilege|not authorized|access control error", re.IGNORECASE)
+
+
+def access_hint(exc: BaseException, subject: str) -> Optional[str]:
+    """One line when ``exc`` means this role may not read the job's ``subject``, else None.
+
+    Every tab uses this for its own data (``subject`` is for example "saved
+    logs" or "GPU metrics"): the Logs tab and Resources explain the same
+    refusal the same way. An Experiment
+    the role can't read gets :func:`experiment_access_hint`'s line. A 403 whose
+    reply names a privilege says the role isn't allowed, keeping the service's
+    message. Anything else, an empty 403 included, is None: the caller shows the
+    standard error text.
+    """
+    hint = experiment_access_hint(exc)
+    if hint:
+        return hint
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status == 403 and _PRIVILEGE_REFUSAL.search(_reply_text(exc)):
+        return f"this role isn't allowed to read this job's {subject} ({describe_error(exc)})"
+    return None
+
+
+def _name_or_none(value: Any) -> Optional[str]:
+    return value if isinstance(value, str) and value else None
+
+
+def sign_in_options(sign_in: Any) -> dict:
+    """How a copied CLI command connects as the TUI does: ``config``, ``host`` and
+    ``base_url`` for :func:`cli_options`, from ``sign_in``
+    (``CortexTrainingLogTUI.sign_in``).
+
+    The TUI's config file, when it read one, as ``--config FILE``; and its PAT
+    host (``--host``) or base URL (``--base-url``), unless that file gives the
+    same one by itself (``host_in_config`` / ``base_url_in_config``): a flag or
+    the environment that set or overrode it is not part of the file. Empty for
+    a connection profile, or when it isn't known.
+    """
+    sign = sign_in if isinstance(sign_in, dict) else {}
+    kind, config = _name_or_none(sign.get("kind")), _name_or_none(sign.get("config"))
+    if kind == "pat":
+        in_config = bool(config) and sign.get("host_in_config") is True
+        return {"config": config, "host": None if in_config else _name_or_none(sign.get("host"))}
+    if kind == "url":
+        in_config = bool(config) and sign.get("base_url_in_config") is True
+        return {"config": config, "base_url": None if in_config else _name_or_none(sign.get("base_url"))}
+    return {}

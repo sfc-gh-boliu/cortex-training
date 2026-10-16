@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""App tests for the job list, job preview, tabbed detail, and checkpoint
-screens, driven by the offline :class:`DemoClient`."""
+"""App tests for the job list, job preview, and tabbed detail screens, driven
+by the offline :class:`DemoClient`."""
 
 import asyncio
 
@@ -31,18 +31,16 @@ from cortex_training.tui import views  # noqa: E402
 from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.app import JobListScreen  # noqa: E402
 from cortex_training.tui.demo import DemoClient  # noqa: E402
-from cortex_training.tui.screens import CheckpointScreen  # noqa: E402
 from cortex_training.tui.screens import JobDetailScreen  # noqa: E402
 from cortex_training.tui.screens import JobSummaryScreen  # noqa: E402
 from cortex_training.tui.stores import AliasStore  # noqa: E402
-from cortex_training.tui.stores import MetricsStore  # noqa: E402
 
 
 @pytest.fixture
 def demo(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
     client = DemoClient()
-    client.seed_local(aliases=AliasStore(), metrics=MetricsStore())
+    client.seed_local(aliases=AliasStore())
     return client
 
 
@@ -67,18 +65,23 @@ def _static(screen, selector) -> str:
     return str(screen.query_one(selector, Static).render())
 
 
-def test_job_list_groups_live_and_history_within_retention(demo):
+@pytest.mark.parametrize("schema_only", [False, True])
+def test_job_list_groups_live_and_history_within_retention(demo, schema_only):
     async def run():
-        app = CortexTrainingLogTUI(demo, poll_interval=0.01)
+        app = CortexTrainingLogTUI(demo, poll_interval=0.01, schema_only=schema_only)
         async with app.run_test(size=(180, 50)) as pilot:
             assert await _wait(pilot, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item)
             s = app.screen
             ids = list(s._job_by_item.values())
-            jobs = {views.job_id_of(j): j for j in demo.list_jobs()}
+            # The account-wide list has every location's jobs and leaves out those
+            # older than six months; the configured schema's list has them all, and
+            # the job list hides the old ones itself.
+            served = demo.list_jobs() if schema_only else list(demo.iter_jobs())
+            jobs = {views.job_id_of(j): j for j in served}
             live = [jid for jid in ids if views.is_live(jobs[jid])]
             assert ids[: len(live)] == live, "live jobs come first"
             assert len(ids) == len(jobs) - 2, "the two jobs older than six months are hidden"
-            assert "2 older hidden" in _static(s, "#listinfo")
+            assert ("2 older hidden" in _static(s, "#listinfo")) == schema_only
             # Live jobs are expanded into sub-job rows by default.
             assert any(sid.endswith(":sampling:0") for _jid, sid in s._sub_by_item.values())
             table = s.query_one("#jobs", DataTable)
@@ -135,7 +138,7 @@ def test_job_list_sort_cycles_and_reverses(demo):
     asyncio.run(run())
 
 
-def test_summary_then_tabs_then_checkpoint(demo):
+def test_summary_then_tabs(demo):
     rl = next(j for j in demo.list_jobs() if len(j["sub_jobs"]) == 2 and j["status"] == "RUNNING")
 
     async def run():
@@ -143,7 +146,8 @@ def test_summary_then_tabs_then_checkpoint(demo):
         async with app.run_test(size=(180, 50)) as pilot:
             assert await _wait(pilot, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item)
             app.push_screen(JobSummaryScreen(demo, rl["job_id"], job=rl))
-            assert await _wait(pilot, lambda: isinstance(app.screen, JobSummaryScreen) and app.screen._checkpoints)
+            assert await _wait(pilot, lambda: isinstance(app.screen, JobSummaryScreen)
+                               and app.screen._fetched_at is not None)
             summary = app.screen
             preview = _static(summary, "#preview")
             for label in ("Name", "Job ID", "Status", "Model", "Type", "Owner", "GPUs", "Created", "Elapsed", "Last update"):
@@ -162,30 +166,12 @@ def test_summary_then_tabs_then_checkpoint(demo):
             d = app.screen
             assert d.query_one("#job-tabs", TabbedContent).active == "resource"
             status = _static(d, "#resource-status")
-            # Resources shows the sub-job selected on the Logs tab (the first one here).
-            assert training in status and "15m" in status and "8 GPU(s)" in status and "last sample" in status
+            # Resources shows the sub-job selected on the Logs tab (the first one here), by name.
+            assert training.endswith(":training:0") and "training #0 (1 of 2" in status and "10m" in status and "8 reporting" in status and "newest" in status
+            assert "H200" in status and "8 requested" in status and "scraped every" in status
             assert "no GPU samples" not in _static(d, "#resource-chart")
             d.action_cycle_window()
-            assert d._resource_range == "1h" and "1h" in _static(d, "#resource-status")
-
-            d.action_show_tab("metrics")
-            assert await _wait(pilot, lambda: d._metric_key == "policy_loss")
-            assert "policy loss" in _static(d, "#metric-chart")
-            assert "last 1h" in _static(d, "#metric-chart")
-
-            d.action_show_tab("checkpoints")
-            assert await _wait(pilot, lambda: d.query_one("#cptable", DataTable).row_count > 0)
-            assert "resumable" in _static(d, "#cp-head") and "weights-only" in _static(d, "#cp-head")
-            # The service sends no step, so there is no Step column and no step sort.
-            columns = [str(c.label) for c in d.query_one("#cptable", DataTable).columns.values()]
-            assert columns == ["Checkpoint ID", "Type", "Created"]
-            d.action_cycle_cp_sort()
-            assert d._cp_sort == "type"
-            cp = next(iter(d._cp_rows.values()))
-            app.push_screen(CheckpointScreen(cp, d._job, "gsm8k grpo"))
-            assert await _wait(pilot, lambda: isinstance(app.screen, CheckpointScreen))
-            body = " ".join(str(w.render()) for w in app.screen.query(".cp-section"))
-            assert cp["checkpoint_id"] in body and "export_checkpoint" in body
+            assert d._resource_range == "30m" and "30m" in _static(d, "#resource-status")
             await _settle(app, pilot)
 
     asyncio.run(run())
@@ -205,22 +191,6 @@ def test_detail_logs_are_tagged_with_sub_job(demo):
             shown = [str(line) for line in d._logview._lines]
             assert any(line.startswith("sampling:0 │ ") and "vllm" in line for line in shown)
             assert not any(line.startswith("sampling:0 │ ") for line in d._shown_lines)  # buffer stays raw
-            await _settle(app, pilot)
-
-    asyncio.run(run())
-
-
-def test_metrics_tab_without_client_metrics_explains(tmp_path, monkeypatch):
-    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
-    client = DemoClient()  # no seed_local: no metrics on this machine
-    job = client.list_jobs()[0]
-
-    async def run():
-        app = CortexTrainingLogTUI(client, poll_interval=0.01)
-        async with app.run_test(size=(160, 45)) as pilot:
-            app.push_screen(JobDetailScreen(client, job["job_id"], job=job, initial_tab="metrics"))
-            assert await _wait(pilot, lambda: isinstance(app.screen, JobDetailScreen))
-            assert await _wait(pilot, lambda: "No client-logged metrics" in _static(app.screen, "#metric-chart"))
             await _settle(app, pilot)
 
     asyncio.run(run())

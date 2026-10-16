@@ -33,6 +33,13 @@ Defaults are Qwen3-8B full-parameter, thinking off, and 100 steps. It uses the
 builtin `who_trained_you` dataset as default.
 The default run will be finished within few minutes.
 
+The job is named after the recipe and model, for example
+`conversational-sft · Qwen3-8B` (`· Qwen3-8B LoRA` for a LoRA config). The
+name is the job's `comment`: `cortex-training get`, `list` and `tui` show it,
+and it can't be changed later. Pass `name="support-chat v4"` to choose another
+(at most 1,024 bytes), or `name=""` to create the job without one. A `comment`
+in the job config JSON is used when `name=` is not given.
+
 ## Common Variations
 
 ```bash
@@ -157,7 +164,8 @@ python -m recipes.sft.conversational.train \
   max_steps=MAX_STEPS \
   enable_thinking=ENABLE_THINKING \
   wandb_project=WANDB_PROJECT \
-  sf_tracking=SF_TRACKING
+  sf_tracking=SF_TRACKING \
+  name=JOB_NAME
 ```
 
 ```bash
@@ -196,10 +204,7 @@ python -m recipes.sft.conversational.train \
 
 ## Logs and Expected Results
 
-Metrics and configuration are written under `log_path`. When the run has a
-job id, its metrics are also kept in the TUI's local store
-(`jobs/<job>/metrics.jsonl` under `~/.cache/cortex-training/`), so
-`cortex-training tui` can chart them on this machine. To send the same
+Metrics and configuration are written under `log_path`. To send the same
 metrics to Weights & Biases:
 
 ```bash

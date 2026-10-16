@@ -78,11 +78,6 @@ def setup_logging(
         config=config,
         do_configure_logging_module=True,
     )
-    if job_id is not None:
-        # Also record metrics locally so `cortex-training tui` can chart them.
-        from cortex_training.tui.stores import LocalMetricsLogger
-
-        ml_logger = _CompositeLogger([ml_logger, LocalMetricsLogger(job_id)])
     if not getattr(config, "sf_tracking", False) or client is None or job_id is None:
         return ml_logger
     run_info = client.get_experiment_run(job_id)

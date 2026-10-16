@@ -34,13 +34,14 @@ from cortex_training.tui.demo import DemoClient  # noqa: E402
 from cortex_training.tui.screens import JobDetailScreen  # noqa: E402
 from cortex_training.tui.screens import JobSummaryScreen  # noqa: E402
 from cortex_training.tui.stores import AliasStore  # noqa: E402
+from cortex_training.tui.stores import MetricsStore  # noqa: E402
 
 
 @pytest.fixture
 def demo(tmp_path, monkeypatch):
     monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
     client = DemoClient()
-    client.seed_local(aliases=AliasStore())
+    client.seed_local(aliases=AliasStore(), metrics=MetricsStore())
     return client
 
 
@@ -172,6 +173,11 @@ def test_summary_then_tabs(demo):
             assert "no GPU samples" not in _static(d, "#resource-chart")
             d.action_cycle_window()
             assert d._resource_range == "30m" and "30m" in _static(d, "#resource-status")
+
+            d.action_show_tab("metrics")
+            assert await _wait(pilot, lambda: d._metric_key == "policy_loss")
+            assert "policy loss" in _static(d, "#metric-chart")
+            assert "last 1h" in _static(d, "#metric-chart")
             await _settle(app, pilot)
 
     asyncio.run(run())
@@ -191,6 +197,22 @@ def test_detail_logs_are_tagged_with_sub_job(demo):
             shown = [str(line) for line in d._logview._lines]
             assert any(line.startswith("sampling:0 │ ") and "vllm" in line for line in shown)
             assert not any(line.startswith("sampling:0 │ ") for line in d._shown_lines)  # buffer stays raw
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_metrics_tab_without_client_metrics_explains(tmp_path, monkeypatch):
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    client = DemoClient()  # no seed_local: no metrics on this machine
+    job = client.list_jobs()[0]
+
+    async def run():
+        app = CortexTrainingLogTUI(client, poll_interval=0.01)
+        async with app.run_test(size=(160, 45)) as pilot:
+            app.push_screen(JobDetailScreen(client, job["job_id"], job=job, initial_tab="metrics"))
+            assert await _wait(pilot, lambda: isinstance(app.screen, JobDetailScreen))
+            assert await _wait(pilot, lambda: "No client-logged metrics" in _static(app.screen, "#metric-chart"))
             await _settle(app, pilot)
 
     asyncio.run(run())

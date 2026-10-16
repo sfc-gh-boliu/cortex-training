@@ -759,7 +759,7 @@ or network gate can send an empty one) keeps the standard error text.
 ### Job TUI
 
 `cortex-training tui` is a read-only terminal UI for finding a job and
-inspecting its logs and GPU usage. It uses the same
+inspecting its metrics, logs, and GPU usage. It uses the same
 connection handling and fallback order as the CLI, including named and
 configured-default Snowflake profiles. Like `checkpoints`
 and `list --all`, it never creates the configured database or schema, which
@@ -803,8 +803,8 @@ cortex-training tui \
 Pass `--sub-job-id JOB_ID:training:0` to scope the job details to one matching
 sub-job; without `JOB_ID`, it opens that sub-job's job. An unmatched id is
 shown as an error, with the job's sub-job ids, rather than falling back to a
-different sub-job. `--demo` runs against generated jobs and telemetry, and
-keeps its names and caches in a temporary directory; the
+different sub-job. `--demo` runs against generated jobs, metrics and
+telemetry, and keeps its names and caches in a temporary directory; the
 title says `(demo)`. Its jobs are in three locations: the configured
 `CORTEX_TRAINING_DB.PUBLIC`, `TEAM_DB.EXPERIMENTS`, and a lowercase
 `"sandbox"."dev"`. It runs on the wall clock: live jobs keep logging (in the
@@ -1036,7 +1036,7 @@ field help under the search box shows only while the box has focus.
 
 | Key | Action |
 |-----|--------|
-| `Enter` | Open the job preview (or, on a sub-job row, that sub-job's details, on the Logs tab; on a "status unavailable" line, its job's preview); in the search box, show the matches of all that was typed and move to the list, where `Enter` opens the highlighted match |
+| `Enter` | Open the job preview (or, on a sub-job row, that sub-job's details: on the Metrics tab when this machine has client-logged metrics for the job, else on Logs; on a "status unavailable" line, its job's preview); in the search box, show the matches of all that was typed and move to the list, where `Enter` opens the highlighted match |
 | `/` / `esc` | Search / clear the search. Keys are taken in the order typed, also when they come faster than the list redraws: what is typed before `Enter` or `esc` is in the search they apply or clear, and the keys after `/`, `Enter` and `esc` go to the search box or the list |
 | `s` / `o` | Sort by created, updated, or status (`succeeded` and `completed` sort with `done`, `canceled` with `cancelled`) / reverse the order. The line above the list says which way it runs: `created ↓ newest first` or `↑ oldest first` (the same for updated), `status ↓ running first` or `↑ ended first`. The cursor goes to the first job |
 | `Home` / `End` | First / last job (`←`/`→` scroll the columns sideways) |
@@ -1098,7 +1098,7 @@ wrap under where they start. A character carrying more than four combining
 marks keeps the first four (so-called zalgo text would otherwise draw over the
 rows around it). Below
 that are the job's sub-jobs with their type, status, model, GPUs and key
-config. A multiplexed sub-job's config
+config, plus the latest loss. A multiplexed sub-job's config
 ends with the sub-job whose GPUs it runs on, for example `runs on
 0a1b2c3d…:training:0`. The sub-job table fits the screen. When its cells are
 wider, a model name over 36 cells and then the end of each config (down to 24
@@ -1119,9 +1119,12 @@ copy is still shown, for example `couldn't refresh: HTTP 500 Internal Server
 Error: ...; showing the copy read at 12:04:30` (or the job list's copy, when no
 read has succeeded yet).
 `Enter` on the "entire job" row or a sub-job row opens the details for that
-scope, on the Logs tab; the line above the table names the tab.
-`l` and `g` open the Logs and Resources tabs
-directly, and do the same in the details.
+scope: on the Metrics tab when this machine has client-logged metrics for the
+job, else on Logs (the service keeps no per-step metrics, so Metrics is empty
+for a job run from elsewhere); the line above the table names the tab.
+`m`, `l`, and `g` open the Metrics, Logs, and Resources tabs
+directly, and do the same in the details, except where a tab gives the letter
+its own meaning (see below).
 
 #### Job details
 
@@ -1130,9 +1133,22 @@ service's `reason` and `reason_details` (or the `unknown` sentence) while it
 sends them. A sub-job's details name it by its id once (`sub-job
 JOB_ID:training:0`). The line keeps to one row when cutting the name and the
 models with `…` is enough for that, and otherwise wraps between its parts,
-with the reason whole. Switch tabs with `2` (Logs) and `3` (Resources), or `t`
-for the next tab.
+with the reason whole. Switch tabs with `1` to `3`, or `t` for the next tab.
 
+- **Metrics** lists every numeric metric the client logged for the job on this
+  machine (bookkeeping counters such as `step` and `progress` are left out).
+  Common SFT and RL names are recognized and labeled, including the ones the
+  recipes log (`train_nll`, `time_total`; `train/avg_loss`, `reward/mean`,
+  `optim/lr`, `test/env/all/correct`) and others such as `val_loss`,
+  `learning_rate`, `grad_norm`, `step_time`, `tokens_per_second`,
+  `policy_loss`, `kl`, `entropy`, and `clip_frac`. The header shows the latest
+  and minimum training (or policy) loss. Pick a metric with the
+  arrow keys to chart it. `w` cycles the window through the last 1 hour
+  (default), 6 hours, 24 hours, and the whole job. `W` takes a custom window
+  such as `30m`, `2h`, `all`, or `steps:100-500`. `x` switches the x-axis
+  between training step and wall-clock time. The step is the record's
+  `global_steps` when it has one, which keeps counting when a recipe
+  re-attaches to the job; otherwise it is the recipe's own loop step.
 - **Logs** is the live and historical log view described below. Each line is
   tagged with the sub-job being tailed, for example `training:0 │ …`, and its
   wrapped rows line up under its text. Saved logs (`s`) and whole-log copies
@@ -1230,7 +1246,8 @@ for the next tab.
     30 minutes, 1 hour, 6 hours, and the whole job.
   - On a terminal narrow enough that the charts stack, and too short for both of
     them and the table, one chart shows at a time; `m` switches between busy and
-    memory. The key help stays at the bottom of the tab (on a line too narrow
+    memory. While both charts show, `m` opens the Metrics tab, as on the other
+    tabs. The key help stays at the bottom of the tab (on a line too narrow
     for all of it, `w window` leaves out the windows' names); on a terminal too
     small for the rest, the tab scrolls. The table's cursor keys (`↑` `↓`,
     `PgUp` `PgDn`) scroll the tab to bring the table into view; `Home` (or
@@ -1261,20 +1278,33 @@ for the next tab.
     a long job's cache shows the selected sub-job's newest samples before the
     rest of its history.
 
+The service does not keep per-step training metrics, so the Metrics tab reads
+a local store: `jobs/<job>/metrics.jsonl` in the TUI cache directory. The SFT
+and RL recipes write to it automatically. From your own training loop:
+
+```python
+from cortex_training.tui.stores import MetricsStore
+
+MetricsStore().append(job_id, {"train_loss": loss, "grad_norm": norm}, step=step)
+```
+
+Only finite numeric values are kept. Metrics logged on another machine do not
+appear.
+
 #### Logs
 
 The Logs tab lists the job's sub-jobs, training first, in a panel as wide as
 their labels; select one to tail its logs (the zone-manager pod is the Ray
 head, so a sub-job's worker output is included). `r` reloads the list and
 stays on the selected sub-job. The tail
-polls only while the Logs tab is on screen: on another tab
-it stops and later resumes from where it left
+polls only while the Logs tab is on screen: on another tab, or under a
+prompt, it stops and later resumes from where it left
 off, so no lines are lost. While a job runs, its status is also re-read every
 60 seconds, so the view switches to the saved console when the job ends.
 Logs are cached locally so reopening a job replays instantly without
 re-fetching from the server — under `~/.cache/cortex-training/` (or
 `$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`. The same
-directory holds display names and GPU telemetry.
+directory holds display names, client-logged metrics, and GPU telemetry.
 
 The pane draws each line as text only: escape sequences in a line (colours,
 cursor moves, clipboard or title writes) are removed and other control
@@ -1449,11 +1479,13 @@ Keys in the job details view:
 
 | Key | Action |
 |-----|--------|
-| `2` `3` | Logs / Resources tab |
-| `l` `g` | The same tabs, as in the preview |
+| `1` `2` `3` | Metrics / Logs / Resources tab |
+| `m` `l` `g` | The same tabs, as in the preview, except `m` on a Resources tab that shows one chart (below) |
 | `t` | Next tab |
-| `w` | Cycle the window (Resources) |
-| `m` | Busy or memory chart, while the terminal is too narrow and short for both and Resources shows one (Resources) |
+| `w` | Cycle the window (Metrics, Resources) |
+| `W` | Enter a custom window (Metrics) |
+| `x` | Step or time x-axis (Metrics) |
+| `m` | Busy or memory chart, while the terminal is too narrow and short for both and Resources shows one (Resources); otherwise the Metrics tab |
 | `<` / `>` | Previous / next sub-job, when the job has two or more (Resources) |
 | `Enter` / `a` | Chart the GPU on the table's highlighted row, which the charts then follow / back to the average across GPUs (Resources) |
 | `/` | Filter the current source (Logs) |

@@ -147,7 +147,7 @@ async def _run_resource_tab(tmp_path):
         assert ok
         tabs = app.screen.query_one("#job-tabs", TabbedContent)
         assert tabs.active == "logs"
-        assert {pane.id for pane in app.screen.query("TabPane")} == {"logs", "resource"}
+        assert {pane.id for pane in app.screen.query("TabPane")} == {"metrics", "logs", "resource"}
         c.download_metrics.assert_not_called()
 
         tabs.active = "resource"
@@ -224,10 +224,7 @@ async def _run_resource_tab(tmp_path):
         ok = await _wait(pilot, app, lambda: tabs.active == "resource")
         assert ok
         await pilot.press("t")
-        ok = await _wait(pilot, app, lambda: tabs.active == "logs")  # after the last tab, the first
-        assert ok
-        await pilot.press("3")
-        ok = await _wait(pilot, app, lambda: tabs.active == "resource")
+        ok = await _wait(pilot, app, lambda: tabs.active == "metrics")  # after the last tab, the first
         assert ok
         await pilot.press("2")
         ok = await _wait(pilot, app, lambda: tabs.active == "logs")
@@ -1740,13 +1737,13 @@ async def _run_job_detail_tabs(mounts):
         await pilot.press("4")  # no Checkpoints tab here: 4 does nothing
         await pilot.pause()
         assert tabs.active == "logs"
-        await pilot.press("1")  # no Metrics tab here: 1 does nothing
-        await pilot.pause()
-        assert tabs.active == "logs"
+        await pilot.press("1")
+        ok = await _wait(pilot, app, lambda: tabs.active == "metrics")
+        assert ok
+        assert screen.query_one("#footer").display  # the footer stays on every tab
         await pilot.press("3")
         ok = await _wait(pilot, app, lambda: tabs.active == "resource" and c.download_metrics.call_count == 1)
         assert ok
-        assert screen.query_one("#footer").display  # the footer stays on every tab
         await pilot.press("5")  # a range key on the two-tab LogScreen; inert here
         await pilot.pause()
         assert tabs.active == "resource" and screen._resource_range != "all"
@@ -1756,8 +1753,8 @@ async def _run_job_detail_tabs(mounts):
         ok = await _wait(pilot, app, lambda: tabs.active == "logs")
         assert ok
         screen.query_one("#logfilter", Input).value = "x"
-        await pilot.press("3")
-        ok = await _wait(pilot, app, lambda: tabs.active == "resource")
+        await pilot.press("1")
+        ok = await _wait(pilot, app, lambda: tabs.active == "metrics")
         assert ok
         await pilot.press("escape")
         ok = await _wait(pilot, app, lambda: app.screen is not screen)
@@ -1844,7 +1841,7 @@ async def _run_tail_waits_for_logs_tab():
     async with app.run_test(size=(140, 40)) as pilot:
         ok = await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item)
         assert ok
-        app.push_screen(JobDetailScreen(c, "7", job={"job_id": "7", "status": "RUNNING"}, initial_tab="resource"))
+        app.push_screen(JobDetailScreen(c, "7", job={"job_id": "7", "status": "RUNNING"}, initial_tab="metrics"))
         ok = await _wait(pilot, app, lambda: isinstance(app.screen, JobDetailScreen) and app.screen._current_source)
         assert ok
         for _ in range(20):

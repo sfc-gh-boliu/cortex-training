@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Enter on a sub-job row (the preview's or the job list's) opens Logs; the preview says so."""
+"""Enter on a sub-job row (the preview's or the job list's) opens Logs, or
+Metrics only when this machine logged metrics for the job; the preview says which."""
 
 import asyncio
 from unittest.mock import MagicMock
@@ -31,6 +32,7 @@ from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.app import JobListScreen  # noqa: E402
 from cortex_training.tui.screens import JobDetailScreen  # noqa: E402
 from cortex_training.tui.screens import JobSummaryScreen  # noqa: E402
+from cortex_training.tui.stores import MetricsStore  # noqa: E402
 
 JOB = "fake-job-enter"
 
@@ -79,9 +81,25 @@ async def _settle(app, pilot):
         await pilot.pause()
 
 
-def test_enter_on_a_preview_sub_job_row_opens_logs():
+def test_enter_tab_is_metrics_only_with_local_metrics():
+    from cortex_training.tui.screens import enter_tab
+
+    store = MetricsStore()
+    assert enter_tab(store, JOB) == "logs"
+    store.path(JOB).parent.mkdir(parents=True, exist_ok=True)
+    store.path(JOB).write_text("")
+    assert enter_tab(store, JOB) == "logs"  # an empty file has no records
+    store.append(JOB, {"train_loss": 1.25}, step=1)
+    assert enter_tab(store, JOB) == "metrics"
+
+
+@pytest.mark.parametrize("logged", [False, True])
+def test_enter_on_a_preview_sub_job_row_opens_logs_unless_metrics_were_logged(logged):
+    if logged:
+        MetricsStore().append(JOB, {"train_loss": 0.5}, step=3)
     job = _job()
     c = _client(job)
+    tab, name = ("metrics", "Metrics") if logged else ("logs", "Logs")
 
     async def run():
         app = CortexTrainingLogTUI(c, poll_interval=0.01)
@@ -90,21 +108,31 @@ def test_enter_on_a_preview_sub_job_row_opens_logs():
             app.push_screen(JobSummaryScreen(c, JOB, job=job))
             assert await _wait(pilot, lambda: isinstance(app.screen, JobSummaryScreen))
             p = app.screen
-            assert await _wait(pilot, lambda: p._fetched_at is not None)
+            assert await _wait(pilot, lambda: p._metric_catalog is not None)
             title = str(p.query_one("#subjobs-title", Static).render())
-            assert title == "Sub-jobs  (Enter opens Logs for the highlighted row)"
+            assert title == f"Sub-jobs  (Enter opens {name} for the highlighted row)"
             table = p.query_one("#subjobs", DataTable)
             table.move_cursor(row=table.get_row_index("sj-1"))
             await pilot.press("enter")
             assert await _wait(pilot, lambda: isinstance(app.screen, JobDetailScreen))
             d = app.screen
-            assert d._active_tab == "logs" and d._scope == f"{JOB}:sampling:0"
+            assert d._active_tab == tab and d._scope == f"{JOB}:sampling:0"
             await _settle(app, pilot)
 
     asyncio.run(run())
 
 
-def test_enter_on_a_list_sub_job_row_opens_logs():
+def test_the_preview_names_the_tab_before_it_has_read_the_metrics():
+    MetricsStore().append(JOB, {"train_loss": 0.5}, step=3)
+    job = _job()
+    p = JobSummaryScreen(_client(job), JOB, job=job)
+    assert p._metric_catalog is None and p._enter_tab() == "metrics"
+
+
+@pytest.mark.parametrize("logged", [False, True])
+def test_enter_on_a_list_sub_job_row_opens_logs_unless_metrics_were_logged(logged):
+    if logged:
+        MetricsStore().append(JOB, {"train_loss": 0.5}, step=3)
     job = _job()
     c = _client(job)
 
@@ -126,7 +154,7 @@ def test_enter_on_a_list_sub_job_row_opens_logs():
             assert table.cursor_row == row
             await pilot.press("enter")
             assert await _wait(pilot, lambda: isinstance(app.screen, JobDetailScreen))
-            assert app.screen._active_tab == "logs"
+            assert app.screen._active_tab == ("metrics" if logged else "logs")
             assert app.screen._scope == f"{JOB}:training:0"
             await _settle(app, pilot)
 

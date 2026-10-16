@@ -19,7 +19,7 @@ Flow: open → every job from the last six months, in every database and schema
 this role can see when the service allows it, else the configured one (live
 first, then history, with sub-job rows; searchable by name, comment, id,
 location, or training config) → a job preview
-→ tabbed details (Logs | Resources) for the job or one
+→ tabbed details (Metrics | Logs | Resources) for the job or one
 sub-job. Pass a job_id on the command line to jump straight to its Logs tab.
 
 Imports ``textual`` at module load. The interface never mutates job state; the
@@ -1624,6 +1624,8 @@ class JobListScreen(Screen):
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         from cortex_training.tui.screens import JobDetailScreen
         from cortex_training.tui.screens import JobSummaryScreen
+        from cortex_training.tui.screens import enter_tab
+        from cortex_training.tui.stores import MetricsStore
 
         if not is_shown(self):
             return  # a second quick Enter: the first already opened the job
@@ -1643,7 +1645,9 @@ class JobListScreen(Screen):
             job = self._jobs_by_id.get(jid)
             client = self._job_client(job)
             if client is not None:
-                self.app.push_screen(JobDetailScreen(client, jid, job=job, sub_job_id=sid, initial_tab="logs",
+                # Metrics only when this machine logged some for the job, else Logs.
+                self.app.push_screen(JobDetailScreen(client, jid, job=job, sub_job_id=sid,
+                                                     initial_tab=enter_tab(MetricsStore(), jid),
                                                      aliases=self._aliases, poll_interval=self._poll_interval))
 
     def _job_client(self, job: dict | None):
@@ -1998,6 +2002,9 @@ class LogScreen(Screen):
             after_refresh(self, self._render_resource)
             self._start_resource_refresh(force=False)
             return
+        if not self._logs_active():
+            self._other_tab_shown(self._active_tab)
+            return
         try:
             target = self.query_one(f"#{self._log_focus_id}")
         except Exception:  # noqa: BLE001 - stale focus id after a remount
@@ -2009,6 +2016,9 @@ class LogScreen(Screen):
     def _sync_footer(self) -> None:
         # The Resource tab lists its own keys; the footer carries the log keys.
         self.query_one("#footer", Footer).display = self._logs_active()
+
+    def _other_tab_shown(self, tab: str) -> None:
+        """Hook: a tab other than Logs or Resource became visible."""
 
     def _sources_cap(self) -> int:
         """The widest the sources panel may be: the log keeps _LOG_MIN_WIDTH cells."""
@@ -4748,7 +4758,7 @@ class CortexTrainingLogTUI(App):
     #jobs > .datatable--fixed { background: $surface; }
     #searchhelp { padding: 0 1; height: auto; }
     #sources { width: 16; border-right: solid $panel; }
-    #job-tabs, #job-tabs ContentSwitcher, #logs, #resource, #logs-body {
+    #job-tabs, #job-tabs ContentSwitcher, #logs, #resource, #logs-body, #metrics, #metrics-body {
         height: 1fr;
     }
     TabPane { padding: 0; }
@@ -4770,6 +4780,9 @@ class CortexTrainingLogTUI(App):
     #resource-chart, #resource-mem-chart { height: auto; min-height: 3; padding: 0 1; text-wrap: nowrap; text-overflow: clip; }
     #resource-table { height: 1fr; min-height: 4; }
     #resource-keys { color: $text-muted; height: 1; padding: 0 1; dock: bottom; }
+    #metric-head { padding: 0 1; height: auto; margin-bottom: 1; }
+    #metriclist { width: 40; border-right: solid $panel; }
+    #metric-pane { padding: 0 1; }
     /* The scrollbar's room is kept while the preview fits, so its text never changes
        width (and re-wraps at the edge) when a refresh makes it scroll. */
     #summary-body { padding: 1 1; scrollbar-gutter: stable; }

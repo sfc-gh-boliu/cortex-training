@@ -39,6 +39,7 @@ from cortex_training.tui.demo import DemoClient  # noqa: E402
 from cortex_training.tui.screens import JobDetailScreen  # noqa: E402
 from cortex_training.tui.screens import JobSummaryScreen  # noqa: E402
 from cortex_training.tui.stores import AliasStore  # noqa: E402
+from cortex_training.tui.stores import MetricsStore  # noqa: E402
 
 NOW = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 
@@ -218,7 +219,7 @@ def _scope(app) -> str:
 
 def test_the_demo_lists_every_location_and_opens_a_job_in_a_quoted_one():
     demo = DemoClient()
-    demo.seed_local(aliases=AliasStore())
+    demo.seed_local(aliases=AliasStore(), metrics=MetricsStore())
     target = next(r for r in demo.iter_jobs() if r["database_name"] == "sandbox" and r["status"] == "RUNNING")
 
     async def run():

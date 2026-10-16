@@ -85,15 +85,15 @@ def test_back_quit_tabs_and_keys_lead_every_footer(width):
             descriptions = [description for _key, description, _ in _footer(app)]
             assert "Clear search" not in descriptions and "Expand/collapse all" in descriptions
             await _to_details(app, pilot)
-            for tab in ("2", "3"):
+            for tab in ("2", "1", "3"):
                 await pilot.press(tab)
                 await wait_for(pilot, lambda: app.screen._active_tab != "", tries=5)
                 for _ in range(3):
                     await pilot.pause()
                 shown = _shown(app)
-                # The two tab keys are one entry ("23 Tabs"), after Back and Quit, then "? Keys".
-                assert shown[:5] == ["b", "q", "2", "3", "question_mark"], (tab, shown)
-                assert [d for _k, d, _ in _footer(app)].count("Logs") == 0  # no separate "2 Logs"
+                # The three tab keys are one entry ("123 Tabs"), after Back and Quit, then "? Keys".
+                assert shown[:6] == ["b", "q", "1", "2", "3", "question_mark"], (tab, shown)
+                assert [d for _k, d, _ in _footer(app)].count("Metrics") == 0  # no separate "1 Metrics"
             await settle(app, pilot)
 
     run(go())
@@ -146,15 +146,15 @@ def test_the_previews_letters_open_the_same_tabs_in_the_details():
             await pilot.press("c")  # on Logs, c copies a selection: there is none, and it says so
             assert await wait_for(pilot, lambda: notes)
             assert notes[-1].startswith("Nothing selected") and _tab(app) == "logs"
-            for key, tab in (("g", "resource"), ("l", "logs"), ("g", "resource")):
+            for key, tab in (("m", "metrics"), ("l", "logs"), ("g", "resource")):
                 await pilot.press(key)
                 assert await wait_for(pilot, lambda: _tab(app) == tab), (key, _tab(app))
             # This job reports no GPU samples, so Resources shows no chart for m to switch:
-            # m does nothing (see the test below for one chart shown).
+            # m opens Metrics, as on the other tabs (see the test below for one chart shown).
             await pilot.press("m")
-            for _ in range(5):
-                await pilot.pause()
-            assert _tab(app) == "resource"
+            assert await wait_for(pilot, lambda: _tab(app) == "metrics")
+            await pilot.press("g")
+            assert await wait_for(pilot, lambda: _tab(app) == "resource")
             await settle(app, pilot)
 
     run(go())
@@ -208,7 +208,7 @@ async def _on_resources(app, pilot):
 
 
 @pytest.mark.parametrize("size, one_chart", [((80, 24), True), ((140, 42), False), ((80, 50), False)])
-def test_m_switches_the_chart_only_while_resources_shows_one(size, one_chart):
+def test_m_switches_the_chart_only_while_resources_shows_one_and_else_opens_metrics(size, one_chart):
     async def go():
         app = CortexTrainingLogTUI(_GpuClient([job("j1")]), "j1", poll_interval=0.01, now=NOW)
         async with app.run_test(size=size) as pilot:
@@ -220,8 +220,8 @@ def test_m_switches_the_chart_only_while_resources_shows_one(size, one_chart):
                 await pilot.pause()
             if one_chart:  # the other chart, on the same tab
                 assert _tab(app) == "resource" and (busy.display, memory.display) == (False, True)
-            else:  # both charts already show: m does nothing
-                assert _tab(app) == "resource" and (busy.display, memory.display) == (True, True)
+            else:  # both charts already show: m does what it does on every other tab
+                assert _tab(app) == "metrics"
             await settle(app, pilot)
 
     run(go())

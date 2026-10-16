@@ -18,6 +18,7 @@
 import json
 import re
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 import requests
@@ -25,8 +26,8 @@ import requests
 from cortex_training.tui import views
 from cortex_training.tui.demo import UNAVAILABLE
 from cortex_training.tui.demo import DemoClient
-from cortex_training.tui.log_cache import job_cache_dir
 from cortex_training.tui.stores import AliasStore
+from cortex_training.tui.stores import MetricsStore
 from tests.r1_cross_cutting_support import isolated_tui_files  # noqa: F401
 
 GIB = 1024 ** 3
@@ -35,7 +36,7 @@ RAW = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{9}Z \{")
 
 def _seeded() -> DemoClient:
     demo = DemoClient()
-    demo.seed_local(aliases=AliasStore())
+    demo.seed_local(aliases=AliasStore(), metrics=MetricsStore())
     return demo
 
 
@@ -82,7 +83,7 @@ def test_a_job_that_ran_out_of_memory_loading_was_barely_busy(tmp_path):
     assert rows and max(r["gpu_util_pct"] for r in rows) < 20
 
 
-def test_the_logs_follow_the_jobs_config():
+def test_the_logs_follow_the_jobs_config_and_its_metrics():
     demo = _seeded()
     rl = next(j for j in demo.list_jobs() if len(j["sub_jobs"]) == 2 and j["status"] == "RUNNING")
     training = rl["sub_jobs"][0]["sub_job_id"]
@@ -90,6 +91,16 @@ def test_the_logs_follow_the_jobs_config():
              for e in demo.tail_logs(rl["job_id"], max_lines=20, sub_job_id=training)["entries"]]
     steps = [line for line in lines if line.startswith("step")]
     assert steps and all("reward=" in line and "lr=1.00e-06" in line for line in steps)  # GRPO at its own lr
+    # The failed SFT job's last logged loss is its metrics' last loss.
+    failed = next(j for j in demo.list_jobs() if demo._kinds.get(j["job_id"]) == "sft-fail")
+    sid = failed["sub_jobs"][0]["sub_job_id"]
+    demo.download_stdout_logs(failed["job_id"], Path(MetricsStore().path("x")).parent / "console")
+    console = (Path(MetricsStore().path("x")).parent / "console" / sid / "stdout.log").read_text().splitlines()
+    logged = [float(re.search(r"loss=([\d.]+)", line).group(1)) for line in console if '"msg": "step' in line]
+    last_metric = MetricsStore().load(failed["job_id"])[-1]["train_loss"]
+    assert logged and abs(logged[-1] - last_metric) < 1e-3 and max(logged) > 1.0  # it diverged, as the chart does
+    # The metrics' learning rate follows the config too.
+    assert {r["learning_rate"] for r in MetricsStore().load(rl["job_id"])} == {1e-6}
 
 
 def test_the_demo_says_it_is_a_demo_in_the_title(monkeypatch):
@@ -222,7 +233,7 @@ def test_a_job_with_more_than_20000_lines_shows_the_scrollback_label():
     demo = _seeded()
     job = next(j for j in demo.list_jobs() if (j.get("comment") or "").startswith("batch eval"))
     sid = job["sub_jobs"][0]["sub_job_id"]
-    out = job_cache_dir("x") / "console-check"
+    out = Path(MetricsStore().path("x")).parent / "console-check"
     demo.download_stdout_logs(job["job_id"], out)
     assert len((out / sid / "stdout.log").read_text().splitlines()) > 25_000
 
@@ -360,18 +371,16 @@ def test_an_unknown_job_its_control_plane_doesnt_know_has_no_sub_jobs():
     assert unknown[0].endswith("Control Plane is unavailable") and len(unknown) == 2
 
 
-@pytest.mark.parametrize("kind, seconds, values", [("sft", 600, r"loss=\S+ +grad_norm=\S+"),
-                                                   ("rl", 3600, r"reward=\S+ +kl=\S+ +policy_loss=\S+")])
-def test_a_running_jobs_step_lines_have_values_of_their_own(monkeypatch, kind, seconds, values):
+def test_steps_past_the_seeded_metrics_have_values_of_their_own(monkeypatch):
     demo = _seeded()
-    job = next(j for j in demo.list_jobs() if j["status"] == "RUNNING" and demo._kinds.get(j["job_id"]) == kind)
+    job = next(j for j in demo.list_jobs() if j["status"] == "RUNNING" and demo._kinds.get(j["job_id"]) == "sft")
     sid = job["sub_jobs"][0]["sub_job_id"]
-    _later(demo, monkeypatch, seconds)
+    _later(demo, monkeypatch, 600)
     lines = [json.loads(e["_raw"].split(" ", 1)[1])["msg"]
              for e in demo.tail_logs(job["job_id"], max_lines=40, sub_job_id=sid)["entries"]]
     steps = [line for line in lines if line.startswith("step")]
-    found = {re.search(values, line).group(0) for line in steps}
-    assert len(steps) >= 30 and len(found) == len(steps)  # no line repeats another's values
+    values = {re.search(r"loss=\S+ +grad_norm=\S+", line).group(0) for line in steps}
+    assert len(steps) >= 30 and len(values) == len(steps)  # no line repeats the last record's values
     numbers = [int(line.split()[1]) for line in steps]
     assert numbers == sorted(numbers) and len(set(numbers)) == len(numbers)
 

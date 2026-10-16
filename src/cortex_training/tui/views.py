@@ -15,7 +15,8 @@
 
 """Pure view-model helpers for the TUI's job list, summary, and detail tabs.
 
-Search, sorting, and summary fields. Like ``format.py`` this never imports
+Search, sorting, summary fields, training-metric series and windows,
+and plain-text charts. Like ``format.py`` this never imports
 ``textual``, so every rule here is unit-testable without the TUI installed.
 """
 
@@ -1222,6 +1223,179 @@ def sort_direction(key: str, descending: bool) -> str:
     return "newest first" if descending else "oldest first"
 
 
+# ─── series stats and windows ────────────────────────────────────────────────
+
+
+def series_stats(values: list) -> dict:
+    if not values:
+        return {"min": None, "avg": None, "max": None, "latest": None}
+    return {"min": min(values), "avg": sum(values) / len(values), "max": max(values), "latest": values[-1]}
+
+
+def parse_window(text: str) -> Optional[tuple]:
+    """``10m`` / ``2h`` / ``1d`` / ``90s`` → ("time", seconds); ``all`` → ("all",);
+    ``steps:100-500`` → ("steps", 100, 500). ``None`` when unparseable."""
+    s = (text or "").strip().lower()
+    if s in ("all", "full", "job"):
+        return ("all",)
+    m = re.fullmatch(r"steps?\s*[:=]?\s*(\d+)\s*-\s*(\d+)", s)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        return ("steps", min(lo, hi), max(lo, hi))
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([smhd])", s)
+    if m:
+        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+        return ("time", float(m.group(1)) * mult)
+    return None
+
+
+def window_label(win: tuple) -> str:
+    if win[0] == "all":
+        return "full job"
+    if win[0] == "steps":
+        return f"steps {win[1]}–{win[2]}"
+    return f"last {fmt_duration(win[1]).replace(' 00s', '').replace(' 00m', '').replace(' 0h', '')}"
+
+
+# ─── training metrics ────────────────────────────────────────────────────────
+
+# canonical key -> (label, family, recognized raw names). Order = display order.
+KNOWN_METRICS = {
+    # "common" metrics apply to SFT and RL jobs. The recipes log train_nll and
+    # time_total (SFT) and train/avg_loss, reward/mean, optim/lr, time/total and
+    # test/env/all/* (RL).
+    "train_loss": ("training loss", "common",
+                   ("train_loss", "train_nll", "loss", "avg_loss", "train/loss", "train/avg_loss", "train_mean_nll")),
+    "val_loss": ("validation loss", "common", ("val_loss", "eval_loss", "validation_loss", "val_nll", "test/nll", "test_nll")),
+    "learning_rate": ("learning rate", "common", ("learning_rate", "lr", "last_lr", "optim/lr")),
+    "grad_norm": ("gradient norm", "common", ("grad_norm", "gradient_norm", "optim/grad_norm")),
+    # The recipes restart their timer each loop, so time_total and time/total are per step.
+    "step_time": ("step time (s)", "common", ("step_time", "time/step", "time_total", "time/total")),
+    "tokens_per_s": ("token throughput (tok/s)", "common", ("tokens_per_s", "tokens_per_second", "throughput", "tok_per_s")),
+    "policy_loss": ("policy loss", "RL", ("policy_loss", "pg_loss", "loss/policy")),
+    "reward": ("reward", "RL", ("reward", "reward_mean", "reward/mean", "env/all/reward/total", "mean_reward")),
+    "kl": ("KL divergence", "RL", ("kl", "kl_divergence", "kl_div", "approx_kl", "optim/kl_sample_train_v1")),
+    "entropy": ("entropy", "RL", ("entropy", "policy_entropy", "optim/entropy")),
+    "clip_frac": ("clip fraction", "RL", ("clip_frac", "clip_fraction", "clipfrac")),
+    "completion_len": ("completion length (tok)", "RL", ("completion_len", "completion_length", "response_length",
+                                                        "env/all/ac_tokens_per_turn", "test/env/all/mean_completion_tokens")),
+    "eval_success": ("eval success rate", "RL", ("eval_success", "eval_success_rate", "success_rate", "eval/accuracy",
+                                                 "test/correct", "test/env/all/correct")),
+}
+_RAW_TO_CANON = {raw: canon for canon, (_, _, raws) in KNOWN_METRICS.items() for raw in raws}
+_BOOKKEEPING = {"step", "ts", "sub_job_id", "rank", "progress", "progress/batch", "progress/done_frac", "global_steps",
+                "sft_model_calls", "sft_packed_rows"}
+LOSS_KEYS = ("train_loss", "policy_loss", "val_loss")
+
+
+@dataclass
+class MetricInfo:
+    key: str  # raw key in the records
+    label: str
+    family: str  # SFT · common | RL | other
+    count: int
+    latest: float
+    minimum: float
+    min_step: Optional[int]
+
+
+def canonical_metric(raw: str) -> Optional[str]:
+    return _RAW_TO_CANON.get(str(raw).lower())
+
+
+def record_step(rec: dict) -> Optional[int]:
+    """The training step of a metrics record, or ``None``.
+
+    Prefers the service's ``global_steps``: it keeps counting when a recipe
+    re-attaches to a job, while the recipe's own loop ``step`` restarts at 0.
+    """
+    for key in ("global_steps", "step"):
+        raw = rec.get(key)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            continue
+        try:
+            value = float(raw)  # an int too large for a float can't be charted either
+        except OverflowError:
+            continue
+        if math.isfinite(value):
+            return int(value)
+    return None
+
+
+def metric_catalog(records: Iterable[dict]) -> list:
+    """Every numeric metric seen, known metrics first (in canonical order)."""
+    stats: dict = {}
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        step = record_step(rec)
+        for k, v in rec.items():
+            if k in _BOOKKEEPING or (f := _as_float(v)) is None:
+                continue
+            s = stats.setdefault(k, {"n": 0, "latest": f, "min": f, "min_step": step})
+            s["n"] += 1
+            s["latest"] = f
+            if f < s["min"]:
+                s["min"], s["min_step"] = f, step
+    order = list(KNOWN_METRICS)
+
+    def rank(k: str) -> tuple:
+        canon = canonical_metric(k)
+        return (order.index(canon), k) if canon else (len(order), k.lower())
+
+    out = []
+    for k in sorted(stats, key=rank):
+        canon = canonical_metric(k)
+        label, family, _ = KNOWN_METRICS[canon] if canon else (k, "other", ())
+        s = stats[k]
+        out.append(MetricInfo(k, label, family, s["n"], s["latest"], s["min"], s["min_step"]))
+    return out
+
+
+def primary_loss(catalog: list) -> Optional[MetricInfo]:
+    for canon in LOSS_KEYS:
+        for info in catalog:
+            if canonical_metric(info.key) == canon:
+                return info
+    return None
+
+
+def metric_points(records: Iterable[dict], key: str) -> list:
+    """(epoch_seconds | None, step | None, value) for one metric, in record order."""
+    pts = []
+    for rec in records:
+        if not isinstance(rec, dict) or (v := _as_float(rec.get(key))) is None:
+            continue
+        dt = parse_ts(rec.get("ts"))
+        pts.append((dt.timestamp() if dt else None, record_step(rec), v))
+    return pts
+
+
+def window_points(points: list, win: tuple) -> list:
+    if win[0] == "all" or not points:
+        return list(points)
+    if win[0] == "steps":
+        return [p for p in points if p[1] is not None and win[1] <= p[1] <= win[2]]
+    times = [p[0] for p in points if p[0] is not None]
+    if not times:
+        return list(points)
+    end = max(times)
+    return [p for p in points if p[0] is not None and p[0] >= end - win[1]]
+
+
+def fmt_metric(v: Optional[float]) -> str:
+    if v is None:
+        return "—"
+    if v == 0:
+        return "0"
+    a = abs(v)
+    if a >= 1e5 or a < 1e-3:
+        return f"{v:.2e}"
+    if a >= 100:
+        return f"{v:,.0f}"
+    return f"{v:.4g}"
+
+
 # ─── locations, copied commands and access ───────────────────────────────────
 
 _PLAIN_IDENTIFIER = re.compile(r"[A-Z_][A-Z0-9_$]*")
@@ -1374,3 +1548,94 @@ def sign_in_options(sign_in: Any) -> dict:
         in_config = bool(config) and sign.get("base_url_in_config") is True
         return {"config": config, "base_url": None if in_config else _name_or_none(sign.get("base_url"))}
     return {}
+
+
+# ─── plain-text charts ───────────────────────────────────────────────────────
+
+_BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def render_chart(
+    xs: list,
+    ys: list,
+    *,
+    width: int,
+    height: int,
+    y_min: Optional[float] = None,
+    y_max: Optional[float] = None,
+    y_fmt=fmt_metric,
+    x_fmt=str,
+) -> list:
+    """Filled column chart with a y-axis and first/last x labels.
+
+    ``xs`` are numbers in any order (a recipe re-attached to a job restarts its
+    step counter). Columns are equal x-buckets; a bucket's value is the mean of
+    its points, and empty buckets stay blank.
+    """
+    gutter = 9
+    plot_w = max(4, width - gutter - 1)
+    height = max(2, height)
+    if not ys:
+        return ["(no data in this window)"]
+    pairs = sorted(zip(xs, ys), key=lambda p: p[0])
+    xs, ys = [p[0] for p in pairs], [p[1] for p in pairs]
+    lo = min(ys) if y_min is None else y_min
+    hi = max(ys) if y_max is None else y_max
+    if hi <= lo:
+        hi, lo = lo + (abs(lo) * 0.1 or 1.0), lo - (abs(lo) * 0.1 if y_min is None else 0)
+    x0, x1 = xs[0], xs[-1]
+    span = (x1 - x0) or 1.0
+    sums = [0.0] * plot_w
+    counts = [0] * plot_w
+    for x, y in zip(xs, ys):
+        col = min(plot_w - 1, int((x - x0) / span * plot_w))
+        sums[col] += y
+        counts[col] += 1
+    cols = [sums[i] / counts[i] if counts[i] else None for i in range(plot_w)]
+    # Sparse series (fewer points than columns) leave regular holes; carry the
+    # previous value across short gaps so a steady signal reads as steady.
+    max_gap = max(1, int(plot_w / max(1, len(ys)) * 2) + 1)
+    last, gap = None, 0
+    for i, c in enumerate(cols):
+        if c is not None:
+            last, gap = c, 0
+        elif last is not None:
+            gap += 1
+            if gap <= max_gap:
+                cols[i] = last
+    # At least one eighth-block, so a value at the axis minimum isn't drawn like a gap.
+    units = [None if v is None else max(1.0, max(0.0, min(1.0, (v - lo) / (hi - lo))) * height * 8) for v in cols]
+    rows = []
+    for r in range(height):
+        level = height - 1 - r  # 0 = bottom row
+        line = []
+        for u in units:
+            if u is None:
+                line.append(" ")
+                continue
+            fill = u - level * 8
+            line.append("█" if fill >= 8 else _BLOCKS[max(0, int(round(fill)))] if fill > 0 else " ")
+        if r == 0:
+            label = y_fmt(hi)
+        elif r == height - 1:
+            label = y_fmt(lo)
+        elif r == height // 2:
+            label = y_fmt((hi + lo) / 2)
+        else:
+            label = ""
+        rows.append(f"{label:>{gutter - 1}} ┤" + "".join(line))
+    rows.append(" " * (gutter - 1) + " └" + "─" * plot_w)
+    left, right = x_fmt(x0), x_fmt(x1)
+    rows.append(" " * (gutter + 1) + left + right.rjust(max(1, plot_w - len(left))))
+    return rows
+
+
+def fmt_clock(epoch: float) -> str:
+    try:
+        return datetime.fromtimestamp(epoch).strftime("%H:%M")
+    except (OverflowError, ValueError, OSError):
+        return "—"
+
+
+def fmt_pct(v: Optional[float]) -> str:
+    return "—" if v is None else f"{v:.0f}%"

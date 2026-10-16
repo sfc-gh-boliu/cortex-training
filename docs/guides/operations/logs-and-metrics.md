@@ -47,13 +47,17 @@ GPU type, requested and reporting GPUs, and two charts kept apart: GPU busy
 (kernel-active %) and GPU memory used %, each with its min, average, max and
 latest for the window and the whole job. It lists each GPU too; `w` cycles 10
 minutes (the default), 30 minutes, 1 hour, 6 hours, or the whole job, and `r`
-refreshes. Run `cortex-training tui`
+refreshes. The
+**Metrics** tab plots the
+training metrics a recipe logged from this machine. Run `cortex-training tui`
 without a job id to browse and search your jobs first: those in every database
 and schema you can see where the service has the account-level list, else the
 configured one (`--schema-only` keeps to that). See
 [Job TUI](../../reference/cli.md#job-tui).
 
-Recipe-level metrics are also written under each recipe's `log_path`.
+Recipe-level metrics are also written under each recipe's `log_path`, and
+to the TUI's local store (`jobs/<job>/metrics.jsonl` under
+`~/.cache/cortex-training/`).
 
 Snowflake profile and PAT clients also emit best-effort client-side operation
 metrics over Snowflake's OTLP endpoint. Failures of essential SDK methods are

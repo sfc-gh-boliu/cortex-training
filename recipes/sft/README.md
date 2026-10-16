@@ -204,7 +204,10 @@ python -m recipes.sft.conversational.train \
 
 ## Logs and Expected Results
 
-Metrics and configuration are written under `log_path`. To send the same
+Metrics and configuration are written under `log_path`. When the run has a
+job id, its metrics are also kept in the TUI's local store
+(`jobs/<job>/metrics.jsonl` under `~/.cache/cortex-training/`), so
+`cortex-training tui` can chart them on this machine. To send the same
 metrics to Weights & Biases:
 
 ```bash

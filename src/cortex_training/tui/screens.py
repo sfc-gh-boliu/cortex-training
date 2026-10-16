@@ -16,7 +16,7 @@
 """Job preview and tabbed job detail screens for the TUI.
 
 Flow: job list → :class:`JobSummaryScreen` (preview + sub-jobs) →
-:class:`JobDetailScreen` (Logs | Resources) for the
+:class:`JobDetailScreen` (Metrics | Logs | Resources) for the
 whole job or one sub-job.
 
 Everything here is read-only against the service. The only writes are local:
@@ -38,6 +38,7 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.content import Content
+from textual.containers import Horizontal
 from textual.containers import Vertical
 from textual.containers import VerticalScroll
 from textual.screen import ModalScreen
@@ -47,6 +48,8 @@ from textual.widgets import Footer
 from textual.widgets import Header
 from textual.widgets import Input
 from textual.widgets import Label
+from textual.widgets import ListItem
+from textual.widgets import ListView
 from textual.widgets import Static
 from textual.widgets import TabbedContent
 from textual.widgets import TabPane
@@ -67,6 +70,7 @@ from cortex_training.tui.format import source_label
 from cortex_training.tui.resource import RANGES
 from cortex_training.tui.stores import ALIAS_MAX_CHARS
 from cortex_training.tui.stores import AliasStore
+from cortex_training.tui.stores import MetricsStore
 
 # Rich's grey62, by value: Textual's markup and styles (the preview's Content)
 # don't know that name and would draw the default color instead.
@@ -106,6 +110,27 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _local_metric_catalog(store: MetricsStore, job_id: str) -> list:
+    """Worker thread. The job's client-logged metrics, summarized; none (and the traceback
+    in the error log) when the local file can't be read, so a damaged file never stops the app."""
+    try:
+        return v.metric_catalog(store.load(job_id))
+    except Exception:  # noqa: BLE001
+        LogScreen._log_traceback(f"local metrics of {job_id} unreadable")
+        return []
+
+
+def enter_tab(metrics: MetricsStore, job_id: str) -> str:
+    """The details tab Enter on a sub-job row opens: Metrics when this machine
+    has client-logged metrics for the job, else Logs (the service keeps no
+    per-step metrics, so for a job run from elsewhere Metrics is empty)."""
+    try:
+        return "metrics" if metrics.path(job_id).stat().st_size > 0 else "logs"
+    except OSError:
+        return "logs"
+
+
+_TAB_NAMES = {"metrics": "Metrics", "logs": "Logs"}
 _SUBJOB_COLUMNS = ("Sub-job", "Type", "Status", "Model", "GPUs", "Config")
 _TYPE, _MODEL, _CONFIG = 1, 3, 5
 # How the sub-job table fits a screen narrower than its cells: each layout leaves
@@ -265,6 +290,7 @@ class JobSummaryScreen(Screen):
         Binding("escape", "close_or_back", "Back", show=False),
         ("q", "app.quit", "Quit"),
         KEYS_BINDING,
+        ("m", "open('metrics')", "Metrics"),
         ("l", "open('logs')", "Logs"),
         ("g", "open('resource')", "Resources"),
         ("n", "rename", "Name job"),
@@ -278,7 +304,7 @@ class JobSummaryScreen(Screen):
     ]
 
     def __init__(self, client, job_id: str, *, job: dict | None = None, aliases: AliasStore | None = None,
-                 poll_interval: float = 1.0, on_job=None) -> None:
+                 metrics: MetricsStore | None = None, poll_interval: float = 1.0, on_job=None) -> None:
         """``on_job(record)`` is called with the job each time a fresh read of it
         arrives (the job list then shows that status too)."""
         super().__init__()
@@ -287,7 +313,9 @@ class JobSummaryScreen(Screen):
         self._job = job or {"job_id": job_id}
         self._on_job = on_job
         self._aliases = aliases or AliasStore()
+        self._metrics = metrics or MetricsStore()
         self._poll_interval = poll_interval
+        self._metric_catalog: list | None = None  # None until read (in the worker)
         # A thread can't be cancelled, so never stack a second fetch.
         self._loading = False
         self._fetch_since: float | None = None  # monotonic start of the get_job in flight
@@ -484,7 +512,7 @@ class JobSummaryScreen(Screen):
         self._show_table(table, labels, fitted, wider)
         # The keys for a table that is cut to fit, or wider than the screen (short, as in
         # the key line at the bottom, to keep to one row on an 80-column screen).
-        hints = ["Enter opens Logs for the highlighted row"]
+        hints = [f"Enter opens {_TAB_NAMES[self._enter_tab()]} for the highlighted row"]
         if cut:
             hints.append("e fit to screen" if self._expanded else "e whole table")
         if wider:
@@ -641,7 +669,7 @@ class JobSummaryScreen(Screen):
             return line(f"[yellow]◔ {word.capitalize()}[/]", "" if details else " — $doing", doing=_WAITING[word])
         if word == "running":
             return Content.from_markup(
-                "  [green]● Running[/] — logs stream live; resources refresh automatically")
+                "  [green]● Running[/] — logs stream live; metrics and resources refresh automatically")
         if word == "unknown":
             # The service could not read the job's live state: it may still be running,
             # unless the service says the control plane has no record of the job.
@@ -652,7 +680,27 @@ class JobSummaryScreen(Screen):
         return Content.from_markup("  " + why.lstrip(), reason=reason, details=details) if why else Content("")
 
     def _glance(self) -> Content:
-        return Content.from_markup("\n[dim]l logs · g resources · n name this job · b back[/dim]")
+        lines = []
+        catalog = self._metric_catalog
+        loss = v.primary_loss(catalog or [])
+        if catalog is None:
+            lines.append(Content.from_markup("[dim]reading metrics logged on this machine…[/dim]"))
+        elif loss:
+            at = f" @ step {loss.min_step}" if loss.min_step is not None else ""
+            lines.append(Content.from_markup(
+                f"[dim]$label[/dim] latest [b]$latest[/b] · min [b]$minimum[/b]{at}", label=loss.label,
+                latest=v.fmt_metric(loss.latest), minimum=v.fmt_metric(loss.minimum)))
+        elif catalog:
+            lines.append(Content.from_markup(f"[dim]{len(catalog)} client-logged metric(s)[/dim]"))
+        else:
+            lines.append(Content.from_markup("[dim]no client-logged training metrics on this machine[/dim]"))
+        # A line that wraps continues under its text, not at the edge.
+        width = self._value_width() + self._LABEL_WIDTH - 2  # the glance's padding
+        return Content("\n").join([
+            Content.from_markup("\n[b]At a glance[/b]"),
+            *(hanging(Content("  ") + line, width, 4) for line in lines),
+            Content.from_markup("\n[dim]m metrics · l logs · g resources · n name this job · b back[/dim]"),
+        ])
 
     def _load(self) -> None:
         self._start_fetch()
@@ -673,6 +721,8 @@ class JobSummaryScreen(Screen):
         if not (isinstance(job, dict) and job):
             job, error = None, error or "the service sent an empty answer"
         self._post(self._apply_job, job, error)
+        # The local metrics file can be large: read and summarize it here, not on the UI thread.
+        self._post(self._apply_metric_catalog, _local_metric_catalog(self._metrics, self._job_id))
 
     def _post(self, fn, *args) -> None:
         call_on_screen(self, fn, *args)
@@ -733,6 +783,10 @@ class JobSummaryScreen(Screen):
         # A long error continues under its text, after the two-cell indent.
         line.update(hanging(content, self._value_width() + self._LABEL_WIDTH, 4))
 
+    def _apply_metric_catalog(self, catalog: list) -> None:
+        self._metric_catalog = catalog
+        self._refresh_view()
+
     def action_refresh(self) -> None:
         if self._loading:
             # The read is in flight (a thread can't be cancelled): say so, not nothing.
@@ -761,16 +815,22 @@ class JobSummaryScreen(Screen):
         if is_shown(self):
             self._open_detail(self._highlighted_scope(), tab)
 
+    def _enter_tab(self) -> str:
+        """Metrics when this machine logged metrics for the job (once read, the catalog says), else Logs."""
+        if self._metric_catalog is not None:
+            return "metrics" if self._metric_catalog else "logs"
+        return enter_tab(self._metrics, self._job_id)
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         # Not a second quick Enter, after the first opened the details.
         if is_shown(self) and event.row_key.value in self._scope_by_row:  # not the "status unavailable" line
-            self._open_detail(self._scope_by_row[event.row_key.value], "logs")
+            self._open_detail(self._scope_by_row[event.row_key.value], self._enter_tab())
 
     def _open_detail(self, sub_job_id, tab: str) -> None:
         self._reread_on_resume = True
         self.app.push_screen(
             JobDetailScreen(self._client, self._job_id, job=self._job, sub_job_id=sub_job_id, initial_tab=tab,
-                            aliases=self._aliases, poll_interval=self._poll_interval)
+                            aliases=self._aliases, metrics=self._metrics, poll_interval=self._poll_interval)
         )
 
     def action_rename(self) -> None:
@@ -790,14 +850,15 @@ class JobSummaryScreen(Screen):
 
 # ─── job detail (tabs) ───────────────────────────────────────────────────────
 
+_METRIC_WINDOWS = [("time", 3600.0), ("time", 6 * 3600.0), ("time", 86400.0), ("all",)]
 _LOG_ONLY = {"save_log", "copy_log", "copy_text", "cycle_level", "toggle_pause", "shrink_sources", "grow_sources", "filter"}
 # Pane ids match LogScreen's ("logs", "resource"), so its tab logic applies as-is.
-_TAB_IDS = ("logs", "resource")
-_TAB_FOCUS = {"logs": "#sources", "resource": "#resource-table"}
+_TAB_IDS = ("metrics", "logs", "resource")
+_TAB_FOCUS = {"metrics": "#metriclist", "logs": "#sources", "resource": "#resource-table"}
 
 
 class JobDetailScreen(LogScreen):
-    """Logs | Resources for a job, optionally scoped to one sub-job.
+    """Metrics | Logs | Resources for a job, optionally scoped to one sub-job.
 
     Extends :class:`LogScreen`, so the Logs tab keeps its live tail, cache,
     saved-console fallback, filter, level, pause, save, and copy behavior, and
@@ -808,19 +869,24 @@ class JobDetailScreen(LogScreen):
     the handlers here never call ``super()`` for them.
     """
 
-    # 2 and 3 are one footer entry ("23 Tabs"), in the places LogScreen keeps for
-    # them, after Back and Quit. The preview's letters open the same tabs here;
-    # c copies a selection on Logs, and m switches the chart on a Resources tab
-    # that shows one chart at a time (check_action).
+    # 1-3 are one footer entry ("123 Tabs"), in the places LogScreen keeps for
+    # them, after Back and Quit. The preview's letters open the same tabs here,
+    # except where a tab gives its letter a meaning of its own: m switches the
+    # chart on a Resources tab that shows one chart at a time (check_action);
+    # with both charts shown, m opens Metrics.
     _TABS = Binding.Group("Tabs", compact=True)
     BINDINGS = [
+        Binding("1", "show_tab('metrics')", "Metrics", group=_TABS),
         Binding("2", "show_tab('logs')", "Logs", group=_TABS),
         Binding("3", "show_tab('resource')", "Resources", group=_TABS),
         Binding("m", "resource_chart", "Busy/memory chart", show=False),
+        Binding("m", "show_tab('metrics')", "Metrics", show=False),
         Binding("l", "show_tab('logs')", "Logs", show=False),
         Binding("g", "show_tab('resource')", "Resources", show=False),
         Binding("c", "copy_text", "Copy selection", show=False),
         Binding("w", "cycle_window", "Window"),
+        Binding("W", "custom_window", "Custom window"),
+        Binding("x", "toggle_axis", "Step/time"),
         # Keep the footer readable next to the tab keys; these still work (? lists them).
         Binding("[", "shrink_sources", "Narrower", show=False),
         Binding("]", "grow_sources", "Wider", show=False),
@@ -833,7 +899,7 @@ class JobDetailScreen(LogScreen):
     _RESOURCE_KEYS_NARROW = "w window   r refresh"  # the header names the window shown
 
     def __init__(self, client, job_id, *, job: dict | None = None, sub_job_id=None, initial_tab: str = "logs",
-                 aliases: AliasStore | None = None, poll_interval=1.0,
+                 aliases: AliasStore | None = None, metrics: MetricsStore | None = None, poll_interval=1.0,
                  job_status=None) -> None:
         super().__init__(client, job_id, sub_job_id=sub_job_id, poll_interval=poll_interval,
                          job_status=job_status or (job or {}).get("status"))
@@ -842,12 +908,26 @@ class JobDetailScreen(LogScreen):
         self._initial_tab = initial_tab if initial_tab in _TAB_IDS else "logs"
         self._active_tab = self._initial_tab
         self._aliases = aliases or AliasStore()
+        self._metrics_store = metrics or MetricsStore()
+        self._metric_records: list = []
+        self._metric_catalog: list = []
+        self._metric_labels: dict = {}  # metric key -> its Label in the list
+        self._metric_stamp: tuple | None = None  # (size, mtime) of the metrics file last read
+        self._metric_key: str | None = None
+        self._metric_window: tuple = _METRIC_WINDOWS[0]
+        self._metric_axis = "step"
 
     # ── layout ──
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("", id="summary")
         with JobTabs(initial=self._initial_tab, id="job-tabs"):
+            with TabPane("Metrics", id="metrics"):
+                yield Static("", id="metric-head")
+                with Horizontal(id="metrics-body"):
+                    yield ListView(id="metriclist")
+                    with VerticalScroll(id="metric-pane"):
+                        yield Static("", id="metric-chart")
             with TabPane("Logs", id="logs"):
                 yield from self._compose_logs()
             with TabPane("Resources", id="resource"):
@@ -856,7 +936,9 @@ class JobDetailScreen(LogScreen):
 
     def on_mount(self) -> None:
         self._render_summary_line()
+        self._load_metrics()
         self.set_interval(self._DATA_REFRESH_SECONDS, self._auto_refresh_data)
+        self.set_interval(10, self._auto_refresh_metrics)
         self.set_interval(self._STATUS_REFRESH_SECONDS, self._refresh_status)
 
     def on_screen_resume(self) -> None:
@@ -962,6 +1044,12 @@ class JobDetailScreen(LogScreen):
         except Exception:  # noqa: BLE001 - not mounted yet
             pass
 
+    def _other_tab_shown(self, tab: str) -> None:
+        self._focus_active_tab()
+        if tab == "metrics":
+            after_refresh(self, self._render_metric_chart)  # it was sized while hidden
+            self._load_metrics()  # records may have arrived while another tab was showing
+
     def check_action(self, action: str, parameters):
         tab = self._active_tab
         if action == "filter" and isinstance(self.focused, Input):
@@ -972,15 +1060,17 @@ class JobDetailScreen(LogScreen):
             return False  # digits pick tabs here, not windows; w cycles the GPU window
         if action == "resource_chart":
             # Only while the pane shows one of the two charts; elsewhere, and while both
-            # are shown (where switching would change nothing), m does nothing.
+            # are shown (where switching would change nothing), m opens the Metrics tab.
             return tab == "resource" and self._resource_single
         if action == "cycle_window":
-            return tab == "resource"
+            return tab in ("metrics", "resource")
         if action == "resource_sub_job":
             # < and >: on Resources, with another sub-job to switch to.
             return tab == "resource" and len(self._resource_sub_job_ids()) > 1
         if action == "resource_all_gpus":
             return tab == "resource" and self._resource_gpu is not None
+        if action in ("custom_window", "toggle_axis"):
+            return tab == "metrics"
         return True
 
     def _line_prefixes(self) -> tuple[str, str]:
@@ -1009,6 +1099,13 @@ class JobDetailScreen(LogScreen):
             return f"No log output: {v.never_started_text(self._ended_job())}."
         return super()._no_log_output()
 
+    def action_refresh_sources(self) -> None:
+        # r refreshes what the visible tab shows; Logs and Resources keep LogScreen's behavior.
+        if self._active_tab == "metrics":
+            self._load_metrics()
+        else:
+            super().action_refresh_sources()
+
     def _auto_refresh_data(self) -> None:
         # Only the visible tab polls, and only while the job is live. Resources waits
         # until the status check sees the shown sub-job running: before that it has no samples.
@@ -1016,6 +1113,10 @@ class JobDetailScreen(LogScreen):
             return
         if self._resource_active() and self._resource_polls():
             self._start_resource_refresh(force=True)
+
+    def _auto_refresh_metrics(self) -> None:
+        if self.app.screen is self and self._active_tab == "metrics" and self._live():
+            self._load_metrics()
 
     # ── windows ──
     def _resource_job(self) -> dict:
@@ -1026,8 +1127,165 @@ class JobDetailScreen(LogScreen):
             names = list(RANGES)
             i = names.index(self._resource_range) if self._resource_range in names else -1
             self.action_resource_range(names[(i + 1) % len(names)])
+            return
+        i = _METRIC_WINDOWS.index(self._metric_window) if self._metric_window in _METRIC_WINDOWS else -1
+        self._metric_window = _METRIC_WINDOWS[(i + 1) % len(_METRIC_WINDOWS)]
+        self._render_metric_chart()
+
+    def action_custom_window(self) -> None:
+        if not is_shown(self):
+            return
+        hint = "30m, 2h, 1d, all, steps:100-500"
+
+        def done(value):
+            if value is None:
+                return
+            win = v.parse_window(value)
+            if win is None:
+                self.notify(f"Couldn't read window “{value}”. Try {hint}.", severity="warning", markup=False)
+                return
+            self._metric_window = win
+            self._render_metric_chart()
+
+        self.app.push_screen(PromptScreen("Metrics window", "", hint), done)
+
+    def action_toggle_axis(self) -> None:
+        self._metric_axis = "time" if self._metric_axis == "step" else "step"
+        self._render_metric_chart()
+
+    # ── metrics tab ──
+    @work(thread=True, exclusive=True, group="metrics")
+    def _load_metrics(self) -> None:
+        try:
+            stat = self._metrics_store.path(self._job_id).stat()
+            stamp = (stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            stamp = None
+        if stamp is not None and stamp == self._metric_stamp:
+            return  # unchanged since the last read: skip the re-parse and the list rebuild
+        try:
+            records = self._metrics_store.load(self._job_id)
+            if self._scope:
+                records = [r for r in records if not r.get("sub_job_id") or r.get("sub_job_id") == self._scope]
+            catalog = v.metric_catalog(records)
+        except Exception:  # noqa: BLE001 - a damaged local file must not stop the app
+            LogScreen._log_traceback(f"local metrics of {self._job_id} unreadable")
+            records, catalog = [], []
+        self._post(self._apply_metrics, records, catalog, stamp)
+
+    async def _apply_metrics(self, records: list, catalog: list, stamp: tuple | None) -> None:
+        self._metric_records = records
+        self._metric_catalog = catalog
+        self._metric_stamp = stamp
+        lv = self.query_one("#metriclist", ListView)
+        keys = [m.key for m in catalog]
+        if self._metric_key not in keys:
+            loss = v.primary_loss(catalog)
+            self._metric_key = loss.key if loss else (keys[0] if keys else None)
+        if keys and keys == list(self._metric_labels):
+            # The same metrics as shown: update their values in place (a rebuild blanks the list).
+            for info in catalog:
+                self._metric_labels[info.key].update(self._metric_row(info))
+        else:
+            await lv.clear()
+            self._metric_labels = {}
+            family = None
+            index = None
+            for i, info in enumerate(catalog):
+                if info.family != family:
+                    family = info.family
+                    lv.append(ListItem(Label(f"[b dim]{family}[/]"), disabled=True))
+                label = self._metric_labels[info.key] = Label(self._metric_row(info))
+                lv.append(ListItem(label, id=f"metric-{i}"))
+                if info.key == self._metric_key:
+                    index = len(lv) - 1
+            if index is not None:
+                lv.index = index
+        self._render_metric_head(catalog)
+        self._render_metric_chart()
+
+    @staticmethod
+    def _metric_row(info) -> Content:
+        label = info.label if len(info.label) <= 26 else info.label[:25] + "…"
+        return Content.from_markup("$label [b]$value[/b]", label=f"{label:<26}", value=f"{v.fmt_metric(info.latest):>9}")
+
+    def _render_metric_head(self, catalog: list) -> None:
+        head = self.query_one("#metric-head", Static)
+        if not catalog:
+            head.update("")
+            return
+        loss = v.primary_loss(catalog)
+        bits = []
+        if loss:
+            at = f" (step {loss.min_step})" if loss.min_step is not None else ""
+            bits.append(Content.from_markup(
+                f"[b]$label[/b]  latest [b green]$latest[/]  ·  min [b]$minimum[/]{at}", label=loss.label,
+                latest=v.fmt_metric(loss.latest), minimum=v.fmt_metric(loss.minimum)))
+        bits.append(Content(f"{len(catalog)} metric(s) logged on this machine  ·  {len(self._metric_records)} record(s)"))
+        head.update(Content("  ") + Content("     ").join(bits))
+
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        if event.list_view.id != "metriclist" or event.item is None or not (event.item.id or "").startswith("metric-"):
+            return
+        catalog = self._metric_catalog
+        idx = int(event.item.id.split("-", 1)[1])
+        if idx < len(catalog) and catalog[idx].key != self._metric_key:
+            self._metric_key = catalog[idx].key
+            self._render_metric_chart()
+
+    def _render_metric_chart(self) -> None:
+        try:
+            chart = self.query_one("#metric-chart", Static)
+        except Exception:  # noqa: BLE001 - not mounted
+            return
+        if not self._metric_records or not self._metric_key:
+            chart.update(Content.from_markup(
+                "[b]No client-logged metrics for this job on this machine.[/b]\n\n"
+                "The service does not keep per-step training metrics. Recipes run from this\n"
+                "machine record them automatically; from your own loop call:\n\n"
+                "  [b]from cortex_training.tui.stores import MetricsStore[/b]\n"
+                '  [b]MetricsStore().append("$job", {"train_loss": loss}, step=step)[/b]', job=self._job_id))
+            return
+        info = {m.key: m for m in self._metric_catalog}.get(self._metric_key)
+        pts = v.window_points(v.metric_points(self._metric_records, self._metric_key), self._metric_window)
+        if self._metric_axis == "step":
+            pts = [p for p in pts if p[1] is not None]
+            xs, x_fmt, axis = [p[1] for p in pts], (lambda s: f"step {int(s)}"), "training step"
+        else:
+            pts = [p for p in pts if p[0] is not None]
+            xs, x_fmt, axis = [p[0] for p in pts], v.fmt_clock, "wall-clock time"
+        ys = [p[2] for p in pts]
+        try:
+            # Fit the pane: a chart wider than it wraps every row (narrow terminals).
+            width = max(20, self.query_one("#metric-pane").size.width - 2)
+            height = max(8, self.query_one("#metric-pane").size.height - 7)
+        except Exception:  # noqa: BLE001 - not laid out yet
+            width, height = 90, 14
+        stats = v.series_stats(ys)
+        title = Content.from_markup("[b]$label[/b]  [dim]($key · $family)[/dim]", label=info.label if info else self._metric_key,
+                                    key=self._metric_key, family=info.family if info else "")
+        sub = Content.from_markup(
+            "window: [b]$window[/b]  ·  x: [b]$axis[/b]  ·  $count point(s)  ·  latest [b]$latest[/b]  min $low  max $high",
+            window=v.window_label(self._metric_window), axis=axis, count=len(ys), latest=v.fmt_metric(stats["latest"]),
+            low=v.fmt_metric(stats["min"]), high=v.fmt_metric(stats["max"]))
+        if ys:
+            body = v.render_chart(xs, ys, width=width, height=height, x_fmt=x_fmt)
+        else:
+            hint = " or x for the time axis" if self._metric_axis == "step" else ""
+            body = [f"(no points in this window — press w to widen it{hint})"]
+        chart.update(Content("\n").join([
+            title, sub, Content(""), Content.from_markup("[cyan]$body[/cyan]", body="\n".join(body)), Content(""),
+            Content.from_markup("[dim]↑/↓ pick a metric · w cycle 1h / 6h / 24h / full job · W custom window · x step ↔ time[/dim]"),
+        ]))
 
     def on_resize(self, event) -> None:
         # LogScreen.on_resize also runs (log re-wrap, Resources); refit the summary
-        # line here.
+        # line and redraw the chart here.
         self.call_after_refresh(self._render_summary_line)
+        if self._active_tab == "metrics":
+            after_refresh(self, self._render_metric_chart)
+
+    def _tabs_resized(self) -> None:
+        super()._tabs_resized()
+        if self._active_tab == "metrics":
+            after_refresh(self, self._render_metric_chart)

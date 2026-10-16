@@ -52,6 +52,7 @@ from cortex_training import AccountJobListUnavailable
 from cortex_training.tui import views
 from cortex_training.tui.format import format_log_entry
 from cortex_training.tui.stores import AliasStore
+from cortex_training.tui.stores import MetricsStore
 
 _GIB = 1024**3
 _H200_FB = 141 * _GIB
@@ -98,7 +99,7 @@ def _kind(sj: dict) -> str:
 
 
 # (alias, status, reason, age, duration, hardware, sub-jobs, kind[, overrides]) — kind
-# drives the training log; the overrides are those _NAME_SPECS and _STATE_SPECS describe.
+# drives metrics; the overrides are those _NAME_SPECS and _STATE_SPECS describe.
 _SPECS = [
     ("qwen3-8b lora · support-chat v4", "RUNNING", "", timedelta(hours=2, minutes=14), None, "H200",
      [_training("Qwen/Qwen3-8B", 8, lr=1e-4, bs=16, seq=8192, lora=16)], "sft"),
@@ -313,7 +314,7 @@ class DemoClient:
         # Jobs whose state moves on while the demo runs (on the wall clock only):
         # job id -> [(seconds after the demo started, status, reason)].
         self._timeline: dict = {}
-        self._run_steps: dict = {}  # job id -> the epoch of each step of its training run, computed once
+        self._metric_records: dict = {}  # job id -> its client-logged records as (epoch, record), read once
         self._rng = random.Random(seed)
         self._account_list = account_list
         # The location this client is bound to: the configured one, or a for_job() row's.
@@ -467,10 +468,14 @@ class DemoClient:
             return RuntimeError(_EXPERIMENT_SQL.format(database=database, schema=schema, name="TRAINING_RUNS"))
         return None
 
-    # ── seeding the local store (aliases) ──
-    def seed_local(self, *, aliases: AliasStore) -> None:
+    # ── seeding local stores (aliases + client-logged metrics) ──
+    def seed_local(self, *, aliases: AliasStore, metrics: MetricsStore) -> None:
         for jid, name in self._aliases.items():
             aliases.set(jid, name)
+        for job in self._jobs:
+            kind = self._kinds.get(job["job_id"])
+            if kind and not metrics.load(job["job_id"]):
+                self._seed_metrics(job, kind, metrics)
 
     @staticmethod
     def _config_lr(job: dict, default: float) -> float:
@@ -480,6 +485,52 @@ class DemoClient:
             if isinstance(opt, dict) and isinstance(opt.get("lr"), (int, float)):
                 return float(opt["lr"])
         return default
+
+    def _seed_metrics(self, job: dict, kind: str, store: MetricsStore) -> None:
+        rng = random.Random(job["job_id"])
+        lr = self._config_lr(job, 1e-4)
+        start = datetime.fromisoformat(job["created_at"].replace("Z", "+00:00")) + timedelta(minutes=6)
+        end = datetime.fromisoformat(job["state_changed_at"].replace("Z", "+00:00"))
+        if job["status"] == "RUNNING":
+            end = self.now - timedelta(seconds=20)
+        span = max(60.0, (end - start).total_seconds())
+        if kind == "rl":
+            steps = int(min(400, span / 45))
+            for s in range(steps):
+                frac = s / max(1, steps - 1)
+                reward = 0.18 + 0.55 * (1 - math.exp(-4 * frac)) + rng.gauss(0, 0.025)
+                store.append(job["job_id"], {
+                    "policy_loss": 0.04 * math.exp(-2 * frac) + rng.gauss(0, 0.006),
+                    "reward": reward,
+                    "kl": 0.002 + 0.03 * frac + abs(rng.gauss(0, 0.003)),
+                    "entropy": 0.92 - 0.45 * frac + rng.gauss(0, 0.02),
+                    "clip_frac": 0.06 + 0.05 * math.sin(frac * 6) ** 2 + abs(rng.gauss(0, 0.01)),
+                    "completion_length": 380 - 120 * frac + rng.gauss(0, 18),
+                    "eval_success_rate": min(0.95, 0.22 + 0.6 * frac + rng.gauss(0, 0.02)) if s % 20 == 0 else None,
+                    "learning_rate": lr,
+                    "grad_norm": 0.6 + 0.4 * math.exp(-3 * frac) + abs(rng.gauss(0, 0.08)),
+                    "step_time": 38 + rng.gauss(0, 3),
+                }, step=s, ts=(start + timedelta(seconds=span * frac)).isoformat())
+            return
+        steps = int(min(1500, span / 6))
+        if kind == "sft-fail":
+            steps = min(steps, 140)
+        for s in range(steps):
+            frac = s / max(1, steps - 1)
+            loss = 0.38 + 1.9 * math.exp(-5.5 * frac) + rng.gauss(0, 0.035)
+            if kind == "sft-fail" and s > 110:
+                loss += (s - 110) * 0.09  # diverging before the failure
+            warm = min(1.0, s / 50)
+            rec = {
+                "train_loss": loss,
+                "learning_rate": lr * warm * (1 - 0.9 * frac),
+                "grad_norm": 1.4 * math.exp(-3 * frac) + 0.25 + abs(rng.gauss(0, 0.06)) + (3.0 if kind == "sft-fail" and s > 120 else 0),
+                "step_time": 5.6 + rng.gauss(0, 0.25),
+                "tokens_per_second": 21500 + rng.gauss(0, 600),
+            }
+            if s % 50 == 0 and s:
+                rec["val_loss"] = loss + 0.06 + rng.gauss(0, 0.01)
+            store.append(job["job_id"], rec, step=s, ts=(start + timedelta(seconds=span * frac)).isoformat())
 
     # ── client surface used by the TUI ──
     def list_jobs(self, status: Optional[str] = None, *, max_retries: Optional[int] = None,
@@ -684,14 +735,14 @@ class DemoClient:
 
     def _period(self, job: dict, sj: dict) -> float:
         """Seconds between periodic lines: a sampling engine's batches, or a training step,
-        spaced as the steps of the job's run are (an RL step takes about 45 s)."""
+        spaced as the job's own metrics records are (an RL step takes about 45 s)."""
         if job["job_id"] in self._log_every:
             return self._log_every[job["job_id"]]
         if _kind(sj) in ("sampling", "log_prob"):
             return self._GENERATE_SECONDS
-        times = self._step_times(job["job_id"])
-        if len(times) > 1:
-            return max(self._STEP_SECONDS, (times[-1] - times[0]) / (len(times) - 1))
+        records = self._records(job["job_id"])
+        if len(records) > 1:
+            return max(self._STEP_SECONDS, (records[-1][0] - records[0][0]) / (len(records) - 1))
         return 45.0 if self._kinds.get(job["job_id"]) == "rl" else self._STEP_SECONDS
 
     def _closing(self, job: dict) -> list:
@@ -701,12 +752,14 @@ class DemoClient:
                 ("ERROR", "zone", "sub-job readiness probe failed 3 times; tearing down")]
 
     def _periodic(self, job: dict, sj: dict) -> tuple:
-        """(epochs of the lines that are the steps of the job's run, epoch of the first line
-        after them, seconds between lines). A training sub-job logs one step line per step
-        of its run; then, and without a run, one line every period."""
+        """(epochs of the lines that are the job's metrics records, epoch of the first line
+        after them, seconds between lines). A training sub-job logs one step line per
+        record, so its log and its Metrics tab agree; then, and without records, one
+        line every period."""
         period = self._period(job, sj)
-        times = self._step_times(job["job_id"]) if _kind(sj) == "training" else []
-        if times:
+        records = self._records(job["job_id"]) if _kind(sj) == "training" else []
+        if records:
+            times = [epoch for epoch, _ in records]
             return times, times[-1] + period, period
         startup = self._startup(job, sj)
         return [], (self._started(job) + timedelta(seconds=startup[-1][0] + period)).timestamp(), period
@@ -719,27 +772,16 @@ class DemoClient:
             periodic += int((end - after) // period) + 1
         return len(self._startup(job, sj)) + periodic + len(self._closing(job))
 
-    def _step_times(self, job_id: str) -> list:
-        """The epoch of each step of the job's training run, in order (none for a job without
-        a kind). The run trains from 6 minutes after the job was created until it ended (20 s
-        before the demo started, for a running job), a step every 6 s (45 s for RL), at most
-        1,500 steps (400 for RL; the failed run stopped at 140), each at its share of that time."""
-        if job_id not in self._run_steps:
-            kind = self._kinds.get(job_id)
-            times: list = []
-            if kind in ("sft", "rl", "sft-fail"):
-                job = self._find(job_id)
-                start = datetime.fromisoformat(job["created_at"].replace("Z", "+00:00")) + timedelta(minutes=6)
-                end = datetime.fromisoformat(job["state_changed_at"].replace("Z", "+00:00"))
-                if job["status"] == "RUNNING":
-                    end = self.now - timedelta(seconds=20)
-                span = max(60.0, (end - start).total_seconds())
-                steps = int(min(400, span / 45)) if kind == "rl" else int(min(1500, span / 6))
-                if kind == "sft-fail":
-                    steps = min(steps, 140)
-                times = [(start + timedelta(seconds=span * (s / max(1, steps - 1)))).timestamp() for s in range(steps)]
-            self._run_steps[job_id] = times
-        return self._run_steps[job_id]
+    def _records(self, job_id: str) -> list:
+        """The job's client-logged metrics (seeded on this machine) as sorted (epoch, record)."""
+        if job_id not in self._metric_records:
+            stamped = []
+            for rec in MetricsStore().load(job_id):
+                ts = views.parse_ts(rec.get("ts"))
+                if ts is not None:
+                    stamped.append((ts.timestamp(), rec))
+            self._metric_records[job_id] = sorted(stamped, key=lambda pair: pair[0])
+        return self._metric_records[job_id]
 
     def _stuck_lines(self, job: dict, sj: dict) -> list:
         """Indices of the lines of ``sj``'s log that are 300 KiB or more (see _STATE_SPECS):
@@ -757,7 +799,7 @@ class DemoClient:
 
     def _step_line(self, job: dict, sj: dict, k: int, at: datetime) -> tuple:
         """The k-th periodic line: a generate batch, a reference log-prob batch, or a
-        training step that follows the job's run and config."""
+        training step that matches the job's own metrics and config."""
         rng = random.Random(f"log{sj['sub_job_id']}:{k}")
         kind = _kind(sj)
         if kind == "log_prob":
@@ -775,21 +817,30 @@ class DemoClient:
                                     f"throughput={rng.randint(5200, 7400)} tok/s")
         if k % 37 == 20:
             return "WARNING", "train", "dataloader stalled 11.8s waiting for next batch (consider num_workers>4)"
-        # The k-th line is the run's step k, and past its last step (the run stops when the
-        # demo starts) the steps go on; a job without a run logs every tenth step.
-        step = k if self._step_times(job["job_id"]) else k * 10
+        records = self._records(job["job_id"])
+        rec = records[min(k, len(records) - 1)][1] if records else None
+        step = int(rec.get("step", k * 10)) if rec else k * 10
+        past = k - len(records) + 1 if records and k >= len(records) else 0
+        # Past the metrics logged on this machine (they stop when the demo starts), the
+        # run goes on from its last record: the next steps, each with values of its own.
+        step += past
         lr = self._config_lr(job, 1e-4)
         if self._kinds.get(job["job_id"]) == "rl":
-            # A reward that climbs, a KL that grows, and a policy loss that eases off, with some noise.
-            reward = 0.18 + 0.55 * (1 - math.exp(-k / 150)) + rng.gauss(0, 0.025)
-            kl = 0.002 + 0.03 * (1 - math.exp(-k / 300)) + abs(rng.gauss(0, 0.003))
-            loss = 0.04 * math.exp(-k / 150) + rng.gauss(0, 0.006)
+            reward = rec.get("reward") if rec else None
+            kl = rec.get("kl") if rec else None
+            loss = rec.get("policy_loss") if rec else None
+            reward = (reward if reward is not None else 0.2) + (rng.gauss(0, 0.02) if past else 0)
+            kl = max(0.0, (kl if kl is not None else 0.002) + (rng.gauss(0, 0.002) if past else 0))
+            loss = (loss if loss is not None else 0.04) + (rng.gauss(0, 0.005) if past else 0)
             return "INFO", "train", (f"step {step:>4}  reward={reward:.3f}  kl={kl:.4f}  policy_loss={loss:.4f}  "
                                      f"lr={lr:.2e}")
-        # A loss that eases off with some noise.
-        loss = 0.38 + 1.9 * math.exp(-k / 150) + abs(rng.gauss(0, 0.03))
-        grad = rng.uniform(0.3, 1.2)
-        lr_now = lr * min(1.0, step / 50)
+        # Without records (none were seeded for this job), a loss that eases off with some noise.
+        loss = rec.get("train_loss") if rec else 0.38 + 1.9 * math.exp(-k / 150) + abs(rng.gauss(0, 0.03))
+        grad = rec.get("grad_norm") if rec else rng.uniform(0.3, 1.2)
+        lr_now = rec.get("learning_rate", lr) if rec else lr * min(1.0, step / 50)
+        if past:
+            loss = max(0.05, loss * 0.9995 ** past + rng.gauss(0, 0.02))
+            grad = max(0.05, grad + rng.gauss(0, 0.05))
         return "INFO", "train", (f"step {step:>4}  loss={loss:.4f}  grad_norm={grad:.3f}  lr={lr_now:.2e}  "
                                  f"tok/s={rng.randint(20500, 22800)}")
 

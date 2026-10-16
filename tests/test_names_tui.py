@@ -40,11 +40,11 @@ from cortex_training.tui import views  # noqa: E402
 from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.app import JobListScreen  # noqa: E402
 from cortex_training.tui.demo import DemoClient  # noqa: E402
-from cortex_training.tui.log_cache import job_cache_dir  # noqa: E402
 from cortex_training.tui.screens import JobDetailScreen  # noqa: E402
 from cortex_training.tui.screens import JobSummaryScreen  # noqa: E402
 from cortex_training.tui.screens import PromptScreen  # noqa: E402
 from cortex_training.tui.stores import AliasStore  # noqa: E402
+from cortex_training.tui.stores import MetricsStore  # noqa: E402
 
 NOW = datetime.now(timezone.utc)
 A, B, C, U, E = (f"fake-job-{c}" for c in ("aaaa", "bbbb", "cccc", "uuuu", "eeee"))
@@ -419,12 +419,12 @@ def test_reason_details_follow_the_reason_in_the_preview_and_the_summary_line():
 
 def test_demo_shows_comment_names_an_unknown_row_and_a_shared_gpu_job():
     client = DemoClient()
-    client.seed_local(aliases=AliasStore())
+    client.seed_local(aliases=AliasStore(), metrics=MetricsStore())
     served = client.list_jobs()
     unknown = next(j for j in served if j["status"] == "UNKNOWN")
     assert "created_at" not in unknown and all("sub_job_id" not in s for s in unknown["sub_jobs"])
     assert client.get_job(unknown["job_id"]) == unknown
-    assert client.download_metrics(unknown["job_id"], job_cache_dir("x") / "m")  # stage data still there
+    assert client.download_metrics(unknown["job_id"], MetricsStore().path("x").parent / "m")  # stage data still there
 
     async def run():
         app = CortexTrainingLogTUI(client, poll_interval=0.01)
@@ -441,7 +441,7 @@ def test_demo_shows_comment_names_an_unknown_row_and_a_shared_gpu_job():
             gpus = [str(column.label) for column in s.query_one("#jobs", DataTable).columns.values()].index("GPUs")
             assert _row(s, _item(s, shared["job_id"]))[gpus] == "shared"
             # Its GPUs report under the job it shares them with, as on the service.
-            assert client.download_metrics(shared["job_id"], job_cache_dir("x") / "m2") == []
+            assert client.download_metrics(shared["job_id"], MetricsStore().path("x").parent / "m2") == []
             await _settle(app, pilot)
 
     asyncio.run(run())

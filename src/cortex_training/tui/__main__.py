@@ -81,7 +81,7 @@ def textual_problem() -> str | None:
 def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=prog,
-        description="Read-only TUI for Cortex Training jobs: logs and GPU usage.",
+        description="Read-only TUI for Cortex Training jobs: metrics, logs, and GPU usage.",
     )
     p.add_argument(
         "job_id", nargs="?",
@@ -143,7 +143,7 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
     p.add_argument(
         "--demo",
         action="store_true",
-        help="Preview the TUI with synthetic jobs and GPU telemetry (no connection).",
+        help="Preview the TUI with synthetic jobs, metrics and GPU telemetry (no connection).",
     )
     return p
 
@@ -305,14 +305,15 @@ def _run_demo(args, app_class, *, account_list: str | None = None) -> int:
 
     from cortex_training.tui.demo import DemoClient
     from cortex_training.tui.stores import AliasStore
+    from cortex_training.tui.stores import MetricsStore
 
     previous = os.environ.get("CORTEX_TRAINING_TUI_CACHE_DIR")
     with tempfile.TemporaryDirectory(prefix="cortex-training-demo-") as cache:
-        # Demo names and caches must never land in the real cache dir.
+        # Demo names, metrics and caches must never land in the real cache dir.
         os.environ["CORTEX_TRAINING_TUI_CACHE_DIR"] = cache
         try:
             client = DemoClient(account_list=account_list)
-            client.seed_local(aliases=AliasStore())
+            client.seed_local(aliases=AliasStore(), metrics=MetricsStore())
             app = app_class(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=args.poll_interval,
                             schema_only=args.schema_only)
             app.title = "cortex training (demo)"  # synthetic jobs: say so on every screen

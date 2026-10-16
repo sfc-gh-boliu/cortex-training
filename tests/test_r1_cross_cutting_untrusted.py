@@ -121,7 +121,7 @@ def test_every_screen_draws_hostile_service_text_inert():
                 _check(app, f"{job_id} preview")
                 await pilot.press("l")
                 assert await wait_for(pilot, lambda: isinstance(app.screen, JobDetailScreen) and app.screen.is_mounted)
-                for tab in ("2", "3"):
+                for tab in ("2", "3", "1"):
                     await pilot.press(tab)
                     for _ in range(15):
                         await pilot.pause()

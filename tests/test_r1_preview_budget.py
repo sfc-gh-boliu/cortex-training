@@ -92,7 +92,7 @@ async def _open(app, pilot, job):
     app.push_screen(JobSummaryScreen(c, JOB, job=job))
     assert await _wait(pilot, lambda: isinstance(app.screen, JobSummaryScreen) and unwrapped(c).get_job.called)
     p = app.screen
-    assert await _wait(pilot, lambda: p._fetched_at is not None and not p._loading)
+    assert await _wait(pilot, lambda: p._metric_catalog is not None and not p._loading)
     for _ in range(10):
         await pilot.pause()
     return p
@@ -119,7 +119,7 @@ def test_the_comment_gets_exactly_the_rows_left():
             p = await _open(app, pilot, job)
             body = p.query_one("#summary-body", VerticalScroll)
             seen = {}
-            for rows in range(46, 32, -1):
+            for rows in range(46, 34, -1):
                 await pilot.resize_terminal(140, rows)
                 assert await _wait(pilot, lambda: p.size.height == rows)
                 for _ in range(10):

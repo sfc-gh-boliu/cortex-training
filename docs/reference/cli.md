@@ -662,7 +662,9 @@ The download itself still completes.
 `--resume`, `--parallel`, `--sub-job`, `--strict`, `--stale-after-minutes`, and
 `--transfer-timeout` do not apply to execution logs,
 including `download-log` without `--log-type stdout`. Two downloads of the same
-directory at once are unsupported.
+directory at once are unsupported. If the TUI is downloading into the same
+directory (its cache, as named in a skipped-chunk warning), the command stops
+with an error instead of writing alongside it.
 
 ### Download GPU Metrics
 
@@ -682,7 +684,8 @@ progress on stderr, and Ctrl-C behave as for
 [persisted stdout](#download-persisted-stdout). While the job is running, a
 sub-job that has saved stdout but no GPU metrics is also listed, with
 `chunk_count` 0, `saved_path` `null`, and a warning that metric uploads may be
-stalled. Two downloads of the same directory at once are unsupported.
+stalled. Two downloads of the same directory at once are unsupported; a TUI
+download of the same directory is refused as for stdout.
 
 ### Job TUI
 
@@ -726,9 +729,29 @@ Logs are cached locally so reopening a job replays instantly without
 re-fetching from the server — under `~/.cache/cortex-training/` (or
 `$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`.
 
-A finished job loads its saved console once. A stream error while the job is
-still running stays an error. The level key filters structured live lines and
-does not hide lines from that saved console.
+A finished job loads its saved console into the same per-job cache
+(`jobs/<job>/stdout/<sub_job_id>/stdout.log` under the cache directory), with
+resume, so reopening the job shows the saved copy at once and only fetches
+chunks that are not already on disk. The status line reports while that
+download runs or waits for another download of the same job — another view,
+or another TUI process, finishes first rather than both writing the same
+files. A failed download is shown in the log pane and keeps the cached view;
+`r` retries it. The selected sub-job is fetched first and shown as soon as it
+is saved, then the rest of the job. The pane shows, and `/` filters, only the
+end of a large console (up to 20,000 lines from at most its last 64 MiB, and
+only bytes the download has committed); `s` and `y` still export the whole
+file. As in a terminal, a carriage return rewinds the line, so a progress bar
+redrawn with `\r` shows only its final state, and a line longer than 8 KiB
+shows only its end. Warnings from a download (for example skipped damaged
+chunks, or uploads that look stalled while the job runs) appear on the status
+line, and on the Resource tab, for the selected sub-job. The TUI always
+resumes, so it keeps a skipped chunk skipped; its warning names the
+`download-log --log-type stdout` or `download-metrics` command, with
+`--sub-job` and `--output-dir` set to the TUI's cache, that retries it. The stalled-upload check runs on at most one GPU
+metrics refresh per job every five minutes (a refresh that fails does not
+count). A
+stream error while the job is still running stays an error. The level key
+filters structured live lines and does not hide lines from that saved console.
 
 The TUI also writes two files into your home directory: saved logs from the `s`
 key (`~/cortex-training-<job8>-<source>.log`, where `<job8>` is the first eight
@@ -749,7 +772,7 @@ Keys in Logs:
 | `s` | Save the current source to `~/cortex-training-<job8>-<source>.log` |
 | `y` | Copy the whole log to the clipboard |
 | `c` | Copy the current selection |
-| `r` | Refresh the sub-job list |
+| `r` | Refresh the sub-job list (and retry or refresh a finished job's saved console) |
 | `t` | Switch to Resource |
 | `[` / `]` | Narrow / widen the sources panel |
 | `b` / `esc` | Back (`esc` clears an active log filter first) |

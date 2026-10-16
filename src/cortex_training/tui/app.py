@@ -133,6 +133,10 @@ from cortex_training.tui.log_cache import job_cache_dir
 from cortex_training.tui.log_cache import prune_consoles
 from cortex_training.tui.log_cache import prune_metrics
 from cortex_training.tui.log_cache import touch_console
+from cortex_training.tui.log_style import LogHighlighter
+from cortex_training.tui.log_style import line_kind
+from cortex_training.tui.log_style import sub_job_color
+from cortex_training.tui.resource import CHART_MUTED
 from cortex_training.tui.resource import DEFAULT_RANGE
 from cortex_training.tui.resource import GPU
 from cortex_training.tui.resource import LOADING_OLDER
@@ -145,16 +149,18 @@ from cortex_training.tui.resource import ResourceData
 from cortex_training.tui.resource import age_slack
 from cortex_training.tui.resource import allocation_text
 from cortex_training.tui.resource import cached_metric_sources
+from cortex_training.tui.resource import chart_hue
 from cortex_training.tui.resource import format_value
 from cortex_training.tui.resource import freshness_text
 from cortex_training.tui.resource import forget_resource_loaders
 from cortex_training.tui.resource import gpu_allocation
 from cortex_training.tui.resource import has_metric_samples
 from cortex_training.tui.resource import headline_metric
-from cortex_training.tui.resource import metric_stats_text
+from cortex_training.tui.resource import level_glyph
+from cortex_training.tui.resource import metric_chart_spans
+from cortex_training.tui.resource import metric_stats_spans
 from cortex_training.tui.resource import no_metrics_text
 from cortex_training.tui.resource import node_allocation_text
-from cortex_training.tui.resource import render_metric_chart
 from cortex_training.tui.resource import resource_loader
 from cortex_training.tui.resource import scrape_text
 from cortex_training.tui.resource import skipped_rows_text
@@ -344,6 +350,32 @@ def call_on_screen(screen: Screen, fn, *args, **kwargs) -> bool:
         return False
 
 
+class _LogPane(Log):
+    """The Logs tab's pane. Each row knows the kind of log line it is part of (a
+    level, or the TUI's own note; see :func:`line_kind`), and its highlighter is told
+    as the row is drawn, so a wrapped line's later rows are styled as its first."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.row_kinds: list[str | None] = []
+
+    def write_rows(self, rows: list[str], kinds: list[str | None], *, scroll_end: bool | None = None) -> None:
+        """``rows`` as :meth:`write_lines` writes them, ``kinds`` one per row it makes."""
+        self.row_kinds.extend(kinds)
+        self.write_lines(rows, scroll_end=scroll_end)
+        del self.row_kinds[:max(0, len(self.row_kinds) - len(self.lines))]  # as the oldest rows went
+
+    def clear(self):
+        self.row_kinds = []
+        return super().clear()
+
+    def _render_line_strip(self, y: int, rich_style):
+        highlighter = self.highlighter
+        if hasattr(highlighter, "row_kind"):
+            highlighter.row_kind = self.row_kinds[y] if 0 <= y < len(self.row_kinds) else None
+        return super()._render_line_strip(y, rich_style)
+
+
 class _SourceList(ListView):
     """The Logs tab's sub-job list. It holds a few rows, so the keys that
     scroll a page or to either end move the log beside it: scrolling back
@@ -376,6 +408,11 @@ class _TimedTail:
             return self._client.tail_logs(*args, **kwargs)
         finally:
             self._screen._tail_request = None
+
+
+def spans_content(spans) -> Content:
+    """One line of ``(text, style)`` spans (as the Resources charts and stats are drawn) as Content."""
+    return Content.assemble(*((text, style) if style else text for text, style in spans))
 
 
 def hanging(content: Content, width: int, indent: int) -> Content:
@@ -1477,7 +1514,10 @@ class JobListScreen(FollowsPointer, Screen):
         """Show ``jid``'s sub-job rows (``unfolded``) or hide them, with the cursor on its row.
 
         The columns stay where they were scrolled to (→ and ← scroll them too):
-        refilled, the table would be back at its first column.
+        refilled, the table would be back at its first column. So does the job's
+        row on screen: refilled, the table would be back at its top, and the
+        cursor's move would bring the row in only as far as the bottom line, its
+        new sub-job rows under it out of view.
         """
         if unfolded:
             self._collapsed.discard(jid)
@@ -1487,9 +1527,41 @@ class JobListScreen(FollowsPointer, Screen):
             self._collapsed.add(jid)
         table = self.query_one("#jobs", DataTable)
         scrolled = table.scroll_x
+        key = self._row_key(jid)
+        try:
+            on_screen = table.get_row_index(key) - int(table.scroll_y)  # rows below the top of the view
+        except Exception:  # noqa: BLE001 - not in the table
+            on_screen = None
         self._render_jobs(keep=jid)
         if scrolled:
             after_refresh(self, table.scroll_to, x=scrolled, animate=False, immediate=True)
+        if on_screen is not None:
+            after_refresh(self, self._keep_job_row, key, on_screen, unfolded)
+
+    def _keep_job_row(self, key: str, on_screen: int, unfolded: bool, tries: int = 10) -> None:
+        """Scroll the list so the job row ``key`` is back ``on_screen`` rows below the top
+        of the view; ``unfolded``: on as far as its sub-job rows need to show, as long as
+        the job's row stays in view."""
+        table = self.query_one("#jobs", DataTable)
+        try:
+            row = table.get_row_index(key)
+        except Exception:  # noqa: BLE001 - gone with a refresh meanwhile
+            return
+        view = table.scrollable_content_region.height - (table.header_height if table.show_header else 0)
+        top = row - max(0, on_screen)
+        if unfolded and view > 0:
+            rows = table.ordered_rows
+            last = row
+            while last + 1 < len(rows) and str(rows[last + 1].key.value).startswith((f"sub-{key}-", f"note-{key}")):
+                last += 1
+            if last - top >= view:
+                top = min(row, last - view + 1)
+        top = max(0, top)
+        if (view <= 0 or top > table.max_scroll_y) and tries:
+            # Not laid out, or not yet as tall as its new rows: once it is.
+            after_refresh(self, self._keep_job_row, key, on_screen, unfolded, tries - 1)
+            return
+        table.scroll_to(y=top, animate=False, immediate=True)
 
     def unfold_highlighted(self) -> bool:
         """→: unfold the highlighted job when it is folded and has rows to show; whether it did
@@ -2537,7 +2609,7 @@ class LogScreen(FollowsPointer, Screen):
             # wrapped to the current pane width before writing. Its max_lines
             # counts those wrapped rows; _write_lines keeps it in step with the
             # _MAX_LINES lines the pane holds.
-            yield Log(id="logview", highlight=False, max_lines=self._MAX_ROWS)
+            yield _LogPane(id="logview", highlight=False, max_lines=self._MAX_ROWS)
         # The Logs tab's own status line (waiting, paused, restarted, scrollback):
         # the header's subtitle is too narrow for these next to a job id. Hidden
         # until it has something to say.
@@ -2566,6 +2638,10 @@ class LogScreen(FollowsPointer, Screen):
         # We drive scrolling ourselves (scroll to the tail on every write unless
         # paused), so disable the widget's blanket auto-scroll.
         self._logview.auto_scroll = False
+        # Each row is styled as it is drawn (levels, tags, the filter's matches); the
+        # rows themselves stay plain text for save, copy and the filter.
+        self._logview.highlighter = LogHighlighter()
+        self._logview.highlight = True
         self._apply_sources_width()
         self._update_subtitle()
         self._load_sources()
@@ -2651,7 +2727,7 @@ class LogScreen(FollowsPointer, Screen):
 
     def _fitted_sources_width(self) -> int:
         labels = [views.sub_job_label(sid) for sid in self._source_by_item.values()]
-        longest = max((views.cell_width(label) for label in labels), default=0)
+        longest = max((views.cell_width(label) for label in labels), default=0) + 2  # with the "● " before it
         return min(self._SOURCES_AUTO_MAX, max(self._SOURCES_AUTO_MIN, longest + 4))
 
     def _apply_sources_width(self) -> None:
@@ -2759,11 +2835,10 @@ class LogScreen(FollowsPointer, Screen):
     # Two charts to a row from this pane width, one under the other below it.
     _RESOURCE_SIDE_BY_SIDE = 90
     _RESOURCE_CHART_GAP = 3  # cells between the two charts of a row
-    # Rows of bars in every chart, and on a terminal shorter than _RESOURCE_SHORT_TERMINAL.
-    # Both even, so the row labelled with half the scale tops out at exactly half of it.
-    _RESOURCE_BAR_ROWS = 4
-    _RESOURCE_SHORT_BAR_ROWS = 2
-    _RESOURCE_SHORT_TERMINAL = 30
+    # Rows of bars in every chart, by the terminal's height: (fewest terminal rows, bar
+    # rows), tallest first; shorter than all of them, the last. Each even, so the row
+    # labelled with half the scale tops out at exactly half of it.
+    _RESOURCE_BAR_ROWS_BY_HEIGHT = ((48, 12), (40, 10), (34, 8), (28, 6), (0, 4))
     _RESOURCE_TICK_SECONDS = 5  # how often the newest sample's age is redrawn
     # A running sub-job's chunks reach the stage about every minute, and an upload
     # can take a minute more: a newest sample older than this (or six sampling
@@ -3075,12 +3150,19 @@ class LogScreen(FollowsPointer, Screen):
             heads.append((("view", kind), text, "dim" if none else "bold" if shown else ""))
         resource = kinds.get(self._resource_kind)
         units: list[tuple[tuple, str, str, str]] = []
+        hue = ""
         if resource is not None:
             metric = headline_metric(resource)
             stale = self._resource_stale(resource, now)
+            metrics = list(resource.metrics)
+            # After a one-cell bar of it, in the first chart's colour.
+            hue = chart_hue(metrics.index(metric)) if metric in metrics else ""
 
             def value(latest) -> str:
-                return "" if metric is None else format_value(latest.get(metric.key), metric.unit)
+                if metric is None:
+                    return ""
+                found = latest.get(metric.key)
+                return f"{level_glyph(found, metric.scale)} {format_value(found, metric.unit)}"
 
             units.append((("unit", None), "ALL", value(resource.latest), "dim" if stale else ""))
             for unit in resource.units:
@@ -3095,8 +3177,13 @@ class LogScreen(FollowsPointer, Screen):
         if units:
             rows.append((("rule",), Content("─" * inner), True))
         for entry, name, value, style in units:
-            text = name + " " * (inner - views.cell_width(name) - views.cell_width(value)) + value
-            rows.append((entry, Content.styled(text, style) if style else Content(text), False))
+            gap = " " * (inner - views.cell_width(name) - views.cell_width(value))
+            if style:  # dimmed: a unit that stopped reporting
+                rows.append((entry, Content.styled(name + gap + value, style), False))
+            else:
+                # The bar in the chart's colour; the value plain, readable under the highlight too.
+                bar, _space, number = value.partition(" ")
+                rows.append((entry, Content.assemble(name, gap, (bar, hue) if hue else bar, _space + number), False))
         return rows
 
     def _sync_resource_list(self, source: str | None, now: datetime) -> None:
@@ -3267,12 +3354,13 @@ class LogScreen(FollowsPointer, Screen):
         # Which sub-job this is, by name (the job's id is on the line above), and where it is among them.
         ids = self._resource_sub_job_ids()
         values["label"] = views.sub_job_label(source) if source else ""
+        # In the colour of its dot in the Logs tab's list and its tag on the log lines.
+        named = f"[b {sub_job_color(values['label'])}]$label[/]"
         if source in ids and len(ids) > 1:
             values.update(position=f"{ids.index(source) + 1} of {len(ids)}", pos=f"{ids.index(source) + 1}/{len(ids)}")
-            source_forms = [("[b]$label[/b] ($position · space switches)", 0), ("[b]$label[/b] ($pos)", 0),
-                            ("[b]$label[/b]", 0)]
+            source_forms = [(f"{named} ($position · space switches)", 0), (f"{named} ($pos)", 0), (named, 0)]
         else:
-            source_forms = [("[b]$label[/b]", 0)]
+            source_forms = [(named, 0)]
         if resource is None:
             if kind == GPU:
                 values.update(allocation=allocation_text(allocation),
@@ -3340,9 +3428,10 @@ class LogScreen(FollowsPointer, Screen):
             status.update(self._resource_status(resource, status.content_size.width))
 
     def _resource_bar_rows(self) -> int:
-        """Rows of bars in each chart: 4, or 2 on a terminal under 30 rows."""
+        """Rows of bars in each chart: 12 on a terminal of 48 rows or more, down to 4
+        under 28 (see _RESOURCE_BAR_ROWS_BY_HEIGHT)."""
         height = getattr(getattr(self.app, "size", None), "height", 0) or 0
-        return self._RESOURCE_SHORT_BAR_ROWS if 0 < height < self._RESOURCE_SHORT_TERMINAL else self._RESOURCE_BAR_ROWS
+        return next(bars for rows, bars in self._RESOURCE_BAR_ROWS_BY_HEIGHT if height >= rows)
 
     def _resource_keys(self, width: int = 0) -> str:
         """The key help, fitted to ``width`` (any length when 0), with only the keys that do something.
@@ -3392,27 +3481,46 @@ class LogScreen(FollowsPointer, Screen):
         gap = self._RESOURCE_CHART_GAP
         column = max(1, (width - gap * (per_row - 1)) // per_row)
         bars = self._resource_bar_rows()
+        hues = [chart_hue(index) for index in range(len(metrics))]
+        # Each title ends with the metric's latest value, at the chart's right edge; the
+        # rest of the title gets the room before it.
+        latest = []
+        for metric in metrics:
+            stats = view.stats.get(metric.key)
+            latest.append(format_value(stats.latest, metric.unit) if stats is not None else "")
+        room = max(1, column - max((views.cell_width(value) for value in latest), default=0) - 2)
         # The header, pinned above them, names the sub-job: the titles needn't.
-        bases = [f"{metric.name} · {window_label(view.name)}" for metric in metrics]
-        titles = [f"{base} · {view.label}" if view.label else base for base in bases]
-        if any(views.cell_width(title) > column for title in titles):
-            titles = [views.fit_cells(base, column) for base in bases]
-        heads = [[title] for title in titles]
+        suffix = f" · {window_label(view.name)}" + (f" · {view.label}" if view.label else "")
+        tails = [suffix] * len(metrics)
+        if any(views.cell_width(metric.name + suffix) > room for metric in metrics):
+            tails = [f" · {window_label(view.name)}"] * len(metrics)
+        if any(views.cell_width(metric.name + tail) > room for metric, tail in zip(metrics, tails)):
+            tails = [""] * len(metrics)
+        notes: list[str | None] = [None] * len(metrics)
         if not complete:
             loading = missing == LOADING_OLDER
             marker = " (loading…)" if loading else f" ({OLDER_NOT_LOADED})"
-            if all(views.cell_width(title + marker) <= column for title in titles):
-                heads = [[title + marker] for title in titles]
+            if all(views.cell_width(metric.name + tail + marker) <= room for metric, tail in zip(metrics, tails)):
+                tails = [tail + marker for tail in tails]
             else:  # on a line of its own under every title, so the charts of a row stay level
                 note = views.fit_cells("(older samples loading…)" if loading else f"({OLDER_NOT_LOADED})", column)
-                heads = [[title, note] for title in titles]
+                notes = [note] * len(metrics)
         blocks = []
-        for metric, head in zip(metrics, heads):
+        for metric, hue, tail, value, note in zip(metrics, hues, tails, latest, notes):
+            name = views.fit_cells(metric.name, room)
+            tail = views.fit_cells(tail, max(0, room - views.cell_width(name)))
+            used = views.cell_width(name) + views.cell_width(tail)
+            head = [Content.assemble((name, f"bold {hue}"), (tail, CHART_MUTED),
+                                     " " * max(1, column - used - views.cell_width(value)), (value, f"bold {hue}"))]
+            if note is not None:
+                head.append(Content.styled(note, CHART_MUTED))
             if has_metric_samples(view, metric.key):
-                body = render_metric_chart(view, metric, column, height=bars).split("\n")
+                body = [spans_content(line) for line in metric_chart_spans(view, metric, column, height=bars,
+                                                                              hue=hue)]
             else:
-                body = [views.fit_cells(f"no {metric.name} samples in this range", column)]
-            blocks.append([Content.styled(line, "bold") for line in head] + [Content(line) for line in body])
+                body = [Content.styled(views.fit_cells(f"no {metric.name} samples in this range", column),
+                                       CHART_MUTED)]
+            blocks.append(head + body)
         height = max(len(block) for block in blocks)
         rows = []
         for start in range(0, len(blocks), per_row):
@@ -3479,9 +3587,9 @@ class LogScreen(FollowsPointer, Screen):
         missing = self._resource_missing(resource)  # the older samples: loading, or not loaded
         self._resource_stale_shown = self._resource_stale(resource, now)
         status.update(self._resource_status(resource, pane_width))
-        stats.update(Content(metric_stats_text(view, whole, resource.metrics, width=pane_width,
-                                               partial=resource.partial, window_partial=not complete,
-                                               missing=missing or LOADING_OLDER)))
+        stats.update(Content("\n").join(spans_content(line) for line in metric_stats_spans(
+            view, whole, resource.metrics, width=pane_width, partial=resource.partial, window_partial=not complete,
+            missing=missing or LOADING_OLDER)))
         charts.update(self._resource_charts(resource, view, pane_width, complete, missing))
 
     def _resource_no_source_text(self) -> Content | str:
@@ -3607,6 +3715,9 @@ class LogScreen(FollowsPointer, Screen):
         """
         if not self._current_source:
             return
+        highlighter = getattr(self._logview, "highlighter", None)
+        if isinstance(highlighter, LogHighlighter):
+            highlighter.query = self._filter  # the repaint below marks the new filter's matches
         self._held = None
         self._paused = False
         self._update_subtitle()
@@ -3930,7 +4041,10 @@ class LogScreen(FollowsPointer, Screen):
             sid = s["sub_job_id"]
             item_id = f"src-{i}"
             self._source_by_item[item_id] = sid
-            lv.append(ListItem(Label(Content(views.sub_job_label(s))), id=item_id))
+            label = views.sub_job_label(s)
+            # A dot in the colour of the sub-job's tag on its log lines; the name stays
+            # plain, readable under the highlight.
+            lv.append(ListItem(Label(Content.assemble(("● ", sub_job_color(label)), label)), id=item_id))
         self._apply_sources_width()  # fitted to these labels
         self.refresh_bindings()  # < and > need two or more sub-jobs
         if not items:
@@ -5334,7 +5448,7 @@ class LogScreen(FollowsPointer, Screen):
         lv.max_lines = max(1, self._rows_total)
         # One write_lines call per page keeps the UI responsive under
         # high-velocity logs (vs. a cross-thread hop + write per line).
-        lv.write_lines(wrapped, scroll_end=follow)
+        self._write_rows(lv, wrapped, chunks, scroll_end=follow)
         if follow and before + added > lv.max_lines:
             # Once full, Log drops its oldest rows and repaints only the rows past
             # its old end, which that has moved out of view, and a view already
@@ -5342,6 +5456,16 @@ class LogScreen(FollowsPointer, Screen):
             lv.refresh()
         if len(self._display_cache) > 4 * self._MAX_LINES:
             self._prune_display_cache()
+
+    def _write_rows(self, lv: Log, rows: list[str], chunks, *, scroll_end: bool) -> None:
+        """Write ``rows`` (the pieces of ``chunks``: (line, its rows, row count) each) to the pane."""
+        if not isinstance(lv, _LogPane):
+            lv.write_lines(rows, scroll_end=scroll_end)
+            return
+        kinds = []
+        for line, _pieces, count in chunks:
+            kinds += [line_kind(self._display(line), note=line in self._banners)] * count
+        lv.write_rows(rows, kinds, scroll_end=scroll_end)
 
     def _prune_display_cache(self) -> None:
         """Keep the display text of the lines this view still has, and drop the rest."""
@@ -5385,7 +5509,7 @@ class LogScreen(FollowsPointer, Screen):
         lv.clear()
         lv.max_lines = max(1, total)
         # One write for the whole buffer: a call per row took seconds at 20,000 lines.
-        lv.write_lines([piece for _, chunk, _ in chunks for piece in chunk], scroll_end=False)
+        self._write_rows(lv, [piece for _, chunk, _ in chunks for piece in chunk], chunks, scroll_end=False)
         # Re-wrapping clears + repaints (resetting scroll to the top), so snap
         # back to the tail unless the user has paused to read history; then back
         # to the line they were reading (the oldest kept, if that one was dropped).

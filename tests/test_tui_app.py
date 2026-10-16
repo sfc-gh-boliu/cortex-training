@@ -721,8 +721,6 @@ async def _run_resource_guards(tmp_path):
         screen.action_shrink_sources()
         screen.action_grow_sources()
         screen.action_save_log()
-        screen.action_copy_log()
-        screen.action_copy_text()
         for _ in range(5):
             await pilot.pause()
         assert screen.focused is table
@@ -1609,7 +1607,7 @@ async def _run_save_exports_file(tmp_path):
         app.screen._filter = "file"
         copied: list[str] = []
         app.copy_to_clipboard = copied.append
-        app.screen.action_copy_log()
+        app.screen.action_copy_text()  # nothing highlighted: the whole log
         ok = await _wait(pilot, app, lambda: bool(copied))
         assert ok, "copy did not export the saved console"
         # Copied without control characters (pasted elsewhere, they would act there); s keeps the bytes.

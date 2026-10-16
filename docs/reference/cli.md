@@ -1082,8 +1082,8 @@ field help under the search box shows only while the box has focus.
 | `/` / `esc` | Search / clear the search. Keys are taken in the order typed, also when they come faster than the list redraws: what is typed before `Enter` or `esc` is in the search they apply or clear, and the keys after `/`, `Enter` and `esc` go to the search box or the list |
 | `s` / `o` | Sort by created, updated, or status (`succeeded` and `completed` sort with `done`, `canceled` with `cancelled`) / reverse the order. The line above the list says which way it runs: `created ↓ newest first` or `↑ oldest first` (the same for updated; jobs without that time, shown as `—`, come last either way), `status ↓ running first` or `↑ ended first` (history first). The cursor goes to the first job |
 | `Home` / `End` | First / last job |
-| `→` / `←` | Unfold the highlighted job's sub-jobs / fold them; on a sub-job row, `←` folds its job and moves to it. Where there is nothing to unfold or fold, they scroll the columns sideways |
-| click `▸` / `▾` | Unfold or fold that job |
+| `→` / `←` | Unfold the highlighted job's sub-jobs / fold them; on a sub-job row, `←` folds its job and moves to it. The job's row stays where it is on screen, and the list scrolls only as far as an unfolded job's sub-jobs need to show. Where there is nothing to unfold or fold, they scroll the columns sideways |
+| click `▸` / `▾` | Unfold or fold that job, as `→` / `←` do |
 | `e` | Expand or collapse every job's sub-jobs |
 | `a` | All schemas / current schema: switch to the account-level list of every database and schema the role can see (the footer's `a All schemas`), or back to the configured one (`a Current schema`); hidden with `--schema-only` |
 | `n` | Name the highlighted job |
@@ -1182,7 +1182,16 @@ for the next tab.
 - **Logs** is the live and historical log view described below. Each line is
   tagged with the sub-job being tailed, for example `training:0 │ …`, and its
   wrapped rows line up under its text. Saved logs (`s`) and whole-log copies
-  (`c` with nothing highlighted) stay untagged.
+  (`c` with nothing highlighted) stay untagged and uncoloured. In the pane,
+  the tag has its sub-job type's colour (training cyan, sampling violet,
+  log_prob amber), as has the dot before each sub-job in the list beside it
+  and its name in the Resources header; the time is muted; the level is
+  coloured by severity (`INFO` green, `WARNING` amber, `ERROR` red), and a
+  warning's or an error's message is tinted to match, on each row it wraps
+  to; the logger name is
+  blue, the keys of `key=value` pairs are muted, exception names and
+  tracebacks are red, the TUI's own notes (`— live —`) are in italics, and
+  what the filter matches is marked in amber.
 - **Resources** shows telemetry (`download_metrics`) for one sub-job at a
   time: the one selected on the Logs tab, until `Space` shows the next one
   (`<` and `>` go back and forth). The tab's header names it, and stays at the top while the
@@ -1280,18 +1289,29 @@ for the next tab.
     `power`) come first, then a row per metric and scope (`10m`, `job`), and
     the first line names what the values are.
   - Under it, a chart per metric, in the same order: two to a row in a pane
-    at least 90 cells wide, one per row otherwise. Every chart has 4 rows of
-    bars, or 2 on a terminal under 30 rows, so the middle label's row tops out
-    at exactly half the scale. A percentage is charted from 0 to 100%
-    (labeled `100%`, `50%` and `0%`); any other metric from 0 to the smallest
-    1, 2, 2.5 or 5 × 10^k at or above the sub-job's highest sample of it, on
-    any GPU or node (`1000 W`, `500 W`, `0 W`), so its axis doesn't move with
-    the window or the unit shown. Each title names the metric, the window
-    and what the values are (`power (W) · last 10m · mean of 8 GPUs`); on a
+    at least 90 cells wide, one per row otherwise. The charts grow with the
+    terminal: 12 rows of bars on a terminal of 48 rows or more, 10 from 40
+    rows, 8 from 34, 6 from 28 and 4 below that, always an even number, so
+    the middle label's row tops out at exactly half the scale; a dotted line
+    marks that row where the bars stay under it. A percentage is charted from
+    0 to 100% (labeled `100%`, `50%` and `0%`); any other metric from 0 to the
+    smallest 1, 2, 2.5 or 5 × 10^k at or above the sub-job's highest sample of
+    it, on any GPU or node (`1000 W`, `500 W`, `0 W`), so its axis doesn't move
+    with the window or the unit shown. Each title names the metric, the window
+    and what the values are (`power (W) · last 10m · mean of 8 GPUs`), and
+    ends, at the chart's right edge, with the metric's latest value; on a
     terminal too narrow for that, every title leaves out what the values are
-    (the stats name it), and a title that still
-    doesn't fit ends in `…`, so the charts of a row stay level. A metric with
-    no samples in the window says so in its chart's place.
+    (the stats name it), then the window, and a name that still doesn't fit
+    ends in `…`, so the charts of a row stay level. A metric with no samples
+    in the window says so in its chart's place.
+  - Each chart has its own colour, by its place in the order (the first, GPU
+    or CPU util %, is green; memory used % cyan; then blue, violet, amber,
+    rose and so on): its bars (lighter toward the top), its title and latest
+    value, and its name in the stats block. The frame, the axis labels and
+    the times are muted, and the stats' latest values are bold. In the panel,
+    each GPU's or node's value has a one-cell bar of it before it, in the
+    first chart's colour (the value itself stays plain, readable under the
+    highlight).
   - For the mean across GPUs or nodes, min and max are the lowest and highest
     average across them at one sampling interval. Each worker scrapes and
     uploads its samples on its own schedule, so a GPU or node without a sample

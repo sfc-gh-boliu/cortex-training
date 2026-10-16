@@ -2404,6 +2404,11 @@ def _glyph(value: float | None, scale: float = 100.0) -> str:
     return _BLOCKS[min(len(_BLOCKS) - 1, max(0, math.ceil(value / scale * len(_BLOCKS)) - 1))]
 
 
+def level_glyph(value: float | None, scale: float = 100.0) -> str:
+    """One cell, a bar as tall as ``value`` of ``scale`` (``▁`` to ``█``); blank when unmeasured."""
+    return _glyph(value, scale)
+
+
 def _bar_row(values: list[float | None], height: int, level: int, scale: float = 100.0) -> str:
     """Row ``level`` (0 at the bottom) of a ``height``-row bar chart, drawn in eighths of a row."""
     cells = []
@@ -2444,32 +2449,84 @@ def _time_labels(start: datetime, end: datetime, chart_width: int, inner: int) -
     return newest.rjust(inner) if inner >= len(newest) else ""
 
 
-def _draw(values, start: datetime, end: datetime, width: int, height: int, labels: tuple[str, str, str],
-          scale: float) -> str:
-    """A bar chart of ``values`` from 0 to ``scale``, ``height`` rows tall, its axis labelled ``labels``."""
+# Each chart's colour, by its place in the metrics' order: GPU util % (or CPU util %)
+# green, memory used % cyan, then on round the palette. Hues that read on a dark
+# background; the same chart keeps its colour across windows, units and refreshes.
+CHART_HUES = ("#4ade80", "#22d3ee", "#60a5fa", "#a78bfa", "#fbbf24", "#fb7185", "#2dd4bf", "#f472b6", "#a3e635",
+              "#fb923c")
+# The frame, labels and the 50% gridline, quieter than the bars.
+CHART_AXIS = "#6b7280"
+CHART_GRID = "#3f4654"
+CHART_MUTED = "#9ca3af"
+_GRID = "┈"
+
+
+def chart_hue(index: int) -> str:
+    """The colour of the ``index``-th chart (see :data:`CHART_HUES`)."""
+    return CHART_HUES[index % len(CHART_HUES)]
+
+
+def _shade(hue: str, share: float) -> str:
+    """``hue`` darkened toward black: ``share`` 1 is the hue itself, 0 is 45% of it."""
+    level = 0.45 + 0.55 * max(0.0, min(1.0, share))
+    return "#" + "".join(f"{round(int(hue[i:i + 2], 16) * level):02x}" for i in (1, 3, 5))
+
+
+def _chart_spans(values, start: datetime, end: datetime, width: int, height: int, labels: tuple[str, str, str],
+                 scale: float, hue: str | None) -> list[list[tuple[str, str]]]:
+    """The lines of a bar chart of ``values`` from 0 to ``scale``, ``height`` rows tall,
+    its axis labelled ``labels``: each line a list of ``(text, style)`` spans. With a
+    ``hue``, the bars are in it, lighter toward the top, and the frame is muted;
+    without one, every style is empty. The middle label's row has a dotted gridline
+    where the bars stay under it."""
     if width <= 0:
-        return ""
+        return [[("", "")]]
+    bar = (lambda row: _shade(hue, (row + 1) / height)) if hue else (lambda row: "")
+    axis_style, grid_style = (CHART_AXIS, CHART_GRID) if hue else ("", "")
     axis = max(len(label) for label in labels)
     if width < axis + 3:
-        return "".join(_glyph(value, scale) for value in _collapse(values, width))
+        return [[("".join(_glyph(value, scale) for value in _collapse(values, width)), hue or "")]]
     height = max(1, height)
     inner = max(1, width - axis - 2)
     columns = _collapse(values, inner)
     chart_width = len(columns)
     padding = " " * (inner - chart_width)
     top, middle, bottom = labels
+    middle_row = height // 2
     lines = []
     for index in range(height):
         if index == 0:
             mark = f"{top:>{axis}} ┤"
-        elif index == height // 2:
+        elif index == middle_row:
             mark = f"{middle:>{axis}} ┤"
         else:
             mark = " " * axis + " │"
-        lines.append(mark + padding + _bar_row(columns, height, height - 1 - index, scale))
-    lines.append(f"{bottom:>{axis}} └{padding}{'─' * chart_width}")
-    lines.append((" " * (axis + 2) + _time_labels(start, end, chart_width, inner)).rstrip())
-    return "\n".join(lines)
+        level = height - 1 - index
+        cells = _bar_row(columns, height, level, scale)
+        if index == middle_row and height > 2:
+            cells = cells.replace(" ", _GRID)
+        spans = [(mark, axis_style), (padding, "")]
+        # Runs of bar and of gridline, each in its own style.
+        run, kind = "", None
+        for cell in cells:
+            this = "grid" if cell == _GRID else "gap" if cell == " " else "bar"
+            if this != kind and run:
+                spans.append((run, grid_style if kind == "grid" else bar(level) if kind == "bar" else ""))
+                run = ""
+            run, kind = run + cell, this
+        if run:
+            spans.append((run, grid_style if kind == "grid" else bar(level) if kind == "bar" else ""))
+        lines.append(spans)
+    lines.append([(f"{bottom:>{axis}} └{padding}{'─' * chart_width}", axis_style)])
+    lines.append([((" " * (axis + 2) + _time_labels(start, end, chart_width, inner)).rstrip(), axis_style)])
+    return lines
+
+
+def _draw(values, start: datetime, end: datetime, width: int, height: int, labels: tuple[str, str, str],
+          scale: float) -> str:
+    """A bar chart of ``values`` from 0 to ``scale``, ``height`` rows tall, its axis labelled ``labels``."""
+    lines = _chart_spans(values, start, end, width, height, labels, scale, None)
+    return "\n".join("".join(text for text, _style in line) for line in lines)
 
 
 def render_metric_chart(view: KindView, metric: Metric, width: int, *, height: int = 2) -> str:
@@ -2481,6 +2538,13 @@ def render_metric_chart(view: KindView, metric: Metric, width: int, *, height: i
     :func:`_time_labels`).
     """
     return _draw(view.chart(metric.key), view.start, view.end, width, height, axis_labels(metric), metric.scale)
+
+
+def metric_chart_spans(view: KindView, metric: Metric, width: int, *, height: int = 2,
+                       hue: str | None = None) -> list[list[tuple[str, str]]]:
+    """:func:`render_metric_chart` as lines of ``(text, style)`` spans, the bars in ``hue``."""
+    return _chart_spans(view.chart(metric.key), view.start, view.end, width, height, axis_labels(metric),
+                        metric.scale, hue)
 
 
 def has_metric_samples(view: KindView, key: str) -> bool:
@@ -2613,6 +2677,26 @@ def metric_stats_text(view: KindView, whole: KindView | None, metrics, *, width:
     names cut to fit. The scope titles name what the values are (``mean of 8
     GPUs``, ``GPU 3``), and so does the first line of the narrow layout.
     """
+    lines = _stats_lines(view, whole, metrics, width=width, partial=partial, window_partial=window_partial,
+                         missing=missing, hues=None)
+    return "\n".join("".join(text for text, _style in line) for line in lines)
+
+
+def metric_stats_spans(view: KindView, whole: KindView | None, metrics, *, width: int, partial: bool = False,
+                       window_partial: bool = False, missing: str = LOADING_OLDER,
+                       hues=None) -> list[list[tuple[str, str]]]:
+    """:func:`metric_stats_text` as lines of ``(text, style)`` spans: each metric's
+    name in its chart's colour (``hues``, in the metrics' order; :func:`chart_hue`
+    without), the latest values bold, the column heads muted."""
+    metrics = list(metrics)
+    hues = list(hues) if hues is not None else [chart_hue(index) for index in range(len(metrics))]
+    return _stats_lines(view, whole, metrics, width=width, partial=partial, window_partial=window_partial,
+                        missing=missing, hues=hues)
+
+
+def _stats_lines(view: KindView, whole: KindView | None, metrics, *, width: int, partial: bool,
+                 window_partial: bool, missing: str, hues) -> list[list[tuple[str, str]]]:
+    """The lines of :func:`metric_stats_text`, as ``(text, style)`` spans (styled with ``hues``)."""
     metrics = list(metrics)
     window_partial = window_partial or (partial and view.name == "all")
     scopes = [(window_label(view.name), None if window_partial else view)]
@@ -2638,8 +2722,17 @@ def metric_stats_text(view: KindView, whole: KindView | None, metrics, *, width:
     block = 4 * cell
     missing_cell = missing if len(missing) <= block else missing[: block - 1] + "…"
 
-    def scope_cells(found: list[str] | None) -> str:
-        return f"{missing_cell:>{block}}" if found is None else "".join(f"{text:>{cell}}" for text in found)
+    styled = hues is not None
+    head_style, muted = (CHART_AXIS, CHART_MUTED) if styled else ("", "")
+
+    def scope_cells(found: list[str] | None) -> list[tuple[str, str]]:
+        if found is None:
+            return [(f"{missing_cell:>{block}}", f"italic {muted}" if styled else "")]
+        # The latest value stands out: it is what the panel and the chart titles show.
+        return [(f"{text:>{cell}}", "bold" if styled and index == 3 else "") for index, text in enumerate(found)]
+
+    def hue(index: int) -> str:
+        return hues[index] if styled and index < len(hues) else ""
 
     label = view.label
     # Each scope says what its own values are: a GPU that stopped reporting is in the whole
@@ -2653,12 +2746,16 @@ def metric_stats_text(view: KindView, whole: KindView | None, metrics, *, width:
         name_width = max([len(name) for name in names] + [0]) + 2
         if width >= name_width + (block + 2) * len(scopes):
             lines = [
-                (" " * name_width + "".join(f"  {title:^{block}}" for title in titles)).rstrip(),
-                " " * name_width + "".join("  " + header for _ in scopes),
+                [((" " * name_width + "".join(f"  {title:^{block}}" for title in titles)).rstrip(),
+                  "bold" if styled else "")],
+                [(" " * name_width + "".join("  " + header for _ in scopes), head_style)],
             ]
-            for name, row in zip(names, table):
-                lines.append(f"{name:<{name_width}}" + "".join("  " + scope_cells(found) for found in row))
-            return "\n".join(lines)
+            for index, (name, row) in enumerate(zip(names, table)):
+                line = [(f"{name:<{name_width}}", hue(index))]
+                for found in row:
+                    line += [("  ", ""), *scope_cells(found)]
+                lines.append(line)
+            return lines
     # Narrow: a row per metric and scope; the first line says what the values are. The
     # scopes go by their keys (10m, job) before the metrics' names are cut.
     names = [name for name, _scope in scopes] if len(scopes) > 1 else [""]
@@ -2667,9 +2764,11 @@ def metric_stats_text(view: KindView, whole: KindView | None, metrics, *, width:
         names = [view.name, "job"]
     scope_width = max(len(name) for name in names) + 1 if len(scopes) > 1 else 0
     name_width = max(4, width - scope_width - block)
-    lines = [views.fit_cells(label, name_width + scope_width).ljust(name_width + scope_width) + header]
-    for metric, row in zip(metrics, table):
+    lines = [[(views.fit_cells(label, name_width + scope_width).ljust(name_width + scope_width),
+               "bold" if styled else ""), (header, head_style)]]
+    for index, (metric, row) in enumerate(zip(metrics, table)):
         for position, (name, found) in enumerate(zip(names, row)):
             shown = views.fit_cells(metric.short, name_width - 1) if position == 0 else ""
-            lines.append(f"{shown:<{name_width}}{name:<{scope_width}}" + scope_cells(found))
-    return "\n".join(lines)
+            lines.append([(f"{shown:<{name_width}}", hue(index)), (f"{name:<{scope_width}}", muted),
+                          *scope_cells(found)])
+    return lines

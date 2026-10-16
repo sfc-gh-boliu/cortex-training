@@ -57,7 +57,7 @@ Tracked operations:
 - Compute: `forward_backward`, `forward`, `generate`, `generate_stream`, `step`
 - Checkpoints and logs: `save`, `load`, `list_checkpoints`,
   `export_checkpoint`, `delete_checkpoint`, `fetch_execution_logs`,
-  `download_stdout_logs`, `download_metrics`
+  `download_execution_logs`, `download_stdout_logs`, `download_metrics`
 - Multi-sub-job operations: `weight_sync`, `bootstrap_router_replay`,
   `router_replay_discard`, `reset_prefix_cache`
 - Async requests: `poll_request`, `get_request_status`, `cancel_request`
@@ -127,7 +127,7 @@ operation.
 | `list_jobs(status=None)` | list of jobs | Returns the inner list, not the envelope |
 | `iter_jobs(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100)` | iterator of jobs | Jobs across the account that the caller can see, newest first, following page tokens; each also carries `database_name` and `schema_name`. The server applies every filter. Arguments are checked on the call: `page_size` is 1 to 1000, and `schema` needs `database` with it. A 404 means account-level listing is not enabled for the account. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2endpoint) |
 | `for_job(job)` | `CortexTrainingClient` | Bound to a job from `iter_jobs` for per-job calls. Borrows this client's session, auth, and telemetry, so keep this one open; closing the returned client is a no-op. Never creates the job's database |
-| `wait_for_job(job_id)` | job dict | Polls until `running`; raises on `failed`/`done`/`cancelled` or timeout. Does not treat `terminated` as terminal |
+| `wait_for_job(job_id)` | job dict | Polls until `running`; raises once the job has ended (`failed`, `cancelled`, `terminated`) or on timeout |
 | `cancel_job(job_id)` | `None` | Idempotent while cancelling/cancelled |
 | `get_capacity(hardware=None)` | capacity dict | `has_reservation`, `max_total_gpus`, `reserved_gpus`, `in_use_gpus`, `pending_gpus`, `available_gpus`, scoped to `hardware` (omitted means the server default, H200). The CLI `capacity` command queries every type unless `--hardware` is set. `max_total_gpus` is the canonical ceiling (`-1` uncapped); `reserved_gpus` is deprecated |
 | `get_capacity_breakdown(hardware=None, *, dimensions=("job_type", "submitted_by"))` | capacity dict plus `breakdown` | `get_capacity` split by sub-job type and/or submitter; each split has a `status` and `groups`. Unknown dimensions raise `ValueError`. See [rest-api.md section 5.4](rest-api.md#breakdown---breakdown) |
@@ -271,10 +271,18 @@ with 256 or fewer experts. See
 
 ## Logs
 
-`tail_logs(job_id, ...)` returns one cursor page;
-`stream_logs(job_id, follow=True, ...)` yields entries and keeps polling.
-`fetch_execution_logs(job_id)` downloads every log file for the job's experiment
-run and returns `{sub_job_id, filename, artifact_uri, content}` dicts.
+`tail_logs(job_id, ...)` returns one cursor page of `{"_raw": "<time> <line>"}`
+entries (see [REST API section 7.8](rest-api.md#78-tail-logs));
+`stream_logs(job_id, follow=True, ...)` yields entries and keeps polling, and
+with `follow=False` stops at the first empty page. On a job that has ended,
+`tail_logs` raises at once and points at `download_stdout_logs`.
+`download_execution_logs(job_id, output_dir, *, resume=False,
+sub_job_ids=None, progress=None, transfer_timeout_seconds=300)` saves every
+execution log file as `<output_dir>/<sub_job_id>/<filename>` (mode `0600`)
+without holding it in memory; with `resume=True` it skips files unchanged since
+the last download. `fetch_execution_logs(job_id)` returns the same files as
+`{sub_job_id, filename, artifact_uri, content}` dicts, in memory. See
+[REST API section 12.2](rest-api.md#122-full-execution-log-download).
 `download_stdout_logs(job_id, output_dir, *, resume=False, max_workers=None,
 progress=None, on_chunk=None, sub_job_ids=None, strict=False,
 stale_after_seconds=600, transfer_timeout_seconds=300)`

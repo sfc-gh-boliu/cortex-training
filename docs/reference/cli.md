@@ -1087,7 +1087,7 @@ field help under the search box shows only while the box has focus.
 | `e` | Expand or collapse every job's sub-jobs |
 | `a` | All schemas / current schema: switch to the account-level list of every database and schema the role can see (the footer's `a All schemas`), or back to the configured one (`a Current schema`); hidden with `--schema-only` |
 | `n` | Name the highlighted job |
-| `c` / `ctrl+c` / right-click | Copy what is highlighted (text, or rows a drag picked, with their whole job ids), else every job in the list; the same in the preview |
+| `ctrl+c` / right-click | Copy what is highlighted (text, or rows a drag picked, with their whole job ids), else every job in the list; the same in the preview |
 | `r` | Refresh (the list also refreshes every 60 seconds while it is showing); while it shows the configured schema in place of the account-level list (`Current schema only: DB.SCHEMA (reason)`), `r` asks that list again once a minute has passed since the last ask |
 | `?` | Show or close the keys panel |
 | `q` | Quit |
@@ -1164,8 +1164,10 @@ failing answer for about a minute), or, after a read fails, the error and which
 copy is still shown, for example `couldn't refresh: HTTP 500 Internal Server
 Error: ...; showing the copy read at 12:04:30` (or the job list's copy, when no
 read has succeeded yet).
-`Enter` on the "entire job" row or a sub-job row opens the details for that
-scope, on the Logs tab; the line above the table names the tab.
+A click on the highlighted row (the "entire job" row or a sub-job row), or
+`Enter`, opens the details for that scope, its telemetry dashboard, on the
+Logs tab, as the line above the table says (`Click a job to open its
+telemetry dashboard`); a click on another row highlights it first.
 `l` and `g` open the Logs and Resources tabs
 directly, and do the same in the details.
 
@@ -1182,7 +1184,7 @@ for the next tab.
 - **Logs** is the live and historical log view described below. Each line is
   tagged with the sub-job being tailed, for example `training:0 │ …`, and its
   wrapped rows line up under its text. Saved logs (`s`) and whole-log copies
-  (`c` with nothing highlighted) stay untagged and uncoloured. In the pane,
+  (a copy with nothing highlighted) stay untagged and uncoloured. In the pane,
   the tag has its sub-job type's colour (training cyan, sampling violet,
   log_prob amber), as has the dot before each sub-job in the list beside it
   and its name in the Resources header; the time is muted; the level is
@@ -1212,8 +1214,8 @@ for the next tab.
     `↑` `↓` (or a click) shows that entry at once: a view's entry switches to
     that view and its mean (`ALL`), and a GPU's or node's entry redraws every
     stat and chart for it alone. `↓` on `GPU Resources` goes to its `ALL` (`↑`
-    from `ALL` reaches `System Resources`). `a` goes back to `ALL`; `<` and
-    `>` keep the view and go back to `ALL`; `w` keeps the GPU or node.
+    from `ALL` reaches `System Resources`). `<` and `>` keep the view and go
+    back to `ALL`; `w` keeps the GPU or node.
     `PgUp`, `PgDn`, `Home` and `End` scroll the stats and charts, also while
     the panel has the focus; so does the mouse wheel over them.
   - The header names the job's GPU type (`hardware`) and compares the GPUs the
@@ -1277,8 +1279,9 @@ for the next tab.
     **memory used %** (`mem_used / mem_total`, at most 100%). The others follow
     in the order the file first has them, such as `GPU memory used (GiB)`,
     `GPU memory free (GiB)`, `power (W)`, `GPU temp (°C)`, `tensor active %`
-    and `DRAM active %`, or `CPU count`, `memory used (GiB)` and `memory total
-    (GiB)`. A name comes from its field: the unit suffix (`_pct`, `_bytes`,
+    and `DRAM active %`, or `memory used (GiB)`. A node's `cpu_count` and
+    `mem_total_bytes` stay the same through a job, so the header names them
+    (above) and they get no chart or stats row. A name comes from its field: the unit suffix (`_pct`, `_bytes`,
     `_watts`, `_c`) becomes `%`, `GiB`, `W` or `°C`, and `gpu`, `cpu`, `sm`
     and `dram` are capitalized.
   - The stats block has a row per metric, in that order: the min, average,
@@ -1336,14 +1339,12 @@ for the next tab.
     30 minutes, 1 hour, 6 hours, and the whole job.
   - The key help stays at the bottom of the tab, with only the keys that do
     something there: `w window 10m · 30m · 1h · 6h · all   r refresh   space
-    sub-job   ↑↓ GPU   a all` (`space` with two or more sub-jobs, `↑↓` with
-    more than one GPU or node, `a` while one is shown). On a line too narrow
-    for all of it, `w window` leaves out the windows' names, then whole
-    entries are left out from the end and the line ends in `…`. The footer
-    shows `space Sub-job` after `w Window`, and `a`
-    (`All GPUs`, `All nodes`) only while one GPU or node is shown; on a
-    terminal too narrow for every key, the footer leaves out the keys that
-    don't fit whole, from the right (`?` lists every key).
+    sub-job   ↑↓ GPU` (`space` with two or more sub-jobs, `↑↓` with more than
+    one GPU or node). On a line too narrow for all of it, `w window` leaves
+    out the windows' names, then whole entries are left out from the end and
+    the line ends in `…`. The footer shows `space Sub-job` after `w Window`;
+    on a terminal too narrow for every key, the footer leaves out the keys
+    that don't fit whole, from the right (`?` lists every key).
   - Telemetry downloads when the tab is first shown; `r` refreshes it, and a
     live job's telemetry refreshes every 30 seconds while the tab is showing,
     once the selected sub-job runs. Before that (the job or the sub-job is
@@ -1580,7 +1581,7 @@ job, pick a list entry or run a footer key), and a footer key runs when it is
 clicked, not as it is pressed. Changing what a view shows (another tab,
 sub-job, GPU, node or window) drops its highlight.
 
-`c`, `ctrl+c` and a right-click all copy the same way: what is highlighted
+`ctrl+c` and a right-click copy the same way: what is highlighted
 (again, without clearing it), else everything the view holds, including what
 is scrolled out of view: on Logs the whole log (its newest lines up to 1 MiB);
 on Resources the panel (each GPU's or node's value), the header, every stats
@@ -1597,7 +1598,7 @@ clipboard could take it, the note says so, with a tip, for eight. To select
 with the terminal itself instead, hold a key while dragging: Option in iTerm2,
 Fn in macOS Terminal, Option in VS Code's terminal once
 `terminal.integrated.macOptionClickForcesSelection` is on. With the keys
-panel open, `c` copies its list of keys too.
+panel open, a copy takes its list of keys too.
 
 Keys in the job details view:
 
@@ -1609,12 +1610,11 @@ Keys in the job details view:
 | `w` | Cycle the window (Resources) |
 | `Space` | Next sub-job, round to the first after the last, when the job has two or more; the view stays, back to `ALL`. `<` / `>` go back / forward (Resources) |
 | `↑` `↓` | Pick GPU Resources or System Resources, `ALL` or one GPU or node in the panel; the charts follow the highlight (Resources) |
-| `a` | Back to `ALL`, the mean across the view's GPUs or nodes, while one is shown (Resources) |
 | `/` | Filter the current source (Logs) |
 | `l` | Cycle minimum log level (INFO / WARNING / ERROR) (Logs; `L` works too); elsewhere the Logs tab |
 | `p` | Pause / resume auto-scroll; scroll back freely while paused. Resumes a tail paused for no input (Logs) |
 | `s` | Save the current source to `~/cortex-training-<job8>-<type>-<index>.log` (Logs) |
-| `c` / `ctrl+c` / right-click | Copy what is highlighted, else everything the tab holds: the log (its newest lines, up to 1 MiB) on Logs; the panel, header, stats and every chart on Resources (any tab) |
+| `ctrl+c` / right-click | Copy what is highlighted, else everything the tab holds: the log (its newest lines, up to 1 MiB) on Logs; the panel, header, stats and every chart on Resources (any tab) |
 | `[` / `]` | Narrow / widen the sources panel, which is otherwise sized to its labels; the log keeps at least 40 columns (Logs) |
 | `PgUp` `PgDn` `Home` `End` | Scroll the log, also while the sources panel has the focus (Logs); scroll the stats and charts, also while the panel has the focus (Resources) |
 | `r` | Refresh the visible tab (on Logs, the sub-job list and its tail) |

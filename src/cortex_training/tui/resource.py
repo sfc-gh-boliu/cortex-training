@@ -22,7 +22,9 @@ at one scrape. Each kind is read into its own series of units: its GPUs
 Metrics are discovered, not listed. Every numeric field of a row is one, except
 the fields that identify or count rows: names ending in ``_index``, ``_num``,
 ``_version`` or ``_interval_s``, and ``seq``. A field that is null in every row
-has nothing to chart. Each kind also derives its memory used %: a GPU's
+has nothing to chart. A node's ``cpu_count`` and ``mem_total_bytes`` stay the
+same through a job, so the System view names them in its header and charts
+neither. Each kind also derives its memory used %: a GPU's
 ``fb_used / (fb_used + fb_free)``, a node's ``mem_used / mem_total``.
 :class:`KindResource` is one kind of one sub-job: its metrics in the order they
 are shown, its units, and a :class:`KindView` per window for each unit and for
@@ -210,7 +212,8 @@ class Unit:
     # False once it has dropped out of the newest capture: shown dimmed and marked stale.
     reporting: bool
     latest_sample_ts: datetime
-    # Each metric's value in its newest row (None: unmeasured), keyed by Metric.key.
+    # Each metric's value in its newest row (None: unmeasured), keyed by Metric.key; a node's
+    # cpu_count and mem_total_bytes too, for the header.
     latest: Mapping[str, float | None] = field(default_factory=dict, hash=False)
 
 
@@ -245,8 +248,9 @@ class KindResource:
 
     ``metrics`` are in the order they are shown: the kind's utilization and its
     derived memory used % first, then every other metric in the order its field
-    first appears in the file. ``latest`` holds each metric's average across the
-    units in the newest capture. :meth:`view` gives the charts and stats of a
+    first appears in the file, but for a node's ``cpu_count`` and
+    ``mem_total_bytes``, which only the header names. ``latest`` holds each
+    field's average across the units in the newest capture, those two included. :meth:`view` gives the charts and stats of a
     window for one unit or for the mean across units.
     """
 
@@ -570,12 +574,15 @@ class _Kind:
     other_is_free: bool
     bridge: bool  # carry a unit across one missed scrape (see _BRIDGE_INTERVALS)
     value_note: bool  # derive how often the headline values change
+    # Fields that stay the same through a job: the header names them (node_allocation_text),
+    # and they get no chart or stats row.
+    constant: tuple[str, ...] = ()
 
 
 _GPU_KIND = _Kind(GPU, 2, "global_gpu_index", "GPU", 0, "gpu_util_pct", "fb_used_pct",
                   "fb_used_bytes", "fb_free_bytes", True, False, True)
 _SYSTEM_KIND = _Kind(SYSTEM, 3, "worker_num", "node", 1, "cpu_util_pct", "mem_used_pct",
-                     "mem_used_bytes", "mem_total_bytes", False, True, False)
+                     "mem_used_bytes", "mem_total_bytes", False, True, False, ("cpu_count", "mem_total_bytes"))
 _KIND_SPECS = {GPU: _GPU_KIND, SYSTEM: _SYSTEM_KIND}
 
 
@@ -1193,7 +1200,8 @@ class _Series:
                 self.bin_width *= 2
 
     def charted(self) -> list[int]:
-        """The slots that have a value somewhere, in the order shown (see KindResource.metrics)."""
+        """The slots that have a value somewhere, in the order shown (see KindResource.metrics,
+        which leaves out the kind's constant fields)."""
         spec = self.spec
         seen = [slot for slot, column in enumerate(self.fields)
                 if column.seen or any(unit.cols[slot] is not None for unit in self.units.values())]
@@ -1837,6 +1845,8 @@ def _snapshot(series: _Series, partial: bool) -> KindResource:
     metrics = []
     for slot in slots:
         column = series.fields[slot]
+        if column.key in spec.constant:
+            continue
         if column.unit == "%":
             scale = 100.0
         else:

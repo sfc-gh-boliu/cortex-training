@@ -204,18 +204,6 @@ def _fit_text(text: Text, width: int) -> Text:
     return Text(cut[:-1].rstrip(" ·") + "…", style=text.style)
 
 
-def _update_if_changed(static: Static, content: Content) -> None:
-    """``static.update(content)`` unless it shows exactly that already.
-
-    Textual keeps a widget's old height when an update that changes it comes
-    while an earlier update's layout is still pending (two answers arriving at
-    once), so an update that changes nothing must not leave one pending.
-    """
-    shown = static.content
-    if not (isinstance(shown, Content) and shown.plain == content.plain and shown.spans == content.spans):
-        static.update(content)
-
-
 class PromptScreen(FollowsPointer, ModalScreen):
     """One-line text prompt; dismisses with the entered text, or ``None`` on Esc."""
 
@@ -251,7 +239,7 @@ class PromptScreen(FollowsPointer, ModalScreen):
 
     def action_copy_text(self) -> None:
         """ctrl+c or a right-click: what the mouse highlighted, else the text selected in
-        the box, else what the prompt shows (as c does on every other screen)."""
+        the box, else what the prompt shows (as a copy does on every other screen)."""
         if self.app.copy_highlight(self):
             return
         box = self.query_one(Input)
@@ -284,8 +272,6 @@ class JobSummaryScreen(FollowsPointer, Screen):
         Binding("escape", "close_or_back", "Back", show=False),
         ("q", "app.quit", "Quit"),
         KEYS_BINDING,
-        # What the mouse highlighted, else the whole preview (ctrl+c and a right-click too).
-        ("c", "copy_text", "Copy"),
         ("l", "open('logs')", "Logs"),
         ("g", "open('resource')", "Resources"),
         ("n", "rename", "Name job"),
@@ -326,9 +312,8 @@ class JobSummaryScreen(FollowsPointer, Screen):
             yield Static("", id="preview")
             yield Static("", id="fetch")  # reading, refreshing, or why the copy shown is older
             yield Static("", id="health")
-            yield Static("", id="subjobs-title")  # names the tab Enter opens
+            yield Static("", id="subjobs-title")  # says what a click on a row opens
             yield PickableTable(id="subjobs", cursor_type="row", zebra_stripes=True)  # a drag picks rows to copy
-            yield Static("", id="glance")
         yield Footer()
 
     _REFRESH_SECONDS = 60
@@ -401,14 +386,13 @@ class JobSummaryScreen(FollowsPointer, Screen):
     # app's CSS for #summary-body, #health, #subjobs-title).
     _CHROME_ROWS = 2 + 2 + 2
 
-    def _rows_besides(self, fields: list, health: Content, title: Content, table_rows: int, glance: Content) -> int:
+    def _rows_besides(self, fields: list, health: Content, title: Content, table_rows: int) -> int:
         """The screen rows everything but the comment takes (``table_rows``: the
         sub-job table's, its header and any sideways scrollbar included)."""
         width = self._value_width() + self._LABEL_WIDTH
         fetch = self.query_one("#fetch", Static)
         lines = [*fields, health, title, *([fetch.render()] if fetch.display else [])]
-        return (self._CHROME_ROWS + sum(_rows_of(line, width) for line in lines) + table_rows
-                + _rows_of(glance, width - 2))  # the glance's padding
+        return self._CHROME_ROWS + sum(_rows_of(line, width) for line in lines) + table_rows
 
     def _comment_rows(self, rows: list, besides: int) -> tuple:
         """``(rows to show, rows left out, too long)`` for the comment: all of it
@@ -503,17 +487,15 @@ class JobSummaryScreen(FollowsPointer, Screen):
             wider = sum(w + 2 * table.cell_padding for w in _column_widths(labels, fitted)) > table_width
         long = long or cut
         self._show_table(table, labels, fitted, wider)
-        # The keys for a table that is cut to fit, or wider than the screen (short, as in
-        # the key line at the bottom, to keep to one row on an 80-column screen).
-        hints = ["Enter opens Logs for the highlighted row"]
+        # What a click on a row opens, then the keys for a table that is cut to fit, or wider
+        # than the screen (short, to keep to one row on an 80-column screen).
+        hints = ["Click a job to open its telemetry dashboard"]
         if cut:
             hints.append("e fit to screen" if self._expanded else "e whole table")
         if wider:
             hints.append("← → scroll")
         title = self._subjobs_title(hints, width)
         self.query_one("#subjobs-title", Static).update(title)
-        glance = self._glance()
-        _update_if_changed(self.query_one("#glance", Static), glance)
         if comment is not None:
             # The whole comment when the screen has the rows for it, else its start and a note.
             at, lines = comment
@@ -522,7 +504,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
             if limit is not None and limit.is_cells:
                 table_rows = min(table_rows, int(limit.value))
             shown, more, too_long = self._comment_rows(
-                lines, self._rows_besides(rows, health, title, table_rows, glance))
+                lines, self._rows_besides(rows, health, title, table_rows))
             long = long or too_long
             note = self._MORE.format(what="comment") if more else ""
             rows.insert(at, Content.from_markup(f"  [dim]{'Comment':<12}[/dim] $value{note}",
@@ -672,9 +654,6 @@ class JobSummaryScreen(FollowsPointer, Screen):
         # A status this client doesn't know: the service's reason, if it sent one.
         return Content.from_markup("  " + why.lstrip(), reason=reason, details=details) if why else Content("")
 
-    def _glance(self) -> Content:
-        return Content.from_markup("\n[dim]l logs · g resources · n name this job · b back[/dim]")
-
     def _load(self) -> None:
         self._start_fetch()
 
@@ -774,7 +753,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
         return self._scope_by_row.get(key) or (self._job_id if key == "all" else None)
 
     def action_copy_text(self) -> None:
-        """``c`` (ctrl+c, a right-click): what the mouse highlighted, else the whole preview."""
+        """ctrl+c or a right-click: what the mouse highlighted, else the whole preview."""
         if not self.app.copy_highlight(self):
             self.app.copy_everything(self, "the preview")
 
@@ -820,7 +799,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
 
 # ─── job detail (tabs) ───────────────────────────────────────────────────────
 
-# c copies on every tab (what the mouse highlighted, else everything the tab holds): not here.
+# Copying (ctrl+c, a right-click) works on every tab, what the mouse highlighted or else everything the tab holds: not here.
 _LOG_ONLY = {"save_log", "cycle_level", "toggle_pause", "shrink_sources", "grow_sources", "filter"}
 # Pane ids match LogScreen's ("logs", "resource"), so its tab logic applies as-is.
 _TAB_IDS = ("logs", "resource")
@@ -1006,9 +985,6 @@ class JobDetailScreen(LogScreen):
         if action == "resource_sub_job":
             # < and >: on Resources, with another sub-job to switch to.
             return tab == "resource" and len(self._resource_sub_job_ids()) > 1
-        if action == "resource_all":
-            # a: on Resources, while one GPU or node is shown (the binding of the view shown).
-            return self._resource_shows_unit(parameters)
         return True
 
     def _line_prefixes(self) -> tuple[str, str]:

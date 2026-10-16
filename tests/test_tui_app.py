@@ -1197,7 +1197,7 @@ async def _run_wrap_and_select():
         # native text selection, and the screen can copy the selection.
         assert isinstance(s._logview, Log)
         assert s._logview.ALLOW_SELECT is True
-        assert hasattr(s, "action_copy_text")  # `c` → copy selection
+        assert hasattr(s, "action_copy_text")  # ctrl+c / a right-click → copy selection
 
         # Wrapping: a long line is split to the pane width on write. The pane
         # may prefix the line with its sub-job tag, which wraps with it.

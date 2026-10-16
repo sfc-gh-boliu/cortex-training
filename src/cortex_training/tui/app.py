@@ -1055,9 +1055,6 @@ class JobListScreen(FollowsPointer, Screen):
     BINDINGS = [
         ("q", "quit", "Quit"),
         KEYS_BINDING,
-        # c: what the mouse highlighted, else everything (see action_copy_text); ctrl+c
-        # and a right-click do the same.
-        ("c", "copy_text", "Copy"),
         # Priority: the app runs these as each key arrives, so the keys typed right
         # after /, Esc or Enter go where that key sends the focus, in the order
         # typed. A plain binding runs only once the key has passed through the
@@ -1480,7 +1477,7 @@ class JobListScreen(FollowsPointer, Screen):
         return None
 
     def action_copy_text(self) -> None:
-        """``c`` (ctrl+c, a right-click): what the mouse highlighted (text, or the rows a
+        """ctrl+c or a right-click: what the mouse highlighted (text, or the rows a
         drag picked), else everything the screen shows, the whole list with whole ids."""
         if not self.app.copy_highlight(self):
             self.app.copy_everything(self)
@@ -2477,9 +2474,6 @@ class LogScreen(FollowsPointer, Screen):
         Binding("L", "cycle_level", "Level", show=False),  # the key it had before
         ("p", "toggle_pause", "Pause"),
         ("s", "save_log", "Save"),
-        # On every tab: what the mouse highlighted, else everything (see action_copy_text);
-        # ctrl+c and a right-click do the same.
-        ("c", "copy_text", "Copy"),
         ("r", "refresh_sources", "Refresh"),
         Binding("[", "shrink_sources", "Narrower", show=False),
         Binding("]", "grow_sources", "Wider", show=False),
@@ -2494,9 +2488,6 @@ class LogScreen(FollowsPointer, Screen):
         Binding("greater_than_sign", "resource_sub_job(1)", "Next sub-job", key_display=">", show=False),
         Binding("comma", "resource_sub_job(-1)", "Prev sub-job", show=False),
         Binding("full_stop", "resource_sub_job(1)", "Next sub-job", show=False),
-        # Resources: back from one GPU's or node's charts to the mean across them (shown while one is).
-        Binding("a", "resource_all('gpu')", "All GPUs"),
-        Binding("a", "resource_all('system')", "All nodes"),
     ]
 
     # The sources panel is sized to its labels ("training #0"), at least
@@ -3045,20 +3036,6 @@ class LogScreen(FollowsPointer, Screen):
             # Not downloaded yet (a cold cache downloads the shown sub-job first): fetch it now.
             self._start_resource_refresh(force=True)
 
-    def action_resource_all(self, kind: str = "") -> None:
-        """a: the charts and stats show the mean across the view's GPUs or nodes again."""
-        if not self._resource_active() or self._resource_unit is None:
-            return
-        self._resource_unit = None
-        self._resource_on_view = False
-        self.refresh_bindings()
-        self._render_resource()
-
-    def _resource_shows_unit(self, parameters: tuple) -> bool:
-        """Whether ``a`` applies: on Resources, while one GPU or node of the view named in ``parameters`` is."""
-        return (self._resource_active() and self._resource_unit is not None
-                and tuple(parameters[:1]) == (self._resource_kind,))
-
     def _follow_resource_source(self, source: str | None) -> None:
         """Set the view and the unit for the sub-job shown.
 
@@ -3070,9 +3047,7 @@ class LogScreen(FollowsPointer, Screen):
             self._resource_shown = source
             self._resource_kind = self._resource_kind_pref
             self._resource_settled = None
-            if self._resource_unit is not None:
-                self._resource_unit = None
-                self.refresh_bindings()
+            self._resource_unit = None
         kinds = self._resource_data.kinds.get(source or "")
         if kinds and self._resource_settled != source:
             self._resource_settled = source
@@ -3105,7 +3080,6 @@ class LogScreen(FollowsPointer, Screen):
             self._resource_unit = which
         else:
             return
-        self.refresh_bindings()  # a shows while one unit is
         self._render_resource()
 
     def _resource_down_from(self, index: int | None) -> int | None:
@@ -3436,10 +3410,10 @@ class LogScreen(FollowsPointer, Screen):
     def _resource_keys(self, width: int = 0) -> str:
         """The key help, fitted to ``width`` (any length when 0), with only the keys that do something.
 
-        ``< >`` shows with two or more sub-jobs, ``↑↓`` with more than one GPU or
-        node in the view, ``a`` while one of them is picked. Too wide, the window
-        key goes to its narrow form (``w window``); then whole entries are left
-        out from the end, and the line ends in ``…``.
+        ``space`` shows with two or more sub-jobs, ``↑↓`` with more than one GPU or
+        node in the view. Too wide, the window key goes to its narrow form
+        (``w window``); then whole entries are left out from the end, and the line
+        ends in ``…``.
         """
         extra = []
         if len(self._resource_sub_job_ids()) > 1:
@@ -3447,8 +3421,6 @@ class LogScreen(FollowsPointer, Screen):
         resource = self._resource_kind_data()
         if resource is not None and len(resource.units) > 1:
             extra.append("↑↓ GPU" if self._resource_kind == GPU else "↑↓ node")
-        if self._resource_unit is not None:
-            extra.append("a all")
         full = [entry for entry, _narrow in self._RESOURCE_KEY_HELP] + extra
         narrow = [entry for _full, entry in self._RESOURCE_KEY_HELP] + extra
         gap = "   "
@@ -3559,7 +3531,6 @@ class LogScreen(FollowsPointer, Screen):
             self.clear_selection()
         if self._resource_unit is not None and (resource is None or self._resource_unit not in resource.unit_ids):
             self._resource_unit = None  # not one of this view's units (any more)
-            self.refresh_bindings()
         self._sync_resource_list(source, now)
         if not source and self._no_sources:
             # Nothing to load or lay out: say why at once (the pane may not have a width yet).
@@ -3617,8 +3588,6 @@ class LogScreen(FollowsPointer, Screen):
         if action == "resource_sub_job":
             # Only where it does something: on Resources, with another sub-job to switch to.
             return self._resource_active() and len(self._resource_sub_job_ids()) > 1
-        if action == "resource_all":
-            return self._resource_shows_unit(parameters)  # the binding of the view shown, while one unit is
         if action == "cycle_window":
             return self._resource_active()
         return True
@@ -3733,7 +3702,7 @@ class LogScreen(FollowsPointer, Screen):
         self._render_log_status()
 
     # ─── export / copy ───────────────────────────────────────────────────
-    # The most ``c`` copies of a log. OSC 52 carries the text
+    # The most a copy of the whole log (ctrl+c or a right-click, nothing highlighted) takes. OSC 52 carries the text
     # base64-encoded in one escape sequence; many terminals drop a much bigger
     # one without a word, and writing it holds the screen up meanwhile.
     _COPY_MAX_BYTES = 1024 * 1024
@@ -3851,7 +3820,7 @@ class LogScreen(FollowsPointer, Screen):
         self._post(self.app.copy_out, "\n".join(kept), what)
 
     def action_copy_text(self) -> None:
-        """``c`` (ctrl+c, a right-click), on every tab: what the mouse highlighted, else
+        """ctrl+c or a right-click, on every tab: what the mouse highlighted, else
         everything the tab holds: the log (its newest lines, up to the cap) on Logs; on
         Resources the panel, the header, every stats row and every chart."""
         if self.app.copy_highlight(self):
@@ -5578,7 +5547,6 @@ class CortexTrainingLogTUI(App):
     #health { height: auto; margin: 1 0; }
     #subjobs-title { height: auto; margin-top: 1; }
     #subjobs { height: auto; max-height: 12; margin: 0 1; }
-    #glance { height: auto; padding: 0 1; }
     PromptScreen { align: center middle; }
     #prompt { width: 80; height: auto; border: thick $accent; background: $surface; padding: 1 2; }
     #prompt-hint { color: $text-muted; }
@@ -5599,9 +5567,6 @@ class CortexTrainingLogTUI(App):
     # aside while a text box has focus (check_action), so q still types there.
     BINDINGS = [
         Binding("q", "quit", "Quit", priority=True),
-        # c copies on every screen: each of the TUI's own copies what the mouse highlighted,
-        # else everything it shows (ctrl+c, Textual's key for it, and a right-click do the same).
-        Binding("c", "screen.copy_text", "Copy", show=False),
     ]
     # How the client connects, set by `cortex-training tui` (never a secret), so
     # the commands the TUI shows to copy connect the same way; None when unknown
@@ -5823,7 +5788,7 @@ class CortexTrainingLogTUI(App):
             await super().on_event(event)
             return
         if event.button == 3 and isinstance(event, (events.MouseDown, events.MouseUp)):
-            # A right-click copies, as c does. Textual would take it for a click:
+            # A right-click copies, as ctrl+c does. Textual would take it for a click:
             # one clears the highlight, and moves a table's cursor or picks an item.
             if isinstance(event, events.MouseUp):
                 await self.run_action("screen.copy_text")
@@ -5873,8 +5838,8 @@ class CortexTrainingLogTUI(App):
     def _footer_click(self, event: events.MouseEvent) -> bool:
         """A footer key runs when it is clicked: pressed and released on it, the pointer
         all but still. Textual runs it on the press, so a drag that began on q Quit quit.
-        True for the press and the release there, which nothing else sees (a highlight
-        stays for c Copy)."""
+        True for the press and the release there, which nothing else sees (so a click on
+        the footer keeps a highlight)."""
         if isinstance(event, events.MouseDown):
             key = self._footer_key_at(event)
             self._footer_down = (key, event.button, event.screen_offset) if key is not None else None

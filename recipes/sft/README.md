@@ -126,9 +126,10 @@ shipped example or a copy with `job_config=JOB_CONFIG`.
           "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         },
 
-        // Optional expert parallelism for MoE. With model_provider prime_rl, keep
-        // the prime_rl block: the SFT loss needs per-token log-probabilities, which
-        // the fused cross-entropy does not return.
+        // Optional expert parallelism for MoE. With model_provider prime_rl,
+        // keep fused cross-entropy off (this block, or model_options with
+        // EP_SIZE > 1): the chunked LM head set below cannot be combined with
+        // it.
         "ac_config": {"mode": "full", "freq": 1},
         "prime_rl": {
           "fused_lm_head_token_chunk_size": 8192,
@@ -148,6 +149,29 @@ The target list above is for dense Qwen models. For
 `gate_proj`, `up_proj`, and `down_proj` do not select those parameters.
 The shipped Qwen3.6 configs use sequence parallel size 8 and logical batch 1
 to run at the model's 262K context limit.
+
+The `prime_rl` entries in the template above are deprecated but keep working.
+On server versions that support `model_options`, with `EP_SIZE` > 1, the same
+settings can be written inside `training_config` in place of the `prime_rl`
+block, as the entry below; see
+[the REST API reference](../../docs/reference/rest-api.md#model_options). The
+shipped Qwen3.6 SFT configs still use the block, which older servers need.
+
+```json
+"model_options": {"lm_head": {"token_chunk_size": 8192, "cross_entropy": false}}
+```
+
+On server versions that have `numerics.fp32_parity`, Qwen3.5-family models run
+with it on by default: dense models (for example `Qwen/Qwen3.8-27B`) and
+Qwen3.5-MoE models with `EP_SIZE` > 1 (the Qwen3.6-35B-A3B configs). It raises
+GPU memory. Memory was not measured for rows near `max_seq_len` with the
+shipped Qwen3.8-27B configs. If a job runs out of memory, raise `sp_size`
+(at most 8 for Qwen3.8-27B) or turn the option off by adding
+`"numerics": {"fp32_parity": false}` to the `model_options` entry of
+`training_config`, inside the same object if the config already has one (two
+`model_options` keys in one JSON object keep only the last). A server that
+has the option but not `model_options` support ignores that entry; see
+[the REST API reference](../../docs/reference/rest-api.md#model_options).
 
 For dense long-context profiles, set an integer
 `fused_lm_head_token_chunk_size` in `training_config`. The server then computes

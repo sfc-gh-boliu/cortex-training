@@ -37,6 +37,11 @@ Tuning knobs on the constructor: `endpoint`, `poll_interval` (0.5s),
 and read timeout, or a `(connect, read)` pair. `from_connection_name` and
 `from_pat` also accept `telemetry_timeout` (3s) for best-effort client metrics.
 
+By default a request answered "database or schema not found" makes the client
+run `CREATE DATABASE` (and `CREATE SCHEMA`) and retry. Set
+`client.auto_create_database = False` for a client that only reads: the error
+is then raised as it is. A client from `for_job` starts with it off.
+
 ## Client metrics
 
 Snowflake profile and PAT clients automatically emit one best-effort event
@@ -52,7 +57,7 @@ constructing the emitter.
 Tracked operations:
 
 - Job lifecycle: `create_job`, `wait_for_job`, `get_job`, `list_jobs`,
-  `iter_jobs` (one event per page), `cancel_job`, `get_capacity`,
+  `iter_jobs` (one event per page), `list_jobs_page`, `cancel_job`, `get_capacity`,
   `get_capacity_breakdown`, `get_experiment_run`
 - Compute: `forward_backward`, `forward`, `generate`, `generate_stream`, `step`
 - Checkpoints and logs: `save`, `load`, `list_checkpoints`,
@@ -126,7 +131,8 @@ operation.
 | `get_job(job_id)` | job dict | Includes `sub_jobs` with their configs |
 | `list_jobs(status=None)` | list of jobs | Returns the inner list, not the envelope |
 | `iter_jobs(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100)` | iterator of jobs | Jobs across the account that the caller can see, newest first, following page tokens; each also carries `database_name` and `schema_name`. The server applies every filter. Arguments are checked on the call: `page_size` is 1 to 1000, and `schema` needs `database` with it. A 404 means account-level listing is not enabled for the account. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2endpoint) |
-| `for_job(job)` | `CortexTrainingClient` | Bound to a job from `iter_jobs` for per-job calls. Borrows this client's session, auth, and telemetry, so keep this one open; closing the returned client is a no-op. Never creates the job's database |
+| `list_jobs_page(*, database=None, schema=None, status=None, submitted_by=None, created_after=None, created_before=None, page_size=100, page_token=None, max_retries=None, request_timeout=None)` | `{"jobs": [...], "next_page_token": str \| None}` | One page of what `iter_jobs` walks, with the same filters read the same way. Pass `next_page_token` back as `page_token`, with the same filters, for the next page; `None` means no more. A page can be short or empty and still have a token. `max_retries` (retries after the first attempt) and `request_timeout` (seconds, or `(connect, read)`) bound this page; omitted, the client's own apply. Raises `AccountJobListUnavailable` (`reason`: `not_deployed`, `disabled`, `forbidden`, `rest_disabled`) for 404, 403 and 405 without retrying, and `InvalidPageToken` for 400 `Invalid page_token` (start again from the first page); both subclass `requests.HTTPError`. Bad arguments, or a page body that is not a job list, raise `ValueError`. See [REST API section 5.3](rest-api.md#across-the-account---get-apiv2endpoint) |
+| `for_job(job)` | `CortexTrainingClient` | Bound to a job from `iter_jobs` or `list_jobs_page` for per-job calls. Borrows this client's session, auth, and telemetry, so keep this one open; closing the returned client is a no-op. Never creates the job's database |
 | `wait_for_job(job_id)` | job dict | Polls until `running`; raises once the job has ended (`failed`, `cancelled`, `terminated`) or on timeout |
 | `cancel_job(job_id)` | `None` | Idempotent while cancelling/cancelled |
 | `get_capacity(hardware=None)` | capacity dict | `has_reservation`, `max_total_gpus`, `reserved_gpus`, `in_use_gpus`, `pending_gpus`, `available_gpus`, scoped to `hardware` (omitted means the server default, H200). The CLI `capacity` command queries every type unless `--hardware` is set. `max_total_gpus` is the canonical ceiling (`-1` uncapped); `reserved_gpus` is deprecated |
@@ -280,15 +286,19 @@ with `follow=False` stops at the first empty page. On a job that has ended,
 sub_job_ids=None, progress=None, transfer_timeout_seconds=300)` saves every
 execution log file as `<output_dir>/<sub_job_id>/<filename>` (mode `0600`)
 without holding it in memory; with `resume=True` it skips files unchanged since
-the last download. `fetch_execution_logs(job_id)` returns the same files as
-`{sub_job_id, filename, artifact_uri, content}` dicts, in memory. See
+the last download. `fetch_execution_logs(job_id, *, sub_job_id=None,
+filename=None)` returns the same files as
+`{sub_job_id, filename, artifact_uri, content}` dicts, in memory, or only
+those of one sub-job or with one name (the rest are listed but not fetched).
+See
 [REST API section 12.2](rest-api.md#122-full-execution-log-download).
 `download_stdout_logs(job_id, output_dir, *, resume=False, max_workers=None,
 progress=None, on_chunk=None, sub_job_ids=None, strict=False,
 stale_after_seconds=600, transfer_timeout_seconds=300)`
 reconstructs persisted console chunks as
 `<output_dir>/<sub_job_id>/stdout.log`.
-`download_metrics(...)`, with the same options, reconstructs GPU metric chunks
+`download_metrics(...)`, with the same options plus `priority=()` and
+`on_commit=None`, reconstructs GPU metric chunks
 as `<output_dir>/<sub_job_id>/gpu.jsonl`. Chunks are fetched `max_workers` at a
 time (default 16) on one Snowflake session and written in order. `resume=True`
 appends chunks that are not already recorded in the manifest beside that file
@@ -298,9 +308,12 @@ are logged as warnings on the `cortex_training` logger. `progress` receives stat
 newline, then `"\n"` when that sub-job finishes or fails; a status that needs no
 updating arrives as one message ending in a newline.
 `on_chunk(sub_job_id, done, total, bytes)` reports counts instead, with
-`done == total` only after that sub-job's file is committed. Both run on the
-calling thread; an error raised by either stops the download and keeps the
-chunks already written. Raise `cortex_training.DownloadCancelled` to stop
+`done == total` only after that sub-job's file is committed. For metrics,
+`on_commit(entry)` then gets a copy of that sub-job's result entry, so a reader
+can open one file while the others download, and sub-jobs named in `priority`
+are downloaded first, in that order (the returned list stays in id order).
+These callbacks run on the calling thread; an error raised by any of them stops
+the download and keeps the chunks already written. Raise `cortex_training.DownloadCancelled` to stop
 without the call counting as a failure. `sub_job_ids` limits the download; an
 entry with no chunks raises `cortex_training.NoChunksError`, a `ValueError`. A
 damaged chunk is fetched once more and then skipped and listed in the entry's
@@ -345,7 +358,9 @@ before building the typed object; see
 
 `ChunkGroupError` and its subclasses `ChunkGroupRestartError` and
 `ChunkGroupConflictError` (all subclasses of `requests.exceptions.HTTPError`)
-carry a `.detail` dict for chunk-group failures. Polling raises `RuntimeError`
+carry a `.detail` dict for chunk-group failures. `AccountJobListUnavailable` (with a
+`.reason`) and `InvalidPageToken`, also `HTTPError` subclasses, come from
+`list_jobs_page`. Polling raises `RuntimeError`
 on a failed/cancelled request and `TimeoutError` at the deadline.
 
 ## Details not covered here

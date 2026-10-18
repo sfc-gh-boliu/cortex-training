@@ -85,7 +85,10 @@ from tenacity import stop_after_attempt
 from tenacity import wait_exponential_jitter
 from urllib3.exceptions import NewConnectionError
 
+from cortex_training import _account_jobs
 from cortex_training import _artifact_download
+from cortex_training._account_jobs import AccountJobListUnavailable  # noqa: F401 - exported
+from cortex_training._account_jobs import InvalidPageToken  # noqa: F401 - exported
 from cortex_training._artifact_download import DownloadCancelled
 from cortex_training._artifact_download import NoChunksError
 from cortex_training import wire
@@ -763,6 +766,33 @@ def _is_account_list_transient(exc: BaseException) -> bool:
         if exc.response is not None and exc.response.status_code == 404:
             return False
     return _is_transient(exc)
+
+
+# ─── Account-level job list: one page at a time ──────────────────────────
+
+
+def _account_list_error(
+    exc: requests.exceptions.HTTPError, *, page_token_sent: bool
+) -> requests.exceptions.HTTPError | None:
+    """The typed error for an account-list page failure, or None to raise ``exc`` as is."""
+    response = exc.response
+    if response is None:
+        return None
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    messages = [
+        candidate["message"]
+        for candidate in _iter_error_dicts(body)
+        if isinstance(candidate.get("message"), str)
+    ]
+    error = _account_jobs.page_error(
+        response, exc.request, messages=messages, page_token_sent=page_token_sent
+    )
+    if error is not None:
+        _add_snowflake_request_id_to_error(error, _response_snowflake_request_id(response))
+    return error
 
 
 def _is_connect_error(exc: BaseException) -> bool:
@@ -1839,6 +1869,19 @@ class CortexTrainingClient:
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
 
+    @property
+    def auto_create_database(self) -> bool:
+        """Whether a request answered "database or schema not found" creates them and retries.
+
+        True by default. Set it to False for a client that only reads: the error
+        is then raised as it is. A client from :meth:`for_job` starts with it off.
+        """
+        return self._auto_create_database
+
+    @auto_create_database.setter
+    def auto_create_database(self, value: bool) -> None:
+        self._auto_create_database = bool(value)
+
     @classmethod
     def from_pat(
         cls,
@@ -2586,11 +2629,92 @@ class CortexTrainingClient:
         A 404 means account-level listing is not enabled for this account, and
         is raised at once rather than retried.
         """
+        params = self._account_jobs_params(
+            "iter_jobs",
+            database=database,
+            schema=schema,
+            status=status,
+            submitted_by=submitted_by,
+            created_after=created_after,
+            created_before=created_before,
+            page_size=page_size,
+        )
+        return self._iter_account_jobs(params)
+
+    def list_jobs_page(
+        self,
+        *,
+        database: str | None = None,
+        schema: str | None = None,
+        status: str | list[str] | None = None,
+        submitted_by: str | None = None,
+        created_after: date | datetime | str | None = None,
+        created_before: date | datetime | str | None = None,
+        page_size: int = 100,
+        page_token: str | None = None,
+        max_retries: int | None = None,
+        request_timeout: float | tuple[float, float] | None = None,
+    ) -> dict:
+        """Read one page of the jobs the caller can see across the account.
+
+        Returns ``{"jobs": [...], "next_page_token": str | None}``. Jobs come
+        newest first and carry ``database_name`` and ``schema_name``; use
+        :meth:`for_job` for per-job calls on one. For the next page, pass
+        ``next_page_token`` back as ``page_token`` with the same filters
+        (``page_size`` may change), so compute a moving bound such as
+        ``created_after`` once per walk; ``None`` means there is no next page.
+        A page can hold fewer than ``page_size`` jobs, or none, and still carry
+        a token. The filters are those of :meth:`iter_jobs`, read the same way,
+        and are checked before any request.
+
+        ``max_retries`` (retries after the first attempt) and
+        ``request_timeout`` (seconds, or a ``(connect, read)`` pair) bound this
+        page; ``None`` keeps the client's own.
+
+        Raises :class:`AccountJobListUnavailable` for 403, 404 and 405, without
+        a retry; :class:`InvalidPageToken` for 400 ``Invalid page_token``;
+        ``requests.HTTPError`` for any other failed answer; and ``ValueError``
+        for bad arguments or a page body that is not a job list.
+        """
+        params = self._account_jobs_params(
+            "list_jobs_page",
+            database=database,
+            schema=schema,
+            status=status,
+            submitted_by=submitted_by,
+            created_after=created_after,
+            created_before=created_before,
+            page_size=page_size,
+        )
+        if page_token:
+            params["page_token"] = page_token
+        bounds: dict[str, Any] = {}
+        if max_retries is not None:
+            if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
+                raise ValueError(f"max_retries must be an int >= 0, got {max_retries!r}")
+            bounds["max_retries"] = max_retries
+        if request_timeout is not None:
+            bounds["timeout"] = _validated_request_timeout(request_timeout)
+        return self._list_jobs_page(params, bounds)
+
+    @staticmethod
+    def _account_jobs_params(
+        caller: str,
+        *,
+        database: str | None,
+        schema: str | None,
+        status: str | list[str] | None,
+        submitted_by: str | None,
+        created_after: date | datetime | str | None,
+        created_before: date | datetime | str | None,
+        page_size: int,
+    ) -> dict:
+        """The account-level list's query parameters, checked before any request."""
         if not 1 <= page_size <= 1000:
             raise ValueError(f"page_size must be between 1 and 1000, got {page_size}")
         if schema is not None and database is None:
             raise ValueError(
-                "iter_jobs(schema=...) needs database=... with it: a schema name "
+                f"{caller}(schema=...) needs database=... with it: a schema name "
                 "alone does not name one schema."
             )
         if status is not None and not isinstance(status, str):
@@ -2604,8 +2728,28 @@ class CortexTrainingClient:
             "created_before": _created_param(created_before),
             "limit": page_size,
         }
-        params = {key: value for key, value in query.items() if value is not None}
-        return self._iter_account_jobs(params)
+        return {key: value for key, value in query.items() if value is not None}
+
+    @_track_operation("list_jobs_page")
+    def _list_jobs_page(self, params: dict, bounds: dict[str, Any]) -> dict:
+        try:
+            resp = self._send(
+                "GET",
+                f"{self.base_url}/api/v2/{self.endpoint}",
+                params=params,
+                retry_on=_is_account_list_transient,
+                # The path names no database, so a not-found error here is not
+                # about the configured one.
+                ensure_database=False,
+                **bounds,
+            )
+        except requests.exceptions.HTTPError as exc:
+            error = _account_list_error(exc, page_token_sent="page_token" in params)
+            if error is None:
+                raise
+            raise error from exc
+        with _server_payload():
+            return _account_jobs.parse_page(resp.json())
 
     def _iter_account_jobs(self, params: dict) -> Iterator[dict]:
         while True:
@@ -2642,7 +2786,7 @@ class CortexTrainingClient:
 
     def for_job(self, job: dict) -> "CortexTrainingClient":
         """Return a client bound to ``job``'s schema, for per-job calls on a
-        row from :meth:`iter_jobs`.
+        row from :meth:`iter_jobs` or :meth:`list_jobs_page`.
 
         The new client borrows this client's session, auth and telemetry, so
         keep this one open and close it rather than the new one. It never
@@ -2942,7 +3086,13 @@ class CortexTrainingClient:
         return downloaded
 
     @_track_operation("fetch_execution_logs")
-    def fetch_execution_logs(self, job_id: str) -> list[dict[str, str]]:
+    def fetch_execution_logs(
+        self,
+        job_id: str,
+        *,
+        sub_job_id: str | None = None,
+        filename: str | None = None,
+    ) -> list[dict[str, str]]:
         """Download every log file under the job's experiment run stage.
 
         Returns a list of
@@ -2950,6 +3100,10 @@ class CortexTrainingClient:
         entries, one per object found under a ``_logs/<sub_job_id>/`` subtree
         in the run's stage. Filenames such as ``execution.jsonl`` and
         ``server.log`` are both included; bodies are decoded as UTF-8.
+
+        ``sub_job_id`` and ``filename``, when given, download only the files
+        of that sub-job and with that name (for example one sub-job's
+        ``execution.jsonl``); the rest are listed but not fetched.
 
         ``artifact_uri`` is the logical ``snow://`` URI. Files are retrieved
         through Snowflake's supported experiment artifact ``LIST``/``GET``
@@ -2981,16 +3135,18 @@ class CortexTrainingClient:
                         after_logs = relative_path.removeprefix("checkpoints/_logs/")
                     else:
                         continue
-                    sub_job_id, separator, filename = after_logs.partition("/")
+                    file_sub_job, separator, file_name = after_logs.partition("/")
                     if (
                         not separator
-                        or not filename
+                        or not file_name
                         or not (
-                            sub_job_id == job_id
-                            or sub_job_id.startswith(f"{job_id}:")
+                            file_sub_job == job_id
+                            or file_sub_job.startswith(f"{job_id}:")
                         )
-                        or sub_job_id in {".", ".."}
-                        or "\\" in sub_job_id
+                        or file_sub_job in {".", ".."}
+                        or "\\" in file_sub_job
+                        or (sub_job_id is not None and file_sub_job != sub_job_id)
+                        or (filename is not None and file_name != filename)
                     ):
                         continue
                     downloaded = self._download_experiment_artifact(
@@ -3009,8 +3165,8 @@ class CortexTrainingClient:
                         downloaded.unlink(missing_ok=True)
                     results.append(
                         {
-                            "sub_job_id": sub_job_id,
-                            "filename": filename,
+                            "sub_job_id": file_sub_job,
+                            "filename": file_name,
                             "artifact_uri": artifact_uri,
                             "content": content,
                         }
@@ -3548,6 +3704,7 @@ class CortexTrainingClient:
         on_chunk: Callable[[str, int, int, int], None] | None = None,
         strict: bool = False,
         warnings_by_sub_job: Mapping[str, list[str]] | None = None,
+        on_commit: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch every new chunk concurrently and append them in plan order.
 
@@ -3560,7 +3717,8 @@ class CortexTrainingClient:
         ``"\\n"`` once the manifest is written or the sub-job fails; a sub-job
         with nothing new gets one line ending in a newline instead.
         ``on_chunk`` gets ``(sub_job_id, done, total, bytes)`` counts, with
-        ``done == total`` only after the file is committed.
+        ``done == total`` only after the file is committed. ``on_commit`` then
+        gets a copy of that sub-job's result entry.
         """
         work = [path for plan in plans for path in plan.new_paths]
         window = max_workers * self._DOWNLOAD_WINDOW_PER_WORKER
@@ -3626,6 +3784,8 @@ class CortexTrainingClient:
                                     warnings=warnings,
                                 )
                             )
+                            if on_commit is not None:
+                                on_commit(dict(results[-1]))
                             continue
                         writer = _artifact_download.ChunkWriter(
                             plan.data_path,
@@ -3708,6 +3868,8 @@ class CortexTrainingClient:
                             warnings=warnings,
                         )
                     )
+                    if on_commit is not None:
+                        on_commit(dict(results[-1]))
                 # Inside the handler, so an interrupt here is still marked saved.
                 pool.shutdown(wait=True)
                 spool.remove_after([])
@@ -4055,6 +4217,8 @@ class CortexTrainingClient:
         strict: bool = False,
         stale_after_seconds: float | None = _DOWNLOAD_STALE_AFTER_SECONDS,
         transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
+        priority: Iterable[str] = (),
+        on_commit: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct staged gzip chunks into one file per sub-job.
 
@@ -4066,6 +4230,10 @@ class CortexTrainingClient:
         are a prefix of the sorted chunk list, and rebuilt otherwise. A chunk
         that will not decompress is downloaded once more and then skipped,
         unless ``strict``.
+
+        Sub-jobs are written in id order, those named in ``priority`` first
+        (in that order); the returned list stays in id order. ``on_commit``
+        gets a copy of each sub-job's result entry once its file is committed.
         """
         if max_workers is None:
             max_workers = self._DOWNLOAD_DEFAULT_WORKERS
@@ -4076,6 +4244,9 @@ class CortexTrainingClient:
         wanted = None if sub_job_ids is None else set(sub_job_ids)
         if wanted is not None and not wanted:
             raise ValueError("sub_job_ids must name at least one sub-job")
+        if isinstance(priority, (str, bytes)):
+            raise TypeError("priority must be an iterable of sub-job ids, not a single string")
+        first = {sub_job_id: rank for rank, sub_job_id in enumerate(dict.fromkeys(priority or ()))}
         if stale_after_seconds is not None and (
             isinstance(stale_after_seconds, bool)
             or not isinstance(stale_after_seconds, (int, float))
@@ -4168,6 +4339,9 @@ class CortexTrainingClient:
                 for sub_job_id in sorted(chunks_by_sub_job)
                 if wanted is None or sub_job_id in wanted
             ]
+            # Those named in priority first, in that order; the sort is stable,
+            # so the rest stay in id order.
+            plans.sort(key=lambda plan: first.get(plan.sub_job_id, len(first)))
             values["sub_job_count"] = len(plans)
             modes = {
                 "append"
@@ -4197,6 +4371,7 @@ class CortexTrainingClient:
                         on_chunk=on_chunk,
                         strict=strict,
                         warnings_by_sub_job=warnings_by_sub_job,
+                        on_commit=on_commit,
                     )
                 finally:
                     values["fetch_ms"] = round((time.monotonic() - started) * 1000, 3)
@@ -4317,13 +4492,20 @@ class CortexTrainingClient:
         strict: bool = False,
         stale_after_seconds: float | None = _DOWNLOAD_STALE_AFTER_SECONDS,
         transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
+        priority: Iterable[str] = (),
+        on_commit: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Reconstruct staged GPU metric chunks into one JSONL file per sub-job.
 
         Accepts the same ``resume``, ``max_workers``, ``progress``, ``on_chunk``,
         ``sub_job_ids``, ``strict``, ``stale_after_seconds``, and
         ``transfer_timeout_seconds`` options as
-        :meth:`download_stdout_logs`. While the job is running, a sub-job with
+        :meth:`download_stdout_logs`. Sub-jobs named in ``priority`` are
+        downloaded first, in that order, then the rest in id order; the
+        returned list is in id order either way. ``on_commit`` is called, on
+        the calling thread, with a copy of each sub-job's result entry once its
+        file is committed; an error it raises stops the download as one from
+        ``on_chunk`` does. While the job is running, a sub-job with
         saved stdout but no metrics gets a result entry with ``chunk_count`` 0,
         ``saved_path`` ``None``, and a warning. Two downloads
         of the same output directory at once are unsupported.
@@ -4343,6 +4525,8 @@ class CortexTrainingClient:
             strict=strict,
             stale_after_seconds=stale_after_seconds,
             transfer_timeout_seconds=transfer_timeout_seconds,
+            priority=priority,
+            on_commit=on_commit,
         )
 
     # ─── Data-plane async operations ─────────────────────────────────────

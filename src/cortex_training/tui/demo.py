@@ -51,7 +51,6 @@ import requests
 from cortex_training import AccountJobListUnavailable
 from cortex_training.tui import views
 from cortex_training.tui.format import format_log_entry
-from cortex_training.tui.stores import AliasStore
 
 _GIB = 1024**3
 _H200_FB = 141 * _GIB
@@ -97,77 +96,72 @@ def _kind(sj: dict) -> str:
     return views.sub_job_kind(sj) or str(sj.get("job_type") or "").lower()
 
 
-# (alias, status, reason, age, duration, hardware, sub-jobs, kind[, overrides]) — kind
+# (status, reason, age, duration, hardware, sub-jobs, kind[, overrides]) — kind
 # drives the training log; the overrides are those _NAME_SPECS and _STATE_SPECS describe.
 _SPECS = [
     # Its nodes report GPU rows only, as on a deployment that doesn't collect CPU and memory.
-    ("qwen3-8b lora · support-chat v4", "RUNNING", "", timedelta(hours=2, minutes=14), None, "H200",
+    ("RUNNING", "", timedelta(hours=2, minutes=14), None, "H200",
      [_training("Qwen/Qwen3-8B", 8, lr=1e-4, bs=16, seq=8192, lora=16)], "sft", {"system_metrics": False}),
-    ("gsm8k grpo · qwen3.6-35b", "RUNNING", "", timedelta(hours=5, minutes=40), None, "H200",
+    ("RUNNING", "", timedelta(hours=5, minutes=40), None, "H200",
      [_training("Qwen/Qwen3.6-35B-A3B", 8, lr=1e-6, bs=64, seq=4096), _sampling("Qwen/Qwen3.6-35B-A3B", 8)], "rl"),
-    ("", "PLACING", "", timedelta(minutes=3), None, "B300",
+    ("PLACING", "", timedelta(minutes=3), None, "B300",
      [_training("Qwen/Qwen3.8-27B", 16, lr=1e-5, bs=32, seq=16384), _sampling("Qwen/Qwen3.8-27B", 8, seq=16384)],
      None),
-    ("qwen3-8b full sft · identity", "FAILED", "sub_job_readiness", timedelta(days=1, hours=3), timedelta(minutes=31), "H200",
+    ("FAILED", "sub_job_readiness", timedelta(days=1, hours=3), timedelta(minutes=31), "H200",
      [_training("Qwen/Qwen3-8B", 4, lr=2e-5, bs=4, seq=32768)], "sft-fail"),
-    ("support-chat v3 (baseline)", "CANCELLED", "cancelled_by_client", timedelta(days=2, hours=6), timedelta(hours=3, minutes=12), "H200",
+    ("CANCELLED", "cancelled_by_client", timedelta(days=2, hours=6), timedelta(hours=3, minutes=12), "H200",
      [_training("Qwen/Qwen3-8B", 8, lr=1e-4, bs=16, seq=8192, lora=8)], "sft"),
-    ("byo weights smoke · qwen3-0.6b", "CANCELLED", "cancelled_by_client", timedelta(days=4), timedelta(minutes=20), "H200",
+    ("CANCELLED", "cancelled_by_client", timedelta(days=4), timedelta(minutes=20), "H200",
      [_training("Qwen/Qwen3-0.6B", 1, lr=1e-5, bs=1, seq=128), _sampling("Qwen/Qwen3-0.6B", 1, seq=128, mem=0.8)], "sft"),
-    ("", "TERMINATED", "idle_timeout", timedelta(days=9), timedelta(hours=1, minutes=2), "H200",
+    ("TERMINATED", "idle_timeout", timedelta(days=9), timedelta(hours=1, minutes=2), "H200",
      [_sampling("Qwen/Qwen3-8B", 2, seq=32768)], None),
-    ("qwen3.5-9b lora r32 sweep", "CANCELLED", "cancelled_by_client", timedelta(days=16), timedelta(hours=6), "B200",
+    ("CANCELLED", "cancelled_by_client", timedelta(days=16), timedelta(hours=6), "B200",
      [_training("Qwen/Qwen3.5-9B", 8, lr=5e-5, bs=32, seq=8192, lora=32)], "sft"),
-    ("qwen3.5-9b lora r8 sweep", "CANCELLED", "cancelled_by_client", timedelta(days=16, hours=1), timedelta(hours=5, minutes=30), "B200",
+    ("CANCELLED", "cancelled_by_client", timedelta(days=16, hours=1), timedelta(hours=5, minutes=30), "B200",
      [_training("Qwen/Qwen3.5-9B", 8, lr=5e-5, bs=32, seq=8192, lora=8)], "sft"),
-    ("", "FAILED", "pending_timeout", timedelta(days=27), timedelta(hours=24), "B300",
+    ("FAILED", "pending_timeout", timedelta(days=27), timedelta(hours=24), "B300",
      [_training("Qwen/Qwen3.6-35B-A3B", 32, lr=1e-6, bs=128, seq=4096)], None),
-    ("math grpo · 8b (paper repro)", "CANCELLED", "cancelled_by_client", timedelta(days=41), timedelta(hours=9), "H200",
+    ("CANCELLED", "cancelled_by_client", timedelta(days=41), timedelta(hours=9), "H200",
      [_training("Qwen/Qwen3-8B", 4, lr=1e-6, bs=32, seq=4096), _sampling("Qwen/Qwen3-8B", 4)], "rl"),
-    ("", "CANCELLED", "cancelled_by_client", timedelta(days=58), timedelta(minutes=48), "H200",
+    ("CANCELLED", "cancelled_by_client", timedelta(days=58), timedelta(minutes=48), "H200",
      [_sampling("Qwen/Qwen3-8B", 2)], None),
-    ("contract-extraction sft", "TERMINATED", "idle_timeout", timedelta(days=77), timedelta(hours=4), "H200",
+    ("TERMINATED", "idle_timeout", timedelta(days=77), timedelta(hours=4), "H200",
      [_training("Qwen/Qwen3-8B", 8, lr=2e-5, bs=16, seq=16384)], "sft"),
-    ("", "FAILED", "out_of_memory", timedelta(days=96), timedelta(minutes=7), "H200",
+    ("FAILED", "out_of_memory", timedelta(days=96), timedelta(minutes=7), "H200",
      [_training("Qwen/Qwen3.8-27B", 8, lr=1e-5, bs=64, seq=32768)], None),
-    ("", "CANCELLED", "cancelled_by_client", timedelta(days=120), timedelta(hours=2), "H200",
+    ("CANCELLED", "cancelled_by_client", timedelta(days=120), timedelta(hours=2), "H200",
      [_training("Qwen/Qwen3-8B", 4, lr=3e-5, bs=8, seq=4096, lora=16)], None, {"experiment": "missing"}),
-    ("first conversational sft", "CANCELLED", "cancelled_by_client", timedelta(days=171), timedelta(minutes=25), "H200",
+    ("CANCELLED", "cancelled_by_client", timedelta(days=171), timedelta(minutes=25), "H200",
      [_training("Qwen/Qwen3-8B", 4, lr=2e-5, bs=4, seq=32768)], None),
-    ("", "CANCELLED", "cancelled_by_client", timedelta(days=201), timedelta(hours=1), "H200",
+    ("CANCELLED", "cancelled_by_client", timedelta(days=201), timedelta(hours=1), "H200",
      [_training("Qwen/Qwen3-8B", 4)], None),  # older than six months: hidden
-    ("", "FAILED", "sub_job_readiness", timedelta(days=230), timedelta(minutes=12), "H200",
+    ("FAILED", "sub_job_readiness", timedelta(days=230), timedelta(minutes=12), "H200",
      [_sampling("Qwen/Qwen3-8B", 2)], None),  # older than six months: hidden
 ]
 
-# Jobs that show names and server-side state: the same fields as _SPECS plus
+# Jobs that show server-side state: the same fields as _SPECS plus
 # overrides. "system_metrics": False leaves a job's telemetry without system rows
-# (CPU and memory). "comment" is the job's create-time comment (its server-side name);
+# (CPU and memory).
 # "reason_details" is the service's sentence beside the reason; "multiplex_onto"
 # is the _SPECS index of the job whose training sub-job this one runs on;
 # "unreachable" makes the service answer UNKNOWN for the job, as it does when
 # it can't reach the control plane. "experiment" says how this role is refused
 # the job's Experiment ("missing" or "sql", see _EXPERIMENT_GONE).
 _NAME_SPECS = [
-    ("lora probe on support-chat v4", "RUNNING", "", timedelta(minutes=25), None, "H200",
+    ("RUNNING", "", timedelta(minutes=25), None, "H200",
      [_training("Qwen/Qwen3-8B", 8, lr=1e-4, bs=8, seq=4096, lora=8)], None,
-     {"comment": "support-chat v4 LoRA probe\nr=8 on the same GPUs as the main run; compare loss at step 500",
-      "multiplex_onto": 0}),
-    ("", "PENDING", "quota_filled", timedelta(minutes=12), None, "B200",
+     {"multiplex_onto": 0}),
+    ("PENDING", "quota_filled", timedelta(minutes=12), None, "B200",
      [_training("Qwen/Qwen3.8-27B", 16, lr=1e-5, bs=32, seq=16384)], None,
-     {"comment": "qwen3.8-27b full sft · contracts v2\nresumes the Oct run; 16k context",
-      "reason_details": "needs 16 GPUs; 8 of 16 reserved GPUs are held by your other jobs"}),
-    ("", "RUNNING", "", timedelta(minutes=50), None, "H200",
+     {"reason_details": "needs 16 GPUs; 8 of 16 reserved GPUs are held by your other jobs"}),
+    ("RUNNING", "", timedelta(minutes=50), None, "H200",
      [_training("Qwen/Qwen3-8B", 8, lr=2e-5, bs=8, seq=8192), _sampling("Qwen/Qwen3-8B", 2)], None,
-     {"comment": "ablation: no warmup [baseline v4]", "unreachable": True}),
-    ("", "FAILED", "node_evacuated", timedelta(days=6), timedelta(hours=2), "H200",
+     {"unreachable": True}),
+    ("FAILED", "node_evacuated", timedelta(days=6), timedelta(hours=2), "H200",
      [_training("Qwen/Qwen3-8B", 8, lr=1e-4, bs=16, seq=8192, lora=16)], "sft",
-     {"comment": "support-chat v3.1 · LoRA r16",
-      "reason_details": "The node running this job was taken out of service; resume from its last checkpoint"}),
-    ("", "CANCELLED", "cancelled_by_client", timedelta(days=11), timedelta(minutes=40), "H200",
-     [_sampling("Qwen/Qwen3-8B", 1)], None,
-     {"comment": "nightly eval of the support-chat checkpoints against the frozen March prompt set "
-                 "(1,200 prompts, temperature 0, max 512 new tokens)"}),
+     {"reason_details": "The node running this job was taken out of service; resume from its last checkpoint"}),
+    ("CANCELLED", "cancelled_by_client", timedelta(days=11), timedelta(minutes=40), "H200",
+     [_sampling("Qwen/Qwen3-8B", 1)], None),
 ]
 
 
@@ -180,22 +174,21 @@ _LOWERCASE = ("sandbox", "dev")
 # Jobs outside the configured location: the same fields as _NAME_SPECS, with
 # "location" (database_name, schema_name).
 _LOCATION_SPECS = [
-    ("", "RUNNING", "", timedelta(hours=1, minutes=5), None, "B200",
+    ("RUNNING", "", timedelta(hours=1, minutes=5), None, "B200",
      [_training("Qwen/Qwen3-8B", 8, lr=3e-5, bs=16, seq=8192)], "sft",
-     {"comment": "team baseline · qwen3-8b sft v2", "location": _TEAM}),
-    ("", "FAILED", "placement_too_large", timedelta(days=3, hours=2), timedelta(minutes=1), "B200",
+     {"location": _TEAM}),
+    ("FAILED", "placement_too_large", timedelta(days=3, hours=2), timedelta(minutes=1), "B200",
      [_training("Qwen/Qwen3.8-27B", 64, lr=1e-5, bs=64, seq=32768)], None,
-     {"comment": "27b long-context trial (64 GPUs)", "location": _TEAM,
-      "reason_details": "asks for 64 GPUs; the largest placement here is 32"}),
-    ("", "CANCELLED", "cancelled_by_client", timedelta(days=12), timedelta(hours=2, minutes=30), "H200",
+     {"location": _TEAM, "reason_details": "asks for 64 GPUs; the largest placement here is 32"}),
+    ("CANCELLED", "cancelled_by_client", timedelta(days=12), timedelta(hours=2, minutes=30), "H200",
      [_training("Qwen/Qwen3-8B", 4, lr=1e-6, bs=32, seq=4096), _sampling("Qwen/Qwen3-8B", 4)], "rl",
-     {"comment": "team grpo · math v1", "location": _TEAM, "experiment": "sql"}),
-    ("", "RUNNING", "", timedelta(minutes=40), None, "H200",
+     {"location": _TEAM, "experiment": "sql"}),
+    ("RUNNING", "", timedelta(minutes=40), None, "H200",
      [_sampling("Qwen/Qwen3-8B", 2)], None,
-     {"comment": "eval endpoint · nightly prompts", "location": _LOWERCASE}),
-    ("", "TERMINATED", "idle_timeout", timedelta(days=20), timedelta(hours=1), "H200",
+     {"location": _LOWERCASE}),
+    ("TERMINATED", "idle_timeout", timedelta(days=20), timedelta(hours=1), "H200",
      [_training("Qwen/Qwen3-0.6B", 1, lr=1e-5, bs=1, seq=128)], "sft",
-     {"comment": "tiny sft smoke · 0.6b", "location": _LOWERCASE}),
+     {"location": _LOWERCASE}),
 ]
 
 # Jobs in states and shapes the jobs above don't show, in the configured location:
@@ -205,27 +198,23 @@ _LOCATION_SPECS = [
 # tab restarts it from the end); "not_found" makes the service answer UNKNOWN with no
 # sub-jobs, as it does for a job its control plane doesn't know.
 _STATE_SPECS = [
-    ("", "CANCELLED", "cancelled_by_client", timedelta(days=5, hours=3), timedelta(hours=7), "H200",
+    ("CANCELLED", "cancelled_by_client", timedelta(days=5, hours=3), timedelta(hours=7), "H200",
      [_sampling("Qwen/Qwen3-8B", 4)], None,
-     {"comment": "batch eval · 25k support prompts, one log line per request", "log_every": 1.0}),
-    ("", "RUNNING", "", timedelta(minutes=35), None, "H200",
+     {"log_every": 1.0}),
+    ("RUNNING", "", timedelta(minutes=35), None, "H200",
      [_training("Qwen/Qwen3-8B", 4, lr=2e-5, bs=8, seq=8192)], None,
-     {"comment": "debug run · dumps a 300 KiB tensor line every 10 minutes", "stuck": True}),
-    ("", "TERMINATED", "idle_timeout", timedelta(days=8), timedelta(hours=1, minutes=10), "H200",
-     [_training("Qwen/Qwen3-8B", 4, lr=1e-6, bs=16, seq=4096), _log_prob("Qwen/Qwen3-8B")], "sft",
-     {"comment": "dpo · reference log-probs on a log_prob sub-job"}),
-    ("", "SUCCEEDED", "", timedelta(days=13), timedelta(hours=2), "H200",
-     [_training("Qwen/Qwen3-0.6B", 2, lr=1e-5, bs=8, seq=2048)], "sft",
-     {"comment": "short sft · finished on its own (SUCCEEDED)"}),
-    ("", "DONE", "", timedelta(days=60), timedelta(minutes=50), "H200",
-     [_training("Qwen/Qwen3-8B", 4, lr=2e-5, bs=8, seq=4096)], None,
-     {"comment": "legacy run · status DONE, from an older service"}),
-    ("", "JOB_STATE_CANCELLED", "cancelled_by_client", timedelta(days=70), timedelta(minutes=30), "H200",
-     [_training("Qwen/Qwen3-8B", 4, lr=2e-5, bs=8, seq=4096)], None,
-     {"comment": "status spelled JOB_STATE_CANCELLED"}),
-    ("", "RUNNING", "", timedelta(hours=3), None, "H200",
+     {"stuck": True}),
+    ("TERMINATED", "idle_timeout", timedelta(days=8), timedelta(hours=1, minutes=10), "H200",
+     [_training("Qwen/Qwen3-8B", 4, lr=1e-6, bs=16, seq=4096), _log_prob("Qwen/Qwen3-8B")], "sft"),
+    ("SUCCEEDED", "", timedelta(days=13), timedelta(hours=2), "H200",
+     [_training("Qwen/Qwen3-0.6B", 2, lr=1e-5, bs=8, seq=2048)], "sft"),
+    ("DONE", "", timedelta(days=60), timedelta(minutes=50), "H200",
+     [_training("Qwen/Qwen3-8B", 4, lr=2e-5, bs=8, seq=4096)], None),
+    ("JOB_STATE_CANCELLED", "cancelled_by_client", timedelta(days=70), timedelta(minutes=30), "H200",
+     [_training("Qwen/Qwen3-8B", 4, lr=2e-5, bs=8, seq=4096)], None),
+    ("RUNNING", "", timedelta(hours=3), None, "H200",
      [_training("Qwen/Qwen3-8B", 8, lr=2e-5, bs=16, seq=8192)], None,
-     {"comment": "orphaned run · its control plane no longer knows it", "not_found": True}),
+     {"not_found": True}),
 ]
 _NOT_FOUND = "Job status unavailable: job not found on Control Plane"
 # What the service answers when the role can't read a job's Experiment, by how
@@ -323,7 +312,6 @@ class DemoClient:
         self.database, self.schema = DEMO_LOCATION
         self._jobs: list = []
         self._kinds: dict = {}
-        self._aliases: dict = {}
         self._unreachable: set = set()  # jobs the service answers UNKNOWN for
         self._not_found: set = set()  # ... with no sub-jobs: its control plane doesn't know them
         self._location_of: dict = {}  # job id -> (database_name, schema_name), outside the configured location
@@ -333,7 +321,7 @@ class DemoClient:
         self._gpu_rows_only: set = set()  # jobs whose telemetry has no system rows (CPU and memory)
         overrides: dict = {}
         specs = (*_SPECS, *_NAME_SPECS, *_LOCATION_SPECS, *_STATE_SPECS)
-        for alias, status, reason, age, duration, hw, subs, kind, *extra in specs:
+        for status, reason, age, duration, hw, subs, kind, *extra in specs:
             jid = _uid(self._rng)
             created = self.now - age
             ended = created + duration if duration else None
@@ -352,17 +340,15 @@ class DemoClient:
                 "job_id": jid, "status": status, "reason": reason, "created_at": _iso(created),
                 "updated_at": _iso(updated), "state_changed_at": _iso(ended or updated), "sub_jobs": sub_jobs,
                 "image_tag": "release_demo", "hardware": hw, "owner_role": "ML_RESEARCH",
-                "submitted_by": self._rng.choice(["USER_A", "USER_B", "USER_A", "USER_C"]), "comment": None,
+                "submitted_by": self._rng.choice(["USER_A", "USER_B", "USER_A", "USER_C"]),
                 "idle_timeout_seconds": 1800, "pending_timeout_seconds": 86400,
             })
             self._kinds[jid] = kind
-            if alias:
-                self._aliases[jid] = alias
             if extra:
                 overrides[jid] = extra[0]
         for jid, more in overrides.items():
             job = self._find(jid)
-            job.update({key: more[key] for key in ("comment", "reason_details") if key in more})
+            job.update({key: more[key] for key in ("reason_details",) if key in more})
             if "location" in more:
                 self._location_of[jid] = more["location"]
             if "multiplex_onto" in more:
@@ -453,7 +439,7 @@ class DemoClient:
         out = json.loads(json.dumps(self._as_of_now(job)))
         if job["job_id"] not in self._unreachable | self._not_found:
             return out
-        fallback = {key: out[key] for key in ("job_id", "owner_role", "submitted_by", "comment") if key in out}
+        fallback = {key: out[key] for key in ("job_id", "owner_role", "submitted_by") if key in out}
         if job["job_id"] in self._not_found:  # its control plane doesn't know it: no sub-jobs either
             fallback.update(status="UNKNOWN", reason=_NOT_FOUND, sub_jobs=[])
             return fallback
@@ -471,11 +457,6 @@ class DemoClient:
             database, schema = self._location_of.get(job["job_id"], DEMO_LOCATION)
             return RuntimeError(_EXPERIMENT_SQL.format(database=database, schema=schema, name="TRAINING_RUNS"))
         return None
-
-    # ── seeding the local store (aliases) ──
-    def seed_local(self, *, aliases: AliasStore) -> None:
-        for jid, name in self._aliases.items():
-            aliases.set(jid, name)
 
     @staticmethod
     def _config_lr(job: dict, default: float) -> float:

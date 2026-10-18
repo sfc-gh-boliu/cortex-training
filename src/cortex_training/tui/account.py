@@ -135,8 +135,7 @@ class ListScope:
     stopped: Optional[str] = None
     walked: int = 0  # ACCOUNT, stopped: the jobs that walk read, the newest
     pages: int = 0  # ACCOUNT, stopped at PAGE_LIMIT: the pages it read
-    active_added: int = 0  # ACCOUNT, stopped: older active jobs the walk for active jobs added
-    active_missing: bool = False  # ACCOUNT, stopped: that walk failed or stopped early, so some may be missing
+    active_missing: bool = False  # ACCOUNT, stopped: the active-job walk failed or stopped early; some may be missing
     reason: Optional[str] = None  # FALLBACK: why the account-level list is unavailable
 
     @property
@@ -190,19 +189,6 @@ def unavailable_text(scope: ListScope) -> str:
     enabled", "account-wide list: HTTP 403" or "HTTP 405", or "no account-wide list" (a client
     without one)."""
     return _FALLBACK_WHY.get(scope.reason or "", _NO_ACCOUNT_LIST)
-
-
-def window_text(scope: Optional[ListScope], *, recent: int, hidden: int) -> str:
-    """The jobs the list holds, for the line under the header.
-
-    Short: that line also carries the live and historical counts, the sort and
-    a search's matches, within a 140-column terminal.
-    """
-    if scope is None or scope.stopped is None:
-        return f"last 6 months ({recent:,} jobs" + (f", {hidden:,} older hidden" if hidden else "") + ")"
-    held = (f"newest {_jobs(scope.walked)}" if scope.stopped == CAPPED
-            else f"first {scope.pages} pages ({_jobs(scope.walked)})")
-    return held + (f" + {scope.active_added:,} older active" if scope.active_added else "")
 
 
 def loaded_text(scope: Optional[ListScope]) -> str:
@@ -413,7 +399,7 @@ class JobLister:
         added = [job for job in rows if views.job_id_of(job) not in listed]
         scope = ListScope(ACCOUNT, stopped=stopped, walked=len(jobs),
                           pages=ACCOUNT_LIST_MAX_PAGES if stopped == PAGE_LIMIT else 0,
-                          active_added=len(added), active_missing=active_stopped is not None)
+                          active_missing=active_stopped is not None)
         return Listing(jobs + added, scope)
 
     def _pages(self, created_after: datetime, status: Optional[str],

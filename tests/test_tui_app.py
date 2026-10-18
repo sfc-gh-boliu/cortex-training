@@ -169,7 +169,7 @@ async def _run_resource_tab(tmp_path):
         assert "training #0" in status  # named by type and index
         calls = c.download_metrics.call_count
 
-        # w cycles the GPU window; the digits switch tabs on the job detail screen.
+        # w cycles the GPU window; the digits do nothing on the job detail screen.
         for _ in range(len(RANGES)):
             if app.screen._resource_range == "all":
                 break
@@ -179,7 +179,7 @@ async def _run_resource_tab(tmp_path):
             app,
             lambda: app.screen._resource_range == "all"
             # Named by type and index; at this width the window may show as its key (all).
-            and re.match(r"training #0 (\(1/2\)|\(1 of 2 · < > switch\))  ·  (whole job|all)  ·",
+            and re.match(r"training #0 (\(1/2\)|\(1 of 2\))  ·  (whole job|all)  ·",
                          str(app.screen.query_one("#resource-status", Static).render())),
         )
         assert ok
@@ -231,10 +231,10 @@ async def _run_resource_tab(tmp_path):
         await pilot.press("t")
         ok = await _wait(pilot, app, lambda: tabs.active == "logs")  # after the last tab, the first
         assert ok
-        await pilot.press("3")
+        await pilot.press("g")
         ok = await _wait(pilot, app, lambda: tabs.active == "resource")
         assert ok
-        await pilot.press("2")
+        await pilot.press("l")
         ok = await _wait(pilot, app, lambda: tabs.active == "logs")
         assert ok
         await _settle(app, pilot)
@@ -982,16 +982,16 @@ def test_a_search_builds_each_hidden_older_job_s_search_text_once(monkeypatch):
     now = datetime(2026, 10, 1, tzinfo=timezone.utc)
     c = _client()
     c.list_jobs.return_value = [{"job_id": "7", "status": "RUNNING", "created_at": now.isoformat()}] + [
-        {"job_id": f"old-{i}", "status": "FAILED", "comment": f"older run {i}",
+        {"job_id": f"old-{i}", "status": "FAILED",
          "created_at": (now - timedelta(days=400 + i)).isoformat()}
         for i in range(3)
     ]
     built = Counter()
     search_haystack = views.search_haystack
 
-    def counted(job, name):
+    def counted(job):
         built[views.job_id_of(job)] += 1
-        return search_haystack(job, name)
+        return search_haystack(job)
 
     monkeypatch.setattr(views, "search_haystack", counted)
 
@@ -1001,7 +1001,7 @@ def test_a_search_builds_each_hidden_older_job_s_search_text_once(monkeypatch):
             ok = await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item)
             assert ok, "jobs did not load"
             screen = app.screen
-            for text in ("older", "older r", "older ru", "older run"):
+            for text in ("o", "ol", "old", "old-"):
                 screen.query_one("#jobfilter", Input).value = text
                 ok = await _wait(pilot, app, lambda: f"“{text}”" in (screen._nomatch or ""))
                 assert ok, f"no message for {text!r}: {screen._nomatch!r}"
@@ -1042,7 +1042,7 @@ def test_job_table_fills_the_same_through_datatable_s_own_methods(monkeypatch):
         async with app.run_test(size=(40, 20)) as pilot:
             fast, own = app.query_one("#fast", _JobTable), app.query_one("#own", _JobTable)
             for table in (fast, own):
-                table.add_column("Name", width=8, key="Name")
+                table.add_column("Job ID", width=8, key="Job ID")
                 table.add_column("N", width=4, key="N")
             assert fast._fills_fast() is tui_main.textual_is_floor()
             monkeypatch.setattr(own, "_fills_fast", lambda: False)
@@ -1311,7 +1311,7 @@ async def _run_wrap_and_select():
         # native text selection, and the screen can copy the selection.
         assert isinstance(s._logview, Log)
         assert s._logview.ALLOW_SELECT is True
-        assert hasattr(s, "action_copy_text")  # ctrl+c / a right-click → copy selection
+        assert hasattr(s, "action_copy_text")  # ctrl+c → copy selection
 
         # Wrapping: a long line is split to the pane width on write. The pane
         # may prefix the line with its sub-job tag, which wraps with it.
@@ -2142,7 +2142,7 @@ async def _run_job_detail_tabs(mounts):
         # GPU telemetry loads only when its tab is shown.
         c.download_metrics.assert_not_called()
 
-        await pilot.press("3")
+        await pilot.press("g")
         ok = await _wait(pilot, app, lambda: tabs.active == "resource" and c.download_metrics.call_count == 1)
         assert ok
         assert screen.query_one("#footer").display  # the footer stays on every tab
@@ -2151,11 +2151,11 @@ async def _run_job_detail_tabs(mounts):
         assert tabs.active == "resource" and screen._resource_range != "all"
 
         # Esc on a tab other than Logs goes back, even with a log filter set.
-        await pilot.press("2")
+        await pilot.press("l")
         ok = await _wait(pilot, app, lambda: tabs.active == "logs")
         assert ok
         screen.query_one("#logfilter", Input).value = "x"
-        await pilot.press("3")
+        await pilot.press("g")
         ok = await _wait(pilot, app, lambda: tabs.active == "resource")
         assert ok
         await pilot.press("escape")
@@ -2223,6 +2223,37 @@ async def _wait_seconds(pilot, predicate, seconds=5.0) -> bool:
             return False
         await pilot.pause(0.02)
     return True
+
+
+async def _run_highlighting_copies_nothing_until_ctrl_c():
+    from textual import events
+
+    from cortex_training.tui.clipboard import selected_text
+
+    app = CortexTrainingLogTUI(_client(), poll_interval=0.01)
+    copied: list[str] = []
+    app.copy_to_clipboard = copied.append
+
+    async def mouse(cls, x, button=1):  # as a terminal sends it: the button held through a drag
+        app.post_message(cls(None, x, 1, 0, 0, button, False, False, False, screen_x=x, screen_y=1))
+        await pilot.pause()
+
+    async with app.run_test() as pilot:
+        assert await _wait(pilot, app, lambda: len(getattr(app.screen, "_job_by_item", {})) >= 2)
+        for cls, x in ((events.MouseDown, 4), (events.MouseMove, 20), (events.MouseUp, 20)):
+            await mouse(cls, x)
+        highlighted = selected_text(app.screen)
+        for cls in (events.MouseDown, events.MouseUp):
+            await mouse(cls, 30, button=3)  # a right-click
+        await pilot.pause(0.5)  # long enough for a copy made on mouse-up to land
+        assert highlighted and copied == []
+        await pilot.press("ctrl+c")
+        assert await _wait(pilot, app, lambda: copied) and copied == [highlighted]
+        await _settle(app, pilot)
+
+
+def test_highlighting_copies_nothing_until_ctrl_c():
+    asyncio.run(_run_highlighting_copies_nothing_until_ctrl_c())
 
 
 def test_a_copy_never_waits_for_this_machine_s_clipboard_tool(monkeypatch):
@@ -2312,7 +2343,7 @@ def test_quit_does_not_wait_for_a_blocked_worker(monkeypatch, tmp_path):
         async with app.run_test(size=(140, 40)) as pilot:
             ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen) and app.screen._current_source)
             assert ok
-            await pilot.press("3")  # Resources: the download blocks, like a request retrying a 5xx
+            await pilot.press("g")  # Resources: the download blocks, like a request retrying a 5xx
             ok = await _wait(pilot, app, lambda: c.download_metrics.call_count == 1)
             assert ok
 
@@ -2338,10 +2369,10 @@ async def _run_tail_waits_for_logs_tab():
         for _ in range(20):
             await pilot.pause(0.02)
         assert c.tail_logs.call_count == 0, "the tail polled while Logs was hidden"
-        await pilot.press("2")
+        await pilot.press("l")
         ok = await _wait(pilot, app, lambda: c.tail_logs.call_count > 0)
         assert ok, "the tail did not start when Logs was shown"
-        await pilot.press("3")
+        await pilot.press("g")
         await pilot.pause(0.5)  # let a request already in flight finish
         calls = c.tail_logs.call_count
         for _ in range(20):
@@ -2423,7 +2454,7 @@ async def _run_saved_console_waits_for_logs_and_is_kept(c):
         for _ in range(10):
             await pilot.pause(0.03)
         assert c.download_stdout_logs.call_count == 0, "downloaded the whole console for another tab"
-        await pilot.press("2")
+        await pilot.press("l")
         ok = await _wait(pilot, app, lambda: "saved line" in app.screen._shown_lines, tries=200)
         assert ok, "the saved console did not load once Logs was shown"
         await pilot.press("b")
@@ -2504,7 +2535,7 @@ def test_markup_like_names_and_server_text_render_literally():
     from cortex_training.tui.screens import JobDetailScreen
     from cortex_training.tui.screens import JobSummaryScreen
 
-    job = {"job_id": "7", "status": "PENDING", "comment": "ablation [/no-warmup", "reason": "quota [/x",
+    job = {"job_id": "7", "status": "PENDING", "reason": "quota [/x",
            "reason_details": "needs [/b] GPUs", "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training",
                                                             "model_name": "org/model [/v2"}]}
     c = _client()
@@ -2520,7 +2551,7 @@ def test_markup_like_names_and_server_text_render_literally():
             ok = await _wait(pilot, app, lambda: isinstance(app.screen, JobSummaryScreen)
                              and "needs [/b] GPUs" in str(app.screen.query_one("#health", Static).render()))
             assert ok
-            assert "ablation [/no-warmup" in str(app.screen.query_one("#preview", Static).render())
+            assert "org/model [/v2" in str(app.screen.query_one("#preview", Static).render())
             app.push_screen(JobDetailScreen(c, "7", job=job, initial_tab="logs"))
             ok = await _wait(pilot, app, lambda: isinstance(app.screen, JobDetailScreen)
                              and "org/model [/v2" in str(app.screen.query_one("#summary", Static).render()))

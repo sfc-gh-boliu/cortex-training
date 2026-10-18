@@ -41,7 +41,6 @@ from cortex_training.tui.format import compact_number
 from cortex_training.tui.format import cut_cells
 from cortex_training.tui.format import subjob_config
 from cortex_training.tui.format import local_time
-from cortex_training.tui.format import one_line as _one_row
 from cortex_training.tui.format import parse_ts  # noqa: F401 - views.parse_ts for the screens
 from cortex_training.tui.format import printable
 from cortex_training.tui.format import source_label
@@ -219,10 +218,9 @@ def is_unknown(job: Any) -> bool:
     return isinstance(job, dict) and status_word(job.get("status")) == "unknown"
 
 
-# ─── names and comments ──────────────────────────────────────────────────────
+# ─── text ────────────────────────────────────────────────────────────────────
 
-NAME_WIDTH = 80  # a one-line name is cut to this many terminal cells
-# printable, cut_cells and one_line come from format.py, so the Logs tab draws by
+# printable and cut_cells come from format.py, so the Logs tab draws by
 # the same rule: escape sequences are removed whole, the other characters a
 # terminal would act on, or that reorder or hide the text around them, become
 # U+FFFD, and a character keeps at most format.MAX_COMBINING_MARKS combining
@@ -297,75 +295,6 @@ def wrap_cells(line: str, width: int) -> list:
             row, token = "", token[len(head):]
     rows.append(row.rstrip())
     return rows
-
-
-def _text_lines(text: Any) -> tuple:
-    """The non-blank lines of ``text``, printable, whitespace collapsed."""
-    return _lines_of(printable(text or ""))
-
-
-@functools.lru_cache(maxsize=4096)
-def _lines_of(s: str) -> tuple:
-    return tuple(line for line in (" ".join(part.split()) for part in s.split("\n")) if line)
-
-
-def first_line(text: Any) -> str:
-    """The first non-blank line of ``text``, whitespace collapsed, never cut."""
-    lines = _text_lines(text)
-    return lines[0] if lines else ""
-
-
-def one_line(text: Any, width: int = NAME_WIDTH) -> str:
-    """The first non-blank line of ``text``, whitespace collapsed, ellipsized:
-    :func:`cortex_training.tui.format.one_line` of that line, at ``width`` cells.
-
-    The ellipsis marks a line cut at ``width`` terminal cells and also a text
-    that goes on past its first line.
-    """
-    lines = _text_lines(text)
-    if not lines:
-        return ""
-    return _one_row(lines[0] + (" …" if len(lines) > 1 else ""), max(1, width))
-
-
-def comment_of(job: Any) -> str:
-    """The job's create-time ``comment`` (all of it, printable), or ``""``."""
-    raw = job.get("comment") if isinstance(job, dict) else None
-    return printable(raw).strip() if raw is not None else ""
-
-
-def alias_of(job: dict, aliases: Optional[dict] = None) -> str:
-    """The job's local display name (set with ``n``), or ``""``."""
-    return one_line((aliases or {}).get(job_id_of(job)) or "")
-
-
-def display_name(job: dict, aliases: Optional[dict] = None) -> str:
-    """The job's local alias (set with ``n``), or ``""``. The server-side
-    ``comment`` is shown as the job's comment, never as its name."""
-    return alias_of(job, aliases)
-
-
-def search_name(job: dict, aliases: Optional[dict] = None) -> str:
-    """The name search matches: the job's whole local alias. Unlike
-    :func:`display_name` it is never cut, so the end of a long (or wide-character)
-    name can be found too."""
-    return first_line((aliases or {}).get(job_id_of(job)) or "")
-
-
-def rename_prompt(job: dict, aliases: Optional[dict] = None) -> tuple:
-    """``(value, placeholder)`` for the rename prompt: it starts with the job's
-    alias, whole, or empty with an example as the placeholder."""
-    return first_line((aliases or {}).get(job_id_of(job)) or ""), "e.g. qwen3-8b lora sweep #3"
-
-
-def alias_to_store(job: dict, typed: Any) -> str:
-    """The alias to keep for a name typed in the rename prompt; ``""`` for none."""
-    return collapse(typed)
-
-
-def shown_name(job: dict, aliases: Optional[dict] = None) -> str:
-    """What the list and preview call a job: its local alias, else its job id."""
-    return display_name(job, aliases) or job_id_of(job)
 
 
 # ─── sub-jobs ────────────────────────────────────────────────────────────────
@@ -631,11 +560,9 @@ def subjob_config_summary(sj: dict) -> str:
     return " · ".join(bits)
 
 
-def summary_fields(job: dict, name: str, now: datetime) -> list:
+def summary_fields(job: dict, now: datetime) -> list:
     """(label, value) rows for the job preview, in display order.
 
-    ``name`` is the one-line display name; without one the row shows the job
-    id. A job with a ``comment`` also gets a ``Comment`` row with all of it.
     A time the job record lacks is
     ``—``, with no "ago" after it.
     """
@@ -648,13 +575,10 @@ def summary_fields(job: dict, name: str, now: datetime) -> list:
         note = f"includes queue time; {status_word(job.get('status'))}, so far"
     else:
         note = "includes queue time"
-    comment = comment_of(job)
     location = location_label(job)
     # The age only beside a time that is shown: a dash has none.
     updated, ago = fmt_ts(job.get("updated_at")), fmt_ago(job.get("updated_at"), now)
     return [
-        ("Name", name or job_id_of(job)),
-        *([("Comment", comment)] if comment else []),
         ("Job ID", job_id_of(job)),
         *([("Location", location)] if location else []),
         ("Status", status_word(job.get("status")).upper()),
@@ -741,7 +665,6 @@ def refresh_job(current: Optional[dict], fresh: dict) -> dict:
 
 # field -> help text; the field names users type in the search box.
 SEARCH_FIELDS = {
-    "name": "display name or comment",
     "id": "job id",
     "status": "job status",
     "owner": "submitting user or owning role",
@@ -944,7 +867,7 @@ def _location_name(job: dict, key: str, home: Optional[tuple]) -> Optional[str]:
     return None if names is None else names[0 if key == "db" else 1]
 
 
-def field_values(job: dict, key: str, name: str = "", *, home: Optional[tuple] = None) -> list:
+def field_values(job: dict, key: str, *, home: Optional[tuple] = None) -> list:
     """All values a job carries for a search field (one per sub-job when relevant).
 
     ``home`` is the configured ``(database_name, schema_name)``, where a row
@@ -961,8 +884,6 @@ def field_values(job: dict, key: str, name: str = "", *, home: Optional[tuple] =
         return _scalars(found)
     subs = sub_jobs(job)
     cfgs = [subjob_config(s) for s in subs]
-    if key == "name":
-        return [v for v in dict.fromkeys((name, comment_of(job))) if v]
     if key == "id":
         return [job_id_of(job)] + [str(s.get("sub_job_id") or "") for s in subs]
     if key == "status":
@@ -1030,12 +951,11 @@ def _compare(actual: Any, op: str, wanted: str) -> bool:
     return False  # ordering needs numbers
 
 
-def search_haystack(job: dict, name: str) -> str:
-    """What plain search words match in ``job``, folded (see :func:`fold`): the
-    name, the whole comment, ids, status, owner, GPU type, job type (as the list
+def search_haystack(job: dict) -> str:
+    """What plain search words match in ``job``, folded (see :func:`fold`):
+    ids, status, owner, GPU type, job type (as the list
     shows it, ``train+sample``, and as the API spells it), and models."""
-    # The comment is searched whole, and also when a local alias is the name shown.
-    bits = [name, comment_of(job), job_id_of(job), status_word(job.get("status")), owner(job),
+    bits = [job_id_of(job), status_word(job.get("status")), owner(job),
             job.get("hardware") or "", job_type_label(job)]
     bits += job_types(job) + _raw_job_types(job) + job_models(job)
     bits += [s.get("sub_job_id") or "" for s in sub_jobs(job)]  # ids copied from logs or --sub-job-id
@@ -1075,20 +995,20 @@ def _same_name(stored: str, wanted: str) -> bool:
     return wanted == stored or identifier_name(wanted) == stored
 
 
-def job_matches_query(job: dict, query: Query, name: str = "", *, home: Optional[tuple] = None,
+def job_matches_query(job: dict, query: Query, *, home: Optional[tuple] = None,
                       hay: Optional[str] = None) -> bool:
     """Whether ``job`` matches every word and filter of ``query``.
 
     ``home`` is the configured ``(database_name, schema_name)``, for ``db`` and
     ``schema`` filters on a row that names no location of its own. ``hay`` is
-    :func:`search_haystack` of ``job`` and ``name`` when the caller keeps it.
+    :func:`search_haystack` of ``job`` when the caller keeps it.
     """
     if query.errors:
         return False  # a typo'd field should surface, not silently match everything
     if query.empty:
         return True
     if hay is None:
-        hay = search_haystack(job, name)
+        hay = search_haystack(job)
     places = location_words(job)
     if any(t not in hay and not _starts_a_name(t, places) for t in query.terms):
         return False
@@ -1098,7 +1018,7 @@ def job_matches_query(job: dict, query: Query, name: str = "", *, home: Optional
             if (stored is not None and _same_name(stored, value)) != (op == "="):
                 return False
             continue
-        values = field_values(job, key, name, home=home)
+        values = field_values(job, key, home=home)
         if op == "!=":
             if any(not _compare(v, op, value) for v in values):
                 return False
@@ -1145,7 +1065,7 @@ def no_match_message(text: str, query: Query, searched: int, *, cut: str = "", o
         if any(op == ":" for _key, op, _value, _typed in query.unknown):
             lines.append("  To search for text with a colon in it, quote it: \"training:0\".")
     if query.terms:
-        lines.append("  Words match name, comment, id, sub-job id, status, owner, GPU type, job type, model, and "
+        lines.append("  Words match id, sub-job id, status, owner, GPU type, job type, model, and "
                      "the start of a location's database or schema name (case-insensitive).")
     if query.filters:
         lines.append("  Filters must all match; try fewer, or ':' for a partial match (model:qwen).")
@@ -1197,18 +1117,10 @@ def sort_job_list(jobs: Iterable[dict], key: str = "created", descending: bool =
     return [j for _at, j in timed] + untimed
 
 
-def sort_direction(key: str, descending: bool) -> str:
-    """Say in words which jobs come first under ``sort_job_list(key, descending)``,
-    in the job list's groups (see :func:`live_first`)."""
-    if key == "status":
-        return "running first" if descending else "ended first"
-    return "newest first" if descending else "oldest first"
-
-
 def live_first(key: str, descending: bool) -> bool:
     """Whether the job list draws its LIVE group above HISTORY: always, but under
-    the status sort reversed (``status ↑ ended first``), whose first jobs are the
-    ended ones, as its words say."""
+    the status sort reversed (``status ↑``), whose first jobs are the
+    ended ones."""
     return key != "status" or descending
 
 

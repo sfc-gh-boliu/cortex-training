@@ -21,7 +21,6 @@ from rich.cells import cell_len
 from cortex_training.tui.format import cut_cells
 from cortex_training.tui.format import wrap_log_line
 from cortex_training.tui.views import fit_cells
-from cortex_training.tui.views import one_line
 from cortex_training.tui.views import wrap_cells
 
 CJK = "模型训练任务已经完成"  # two cells a character
@@ -53,5 +52,4 @@ def test_breaks_fall_between_words_and_a_wide_prefix_counts_its_cells():
 def test_cutting_to_cells_never_splits_a_wide_character():
     assert cut_cells("模型训练", 5) == "模型" and cut_cells("模型", 1) == ""
     assert fit_cells("模型训练", 5) == "模型…" and fit_cells("模型训练", 8) == "模型训练"
-    assert one_line("模型训练任务\nsecond line", 9) == "模型训练…"  # the ellipsis also says more lines follow
     assert wrap_cells("模型 训练任务", 5) == ["模型", "训练", "任务"]

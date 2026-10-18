@@ -18,12 +18,12 @@
 Flow: open → every job from the last six months in the configured database and
 schema, or (``a``) in every database and schema this role can see when the
 service allows it (live first, then history, with sub-job rows; searchable by
-name, comment, id, location, or training config) → a job preview
+id, location, or training config) → a job preview
 → tabbed details (Logs | Resources) for the job or one
 sub-job. Pass a job_id on the command line to jump straight to its Logs tab.
 
 Imports ``textual`` at module load. The interface never mutates job state; the
-only writes are local (display names, log and telemetry caches).
+only writes are local (log and telemetry caches).
 """
 
 from __future__ import annotations
@@ -39,7 +39,6 @@ import tempfile
 import threading
 import time
 import traceback
-from collections import Counter
 from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor
@@ -77,8 +76,6 @@ from textual.widget import Widget
 from textual.widgets import DataTable
 from textual.widgets import Footer
 from textual.widgets._footer import FooterKey
-from textual.widgets._footer import FooterLabel
-from textual.widgets._footer import KeyGroup
 from textual.widgets import Header
 from textual.widgets import HelpPanel
 from textual.widgets import Input
@@ -111,7 +108,6 @@ from cortex_training.tui.account import empty_text
 from cortex_training.tui.account import loaded_text
 from cortex_training.tui.account import scope_text
 from cortex_training.tui.account import unavailable_text
-from cortex_training.tui.account import window_text
 from cortex_training.tui.format import display_line
 from cortex_training.tui.format import entry_at_level
 from cortex_training.tui.format import entry_matches
@@ -510,10 +506,9 @@ _BLANK = _FixedCell("")
 
 
 def _sort_part(key: str, descending: bool) -> Content:
-    """The sort, on the line above the job list: ``sort: created ↓ newest first (o reverses)``."""
+    """The sort, on the line above the job list: ``sort: created ↓``."""
     arrow = "↓" if descending else "↑"
-    return Content.from_markup(f"[dim]sort:[/dim] [b]{key} {arrow}[/b] "
-                               f"[dim]{views.sort_direction(key, descending)} (o reverses)[/dim]")
+    return Content.from_markup(f"[dim]sort:[/dim] [b]{key} {arrow}[/b]")
 
 
 # The widest sort part: each is drawn this wide (trailing spaces), so s and o never
@@ -545,15 +540,14 @@ class _JobRows:
     """One job's table rows as last built, and what they were built from."""
 
     # Slots: one of these per listed job, kept between renders.
-    __slots__ = ("job", "alias", "compact", "cells", "names", "sub_cells", "sub_keys", "layout", "expanded", "row",
+    __slots__ = ("job", "compact", "cells", "names", "sub_cells", "sub_keys", "layout", "expanded", "row",
                  "subs")
 
-    def __init__(self, job: dict, alias, compact: bool, cells: dict) -> None:
+    def __init__(self, job: dict, compact: bool, cells: dict) -> None:
         self.job = job  # the record (compared by identity: a refresh keeps an unchanged record)
-        self.alias = alias
         self.compact = compact  # built with MM-DD HH:MM times
-        self.cells = cells  # column label -> cell: the job's row, but for its Name
-        self.names: dict = {}  # unfolded (True/False) -> the Name cell, with that ▾/▸ marker
+        self.cells = cells  # column label -> cell: the job's row, but for its Job ID
+        self.names: dict = {}  # unfolded (True/False) -> the Job ID cell, with that ▾/▸ marker
         self.sub_cells: tuple | None = None  # ((row key suffix, {label: cell}), ...): its sub-job rows (and note)
         self.sub_keys: tuple = ()  # ((job id, sub-job id) or None for the note, ...) beside sub_cells
         self.layout = None  # the layout row and subs are in
@@ -771,9 +765,6 @@ class PickableTable(DataTable):
         self._end_pick()
         if dragged:
             self._swallow_click = True
-            copy_highlight = getattr(self.app, "copy_highlight", None)
-            if callable(copy_highlight):
-                copy_highlight(self.screen)  # as a drag over text is copied
         else:
             self.clear_picked()  # a click: it does what a click does, and drops the picks
 
@@ -917,7 +908,7 @@ class _JobTable(PickableTable):
     """The job list's table. Home and End go to the first and the last job. → unfolds
     the highlighted job's sub-jobs and ← folds them (on a sub-job row, its job's);
     where there is nothing to unfold or fold they scroll sideways, the marker and
-    the name staying in place. A click on a job's ▸/▾ marker unfolds or folds it.
+    the job id staying in place. A click on a job's ▸/▾ marker unfolds or folds it.
     The screen does the unfolding (see :meth:`JobListScreen.unfold_highlighted`).
     A drag over rows picks them (see :class:`PickableTable`)."""
 
@@ -927,7 +918,7 @@ class _JobTable(PickableTable):
         Binding("right", "cursor_right", "Unfold sub-jobs, else scroll right", show=False),
         Binding("left", "cursor_left", "Fold sub-jobs, else scroll left", show=False),
     ]
-    # The marker before the name of a job with sub-jobs. A click on the arrow
+    # The marker before the id of a job with sub-jobs. A click on the arrow
     # itself (one cell) unfolds or folds the job (see _marker_at); the cell's
     # padding before it and the space after it are the row's, as the rest of it is.
     _MARKERS = ("▸ ", "▾ ")
@@ -969,8 +960,8 @@ class _JobTable(PickableTable):
         columns = self.ordered_columns
         if not (isinstance(row, int) and isinstance(column, int) and 0 <= row < self.row_count
                 and 0 <= column < min(len(columns), self.fixed_columns)):
-            return None  # the header, or no fixed column (the Name column is one; it never scrolls)
-        if columns[column].key.value != "Name" or not str(self.get_cell_at(Coordinate(row, column))).startswith(
+            return None  # the header, or no fixed column (the Job ID column is one; it never scrolls)
+        if columns[column].key.value != "Job ID" or not str(self.get_cell_at(Coordinate(row, column))).startswith(
                 self._MARKERS):
             return None
         offset = event.get_content_offset(self)
@@ -1046,12 +1037,11 @@ class JobListScreen(FollowsPointer, Screen):
     each job's ``DB.SCHEMA`` when they differ. Opening a job hands its screens a
     client bound to its location (:class:`cortex_training.tui.account.JobClients`).
 
-    A job with sub-jobs shows ▸ (folded) or ▾ before its name: a click on that
+    A job with sub-jobs shows ▸ (folded) or ▾ before its job id: a click on that
     marker, or →/← on its row, unfolds or folds it, and ``e`` unfolds or folds
     every job. Live jobs start unfolded.
 
-    A job's name is its local alias, else its id; its server ``comment`` shows
-    after it, dimmed. Search matches aliases, comments, partial ids and
+    Search matches partial ids and
     locations (case-insensitive) and takes ``field<op>value`` filters over the
     training configuration; see :func:`cortex_training.tui.views.parse_query`.
     """
@@ -1079,24 +1069,21 @@ class JobListScreen(FollowsPointer, Screen):
         ("s", "cycle_sort", "Sort"),
         ("o", "toggle_order", "Order"),
         ("e", "expand_all", "Expand/collapse all"),
-        ("n", "rename", "Name job"),
         ("r", "refresh", "Refresh"),
     ]
     # Each list call fans out to the control plane for every live job, so keep
     # the background refresh gentle; r refreshes on demand.
     _REFRESH_SECONDS = 60
-    # The columns a user scans for come first (marker, name, id, status, type,
+    # The columns a user scans for come first (marker, job id, status, type,
     # the time the list is sorted by, owner): they fit in 100 cells. The rest
     # follow and scroll into view on narrower terminals, with the marker and the
-    # name kept in place (fixed columns).
-    _COLUMNS = [(" ", 1), ("Name", 30), ("Job ID", 10), ("Status", 12), ("Type", 13), ("Created", 16),
+    # job id kept in place (fixed columns).
+    _COLUMNS = [(" ", 1), ("Job ID", 38), ("Status", 12), ("Type", 13), ("Created", 16),
                 ("Owner", 14), ("Model", 18), ("GPUs", 9), ("Updated", 16)]
-    _FIXED_COLUMNS = 2  # the marker and the name stay in view while the table scrolls sideways
-    _FIRST_COLUMNS = (" ", "Name", "Job ID", "Status", "Type", "Created", "Owner")
-    # Name takes what a wide terminal has spare once every column fits, up to a
-    # whole one-line name after the ▸/▾ marker; a longer name ends in "…". Where
-    # the first columns don't fit beside a 30-cell name it narrows, down to this.
-    _NAME_MAX = 2 + views.NAME_WIDTH
+    _FIXED_COLUMNS = 2  # the marker and the job id stay in view while the table scrolls sideways
+    _FIRST_COLUMNS = (" ", "Job ID", "Status", "Type", "Created", "Owner")
+    # Job ID is 38 cells, the ▸/▾ marker and a whole job id. Where the first
+    # columns don't fit beside it, it narrows, down to this; a cut id ends in "…".
     _NAME_MIN = 16
     # Created and Updated as MM-DD HH:MM where not every column fits with the
     # whole date (the list spans six months, so the date is never ambiguous).
@@ -1107,25 +1094,22 @@ class JobListScreen(FollowsPointer, Screen):
     _SEARCH_HELP_MIN_ROWS = 30
     # The Location column (DB.SCHEMA) follows this one, only while the list holds
     # jobs from more than one location; it is as wide as the longest, within these.
-    # After GPUs: the columns before it fill a 140-column terminal, and Location
+    # After GPUs: the columns before it fill a 136-column terminal, and Location
     # is wide (a quoted DB.SCHEMA), so it scrolls into view rather than pushing
     # Model and GPUs off.
     _LOCATION_AFTER = "GPUs"
     _LOCATION_AT = [label for label, _width in _COLUMNS].index(_LOCATION_AFTER) + 1
     _LOCATION_WIDTHS = (10, 32)
 
-    def __init__(self, client, *, poll_interval=1.0, aliases=None, now=None, clients=None, lister=None,
+    def __init__(self, client, *, poll_interval=1.0, now=None, clients=None, lister=None,
                  schema_only=False):
         """``clients`` and ``lister`` are the app's (shared with a list opened again
         later); without them the screen makes its own for ``client``."""
         super().__init__()
-        from cortex_training.tui.stores import AliasStore
-
         self._client = client
         self._clients = clients if clients is not None else JobClients(client)
         self._lister = lister if lister is not None else JobLister(client, schema_only=schema_only)
         self._poll_interval = poll_interval
-        self._aliases = aliases or AliasStore()
         self._now = now  # fixed clock for tests/screenshots; None = wall clock
         self._job_by_item: dict[str, str] = {}
         self._jobs_by_id: dict[str, dict] = {}
@@ -1151,15 +1135,14 @@ class JobListScreen(FollowsPointer, Screen):
         self._asked = self._account_wanted()
         self._search_timer = None
         self._layout: _ListLayout | None = None  # the table's columns, once they exist
-        self._unavailable: Content | None = None  # the line above the list, before wrapping
         self._notice: Content | None = None  # the stale-list notice, before wrapping
         self._info: Content | list | None = None  # the line(s) under the header, before wrapping
         self._nomatch: str | None = None  # the no-match message (plain text), before wrapping
         self._nomatch_brief: str | None = None  # the same without the fields, for while the search help shows
-        # Per job id, built once and reused while the record, its name and its
+        # Per job id, built once and reused while the record and its
         # place in the layout stay the same: its cells, sub-job rows and search text.
         self._rows: dict[str, _JobRows] = {}
-        self._hay: dict[str, tuple] = {}  # job id -> (record, name, search_haystack)
+        self._hay: dict[str, tuple] = {}  # job id -> (record, search_haystack)
         self._resolved: tuple | None = None  # (search text, the jobs list it was resolved against, query)
         self._headers: dict[str, tuple] = {}  # LIVE/HISTORY -> ((count, label, layout), cells)
         self._keys: dict[str, str] = {}  # job id -> its row's table key
@@ -1169,14 +1152,13 @@ class JobListScreen(FollowsPointer, Screen):
         yield Header()
         yield Static("", id="listinfo")
         yield Static("", id="listnotice")
-        yield Static("", id="unavailable")
         yield _JobTable(id="jobs", cursor_type="row", zebra_stripes=False, fixed_columns=self._FIXED_COLUMNS)
         # In the table's place when there is none; it scrolls, as a long message
         # can be taller than a short terminal leaves it (Tab focuses it, for the keys).
         with VerticalScroll(id="nomatch-box"):
             yield Static("", id="nomatch")
         yield Input(
-            placeholder="search names / comments / ids…  or fields: model:qwen lr<1e-4 gpus>=8 method:lora gpu:H200  (/ focus · Esc clear)",
+            placeholder="search ids…  or fields: model:qwen lr<1e-4 gpus>=8 method:lora gpu:H200  (/ focus · Esc clear)",
             id="jobfilter",
         )
         yield Static("", id="searchhelp")
@@ -1186,7 +1168,6 @@ class JobListScreen(FollowsPointer, Screen):
         self.query_one("#nomatch", Static).display = False
         self.query_one("#nomatch-box", VerticalScroll).display = False
         self.query_one("#listnotice", Static).display = False
-        self.query_one("#unavailable", Static).display = False
         self._set_columns(self.query_one("#jobs", DataTable), self._layout_for(0))
         self._paint_help()
         self._refresh_jobs()
@@ -1197,7 +1178,7 @@ class JobListScreen(FollowsPointer, Screen):
 
     def on_screen_resume(self) -> None:
         # Detail screens own the same app-level subtitle while they are active.
-        # Restore the list status (and any renamed job, or a status the preview
+        # Restore the list status (and a status the preview
         # read) on return; a list that is as it was isn't drawn again.
         self._update_subtitle()
         self._render_jobs()
@@ -1213,7 +1194,6 @@ class JobListScreen(FollowsPointer, Screen):
         """After a resize: re-wrap the lines around the list, and re-render if the columns change."""
         self._paint_info()
         self._paint_notice()
-        self._paint_unavailable()
         self._paint_nomatch()
         self._paint_help()
         if self._layout != self._layout_for(self._location_column_width(self._recent())):
@@ -1255,9 +1235,9 @@ class JobListScreen(FollowsPointer, Screen):
     def _layout_for(self, location_width: int) -> _ListLayout:
         """The columns for this terminal's width, the sort, and the Location column (0: hidden).
 
-        Every column has its full width when they all fit beside a 30-cell name,
-        and the name takes what is spare. Otherwise the dates drop the year, and
-        the name narrows (down to 16 cells) until the first columns fit; and while
+        Every column has its full width when they all fit beside a 38-cell job id.
+        Otherwise the dates drop the year, and
+        the job id narrows (down to 16 cells) until the first columns fit; and while
         the list is sorted by Updated, that column moves to Created's place if it
         would be out of view, so the sorted time always shows.
         """
@@ -1272,17 +1252,17 @@ class JobListScreen(FollowsPointer, Screen):
         if compact:
             columns = [(label, self._TIME_COMPACT if label in ("Created", "Updated") else width)
                        for label, width in columns]
-        name_base = dict(self._COLUMNS)["Name"]
-        spare = room - pad - sum(width + pad for label, width in columns if label != "Name")
+        name_base = dict(self._COLUMNS)["Job ID"]
+        spare = room - pad - sum(width + pad for label, width in columns if label != "Job ID")
         if spare >= name_base:
-            name = min(spare, self._NAME_MAX)
+            name = name_base
         else:
-            first = set(self._FIRST_COLUMNS) - {"Name"}
+            first = set(self._FIRST_COLUMNS) - {"Job ID"}
             needed = sum(width + pad for label, width in columns if label in first)
-            if room - pad - needed < self._NAME_MIN:  # the last of them can't fit: the name takes its room
+            if room - pad - needed < self._NAME_MIN:  # the last of them can't fit: the job id takes its room
                 needed -= dict(columns)[self._FIRST_COLUMNS[-1]] + pad
             name = max(self._NAME_MIN, min(name_base, room - pad - needed))
-        columns = [(label, name if label == "Name" else width) for label, width in columns]
+        columns = [(label, name if label == "Job ID" else width) for label, width in columns]
         labels = [label for label, _width in columns]
         if self._sort == "updated":
             ends = sum(width + pad for _label, width in columns[: labels.index("Updated") + 1])
@@ -1335,10 +1315,7 @@ class JobListScreen(FollowsPointer, Screen):
         # The status first, as it is short, then the scope: a narrow terminal cuts
         # the end of the line, and r must show that it is refreshing.
         # (The subtitle is drawn as plain text, never markup.)
-        keys = "↑/↓, Enter · →/← sub-jobs · / search · s sort · o order"
-        if not self._lister.schema_only:
-            keys += " · a current schema" if self._account_wanted() else " · a all schemas"
-        bits = [refresh_status, self._scope_text(), f"select a job ({keys} · r refresh)"]
+        bits = [refresh_status, self._scope_text()]
         self.app.sub_title = "  ·  ".join(bit for bit in bits if bit)
 
     def _scope_text(self) -> str:
@@ -1381,7 +1358,6 @@ class JobListScreen(FollowsPointer, Screen):
         # the list stays on the current schema and says why (see _on_jobs).
         self._asked = account
         self.refresh_bindings()  # the footer's a names the other list now
-        self._update_subtitle()
         self._refresh_jobs(manual=True, quiet=True)
 
     def _refresh_tick(self) -> None:
@@ -1469,7 +1445,7 @@ class JobListScreen(FollowsPointer, Screen):
         self._render_jobs(top=True)
 
     def whole_id(self, key) -> str | None:
-        """The whole id of the job or sub-job on row ``key`` (the Job ID column cuts it short)."""
+        """The whole id of the job or sub-job on row ``key`` (a sub-job's row shows its label there)."""
         if key in self._job_by_item:
             return self._job_by_item[key]
         sub = self._sub_by_item.get(key)  # (job id, sub-job id)
@@ -1478,7 +1454,7 @@ class JobListScreen(FollowsPointer, Screen):
         return None
 
     def action_copy_text(self) -> None:
-        """ctrl+c or a right-click: what the mouse highlighted (text, or the rows a
+        """ctrl+c: what the mouse highlighted (text, or the rows a
         drag picked), else everything the screen shows, the whole list with whole ids."""
         if not self.app.copy_highlight(self):
             self.app.copy_everything(self)
@@ -1599,24 +1575,6 @@ class JobListScreen(FollowsPointer, Screen):
             self._collapsed.clear()
             self._expanded = {views.job_id_of(j) for j in self._all_jobs}
         self._render_jobs()
-
-    def action_rename(self) -> None:
-        from cortex_training.tui.screens import PromptScreen
-        from cortex_training.tui.stores import ALIAS_MAX_CHARS
-
-        _key, jid = self._highlighted()
-        if not jid or not is_shown(self):
-            return
-        job = self._jobs_by_id.get(jid, {"job_id": jid})
-        current, placeholder = views.rename_prompt(job, self._aliases.all())
-
-        def done(value):
-            if value is not None:
-                self._aliases.set(jid, views.alias_to_store(job, value))
-                self._render_jobs(keep=jid)
-
-        self.app.push_screen(PromptScreen(f"Display name for {jid}", current, placeholder,
-                                          max_length=ALIAS_MAX_CHARS), done)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "jobfilter":
@@ -1763,19 +1721,14 @@ class JobListScreen(FollowsPointer, Screen):
     # ─── rows ────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _name_cell(job: dict, aliases: dict, unfolded: bool | None = None) -> _FixedCell:
-        """The Name cell: the job's local alias, else its job id, then its comment
-        (dimmed) when it has one; after a ▾ or ▸ marker for a job that unfolds
+    def _name_cell(job: dict, unfolded: bool | None = None) -> _FixedCell:
+        """The Job ID cell: the job's id, after a ▾ or ▸ marker for a job that unfolds
         (``unfolded`` True or False; None: it has nothing to unfold). Plain text,
         never markup."""
-        alias = views.alias_of(job, aliases)
-        comment = views.one_line(views.comment_of(job))
-        parts = [(alias, "bold")] if alias else [(views.job_id_of(job), "grey50")]
-        if comment:
-            parts.append((f"  {comment}", "grey62"))
+        parts = [(views.job_id_of(job), "grey50")]
         if unfolded is not None:
             parts.insert(0, ("▾ " if unfolded else "▸ ", "grey50"))
-        # The column cuts a long name: it ends in "…" there, as everywhere a name is cut.
+        # The column cuts a long id: it ends in "…" there.
         return _FixedCell.assemble(*parts)
 
     @staticmethod
@@ -1795,12 +1748,11 @@ class JobListScreen(FollowsPointer, Screen):
         return _cell(f"role {role}", "grey62") if role else _cell("—")
 
     def _job_cells(self, job: dict, compact: bool) -> dict:
-        """A job's row but for its Name: column label -> cell."""
+        """A job's row but for its Job ID: column label -> cell."""
         live = views.is_live(job)
         word = views.status_word(job.get("status"))
         unknown = views.is_unknown(job)
         status_style = {"running": "bold green", "failed": "bold red"}.get(word, "yellow" if live or unknown else "grey62")
-        jid = views.job_id_of(job)
         models = views.job_models(job)
         model = views.short_model(models[0]) if models else "—"
         if len(models) > 1:
@@ -1812,7 +1764,6 @@ class JobListScreen(FollowsPointer, Screen):
         # Plain text throughout: DataTable parses a str cell as markup.
         return {
             " ": marker,
-            "Job ID": _cell(jid[:8] + "…" if len(jid) > 9 else jid),
             "Status": _cell(word.upper(), status_style),
             "Type": _cell(views.job_type_label(job)),
             "Created": self._time_cell(job.get("created_at"), compact),
@@ -1835,19 +1786,15 @@ class JobListScreen(FollowsPointer, Screen):
         except Exception:  # noqa: BLE001 - the traceback goes to the error log
             jid = views.job_id_of(job) if isinstance(job, dict) else "?"
             LogScreen._log_traceback(f"job list row for {jid}")
-            return {"Name": _cell(jid, "grey50"), "Status": _cell("? can't show", "yellow")}
+            return {"Job ID": _cell(jid, "grey50"), "Status": _cell("? can't show", "yellow")}
 
     @staticmethod
     def _sub_cells(sj: dict, last: bool) -> dict:
         word = views.status_word(sj.get("status"))
         style = {"running": "green", "failed": "red"}.get(word, "grey62")
         branch = "└─" if last else "├─"
-        sid = str(sj.get("sub_job_id") or "")
-        # The sub-job id after its job's id (training:0): the row above shows the job id.
-        suffix = ":".join(sid.split(":")[1:]) if sid.count(":") >= 2 else sid
         return {
-            "Name": _cell(f"   {branch} {views.sub_job_label(sj)}", "grey70"),
-            "Job ID": _cell(suffix or "—", "grey50"),
+            "Job ID": _cell(f"   {branch} {views.sub_job_label(sj)}", "grey70"),
             "Status": _cell(word.upper(), style),
             "Type": _cell(views.sub_job_type(sj), "grey70"),
             "Model": _cell(views.short_model(sj.get("model_name")) or "—", "grey70"),
@@ -1856,8 +1803,8 @@ class JobListScreen(FollowsPointer, Screen):
 
     @staticmethod
     def _note_cells(*, last: bool) -> dict:
-        """An UNKNOWN job's one-line sub-row; #unavailable has the service's sentence."""
-        return {"Name": _cell(f"   {'└─' if last else '├─'} ? status unavailable", "yellow")}
+        """An UNKNOWN job's one-line sub-row."""
+        return {"Job ID": _cell(f"   {'└─' if last else '├─'} ? status unavailable", "yellow")}
 
     def _sub_rows(self, job: dict) -> tuple:
         """``job``'s rows under it while unfolded, and their keys: an UNKNOWN job's
@@ -1866,7 +1813,7 @@ class JobListScreen(FollowsPointer, Screen):
         entries = views.sub_jobs(job)
         subs, keys = [], []
         if views.is_unknown(job):
-            # In place of live sub-job state (the sentence is above the table, once).
+            # In place of live sub-job state.
             subs.append(("note", self._note_cells(last=not entries)))
             keys.append(None)
         for si, sj in enumerate(entries):
@@ -1877,19 +1824,19 @@ class JobListScreen(FollowsPointer, Screen):
 
     @staticmethod
     def _header_cells(group: str, count: int, label: str, layout: _ListLayout) -> tuple:
-        """A LIVE/HISTORY row. Its title is in the Name column; where that is too
+        """A LIVE/HISTORY row. Its title is in the Job ID column; where that is too
         narrow for all of it, what the group holds goes on in the columns after
-        Name, as many whole words to a column as fit, so the title is never cut."""
+        Job ID, as many whole words to a column as fit, so the title is never cut."""
         style = "bold green" if group == "LIVE" else "bold grey62"
         head = f"{group} ({count})"
         labels = layout.labels
         widths = dict(layout.columns)
-        if views.cell_width(f"{head}  {label}") <= widths["Name"]:
-            cells = {"Name": _FixedCell.assemble((f"{head}  ", style), (label, "dim"))}
+        if views.cell_width(f"{head}  {label}") <= widths["Job ID"]:
+            cells = {"Job ID": _FixedCell.assemble((f"{head}  ", style), (label, "dim"))}
         else:
-            cells = {"Name": _cell(head, style)}
+            cells = {"Job ID": _cell(head, style)}
             words = label.split()
-            for column in labels[labels.index("Name") + 1:]:
+            for column in labels[labels.index("Job ID") + 1:]:
                 if not words:
                     break
                 text = words.pop(0)
@@ -1898,17 +1845,16 @@ class JobListScreen(FollowsPointer, Screen):
                 cells[column] = _cell(text, "dim")
         return tuple(cells.get(column, _BLANK) for column in labels)
 
-    def _job_rows(self, job: dict, aliases: dict, layout: _ListLayout) -> _JobRows:
+    def _job_rows(self, job: dict, layout: _ListLayout) -> _JobRows:
         """``job``'s rows in ``layout``. Its cells are built again only when its
-        record or name changed. Unfolding or folding it changes only its Name
+        record changed. Unfolding or folding it changes only its Job ID
         cell's marker, and adds or drops its sub-job rows (built once); a new
         layout only puts the cells in that layout's order."""
         jid = views.job_id_of(job)
-        alias = aliases.get(jid)
         compact = layout.compact_times
         rows = self._rows.get(jid)
-        if not (rows is not None and rows.job is job and rows.alias == alias and rows.compact == compact):
-            rows = _JobRows(job, alias, compact, self._row_or_note(job, lambda: self._job_cells(job, compact)))
+        if not (rows is not None and rows.job is job and rows.compact == compact):
+            rows = _JobRows(job, compact, self._row_or_note(job, lambda: self._job_cells(job, compact)))
             self._rows[jid] = rows
         expanded = self._is_expanded(job)
         if rows.layout != layout or rows.expanded != expanded:
@@ -1916,11 +1862,11 @@ class JobListScreen(FollowsPointer, Screen):
             if name is None:
                 unfolded = expanded if self._expandable(job) else None
                 # A row that can't be drawn is named by its job id (see _row_or_note).
-                name = rows.names[expanded] = rows.cells.get("Name") or self._row_or_note(
-                    job, lambda: {"Name": self._name_cell(job, aliases, unfolded)})["Name"]
+                name = rows.names[expanded] = rows.cells.get("Job ID") or self._row_or_note(
+                    job, lambda: {"Job ID": self._name_cell(job, unfolded)})["Job ID"]
             labels = layout.labels
             cells = rows.cells
-            rows.row = tuple(name if label == "Name" else cells.get(label, _BLANK) for label in labels)
+            rows.row = tuple(name if label == "Job ID" else cells.get(label, _BLANK) for label in labels)
             if expanded:
                 if rows.sub_cells is None:
                     rows.sub_cells, rows.sub_keys = self._sub_rows(job)
@@ -1942,14 +1888,14 @@ class JobListScreen(FollowsPointer, Screen):
         self._resolved = (self._filter, self._all_jobs, query)
         return query
 
-    def _haystack(self, job: dict, name: str) -> str:
-        """``views.search_haystack`` of ``job``, kept while its record and name stay the same."""
+    def _haystack(self, job: dict) -> str:
+        """``views.search_haystack`` of ``job``, kept while its record stays the same."""
         jid = views.job_id_of(job)
         kept = self._hay.get(jid)
-        if kept is not None and kept[0] is job and kept[1] == name:
-            return kept[2]
-        hay = views.search_haystack(job, name)
-        self._hay[jid] = (job, name, hay)
+        if kept is not None and kept[0] is job:
+            return kept[1]
+        hay = views.search_haystack(job)
+        self._hay[jid] = (job, hay)
         return hay
 
     # ─── the lines around the table ──────────────────────────────────────────
@@ -1963,7 +1909,7 @@ class JobListScreen(FollowsPointer, Screen):
         self._notice = None
         if not stale:
             return
-        # Three spaces, as #unavailable: in line with #listinfo's text, which has a column of padding.
+        # Three spaces: in line with #listinfo's text, which has a column of padding.
         self._notice = Content.from_markup("   [red]refresh failed $failed: $error; showing the list from $at[/red]",
                                            failed=self._failed_at or "", error=self._list_error or "",
                                            at=self._listed_at or "—")
@@ -2021,33 +1967,7 @@ class JobListScreen(FollowsPointer, Screen):
         if self.query_one("#nomatch", Static).content_size.width not in (0, painted_for):
             self._paint_nomatch()
 
-    def _show_unavailable(self, jobs: list) -> None:
-        """Say once, above the list, why the shown UNKNOWN jobs have no live status:
-        in a control-plane outage every live job turns UNKNOWN with the same sentence."""
-        widget = self.query_one("#unavailable", Static)
-        sentences = [views.status_unavailable_text(j) for j in jobs if views.is_unknown(j)]
-        widget.display = bool(sentences)
-        self._unavailable = None
-        if not sentences:
-            return
-        sentence, count = Counter(sentences).most_common(1)[0]
-        tally = f"{count} job" + ("s" if count != 1 else "")
-        others = len(sentences) - count
-        if others:
-            tally += f"; {others} more for another reason (see each job's preview)"
-        # Three spaces: in line with #listinfo's text, which has a column of padding.
-        self._unavailable = Content.from_markup("   [yellow]? $sentence[/]  [dim]· $tally[/dim]", sentence=sentence,
-                                                tally=tally)
-        self._paint_unavailable()
-
-    def _paint_unavailable(self) -> None:
-        if self._unavailable is None:
-            return
-        widget = self.query_one("#unavailable", Static)
-        # Wrapped lines continue under the sentence ("   ? " is five cells), not at the edge.
-        widget.update(hanging(self._unavailable, widget.size.width or self.size.width or self.app.size.width, 5))
-
-    def _older_matches(self, query, aliases: dict) -> list:
+    def _older_matches(self, query) -> list:
         """Ids of the jobs older than six months (hidden) that ``query`` matches, newest first."""
         now = self._clock()
         home = self._clients.home
@@ -2056,8 +1976,7 @@ class JobListScreen(FollowsPointer, Screen):
             if views.within_retention(job, now):
                 continue
             # Each keystroke searches them again: their search text is kept, as the shown jobs' is.
-            name = views.search_name(job, aliases)
-            if views.job_matches_query(job, query, name, home=home, hay=self._haystack(job, name)):
+            if views.job_matches_query(job, query, home=home, hay=self._haystack(job)):
                 found.append(job)
         return [views.job_id_of(j) for j in views.sort_job_list(found, "created", True)]
 
@@ -2074,7 +1993,6 @@ class JobListScreen(FollowsPointer, Screen):
             keep_sub = self._sub_by_item.get(key)  # a sub-job row keeps its own cursor
         recent = self._recent()
         layout = self._layout_for(self._location_column_width(recent))
-        self._show_unavailable([])
         self._show_notice()
         info_line.set_class(False, "error")
         if not self._loaded and not self._list_error:
@@ -2092,11 +2010,9 @@ class JobListScreen(FollowsPointer, Screen):
             info_line.update(Text(f"[error] {self._list_error}  (r retries{hint})", style="red"))
             self._hide_table(table, layout, "")  # an empty message keeps the search box at the bottom
             return
-        aliases = self._aliases.all()
         hidden = len(self._all_jobs) - len(recent)
         query = self._query()
-        # Search sees each name whole (the list cuts long ones). Rows of the
-        # configured schema's own list name no location: db: and schema: read
+        # Rows of the configured schema's own list name no location: db: and schema: read
         # the configured one for them.
         home = self._clients.home
         if query.empty and not query.errors:
@@ -2104,15 +2020,12 @@ class JobListScreen(FollowsPointer, Screen):
         else:
             visible = []
             for job in recent:
-                name = views.search_name(job, aliases)
-                if views.job_matches_query(job, query, name, home=home, hay=self._haystack(job, name)):
+                if views.job_matches_query(job, query, home=home, hay=self._haystack(job)):
                     visible.append(job)
         ordered = views.sort_job_list(visible, self._sort, self._descending)
         live = [j for j in ordered if views.is_live(j)]
         history = [j for j in ordered if not views.is_live(j)]
 
-        # A list cut at the newest jobs doesn't hold the whole six months: say so.
-        window = window_text(self._scope, recent=len(recent), hidden=hidden)
         parts = [Content.from_markup(f"[bold green]● {len(live):,} live[/]   [grey62]○ {len(history):,} historical[/]")]
         if self._filter:
             # The count before the query: a long query wraps, the count stays in view.
@@ -2120,8 +2033,7 @@ class JobListScreen(FollowsPointer, Screen):
             parts.append(Content.from_markup(f"[b]{len(visible):,}[/b] [dim]match(es) for[/dim] [b]$query[/b]",
                                              query=self._filter))
         sort = _sort_part(self._sort, self._descending)
-        parts += [Content.from_markup("[dim]$window[/dim]", window=window),
-                  sort + Content(" " * (_SORT_PART_CELLS - sort.cell_length))]
+        parts.append(sort + Content(" " * (_SORT_PART_CELLS - sort.cell_length)))
         self._info = parts
         self._paint_info()
 
@@ -2132,7 +2044,7 @@ class JobListScreen(FollowsPointer, Screen):
             one = self._scope is not None and self._scope.kind != ACCOUNT
             widen = self._scope is not None and self._scope.kind == SCHEMA
             if self._filter:
-                found = dict(cut=loaded_text(self._scope), older=self._older_matches(query, aliases) if hidden else (),
+                found = dict(cut=loaded_text(self._scope), older=self._older_matches(query) if hidden else (),
                              location=self._schema_label() if one else "", widen=widen)
                 message = views.no_match_message(self._filter, query, len(recent), **found)
                 # While the search help shows under the box, it lists the fields: the message needn't.
@@ -2153,7 +2065,6 @@ class JobListScreen(FollowsPointer, Screen):
         self._show_nomatch(None)
         was_hidden = not table.display
         table.display = True
-        self._show_unavailable(visible)
 
         # The rows to show, from what each job had built, unless it changed.
         plan: list = []
@@ -2167,7 +2078,7 @@ class JobListScreen(FollowsPointer, Screen):
             if not jobs:
                 continue
             if group == "LIVE":
-                # "?" as on those rows and on the line above the table: their status is unavailable.
+                # "?" as on those rows: their status is unavailable.
                 label = "running, queued, ?" if any(views.is_unknown(j) for j in jobs) else "running or queued"
             else:
                 label = "ended or failed"  # a job the control plane has no record of (?) has ended too
@@ -2176,7 +2087,7 @@ class JobListScreen(FollowsPointer, Screen):
                 jid = views.job_id_of(job)
                 item_id = self._row_key(jid)
                 job_by_item[item_id] = jid
-                rows = self._job_rows(job, aliases, layout)
+                rows = self._job_rows(job, layout)
                 plan.append((item_id, rows.row))
                 if jid == keep and target_row is None:
                     target_row = len(plan) - 1
@@ -2202,10 +2113,10 @@ class JobListScreen(FollowsPointer, Screen):
         if not same:
             if (shown is not None and shown[0] == layout and table.row_count == len(plan)
                     and {key: id(cells) for key, cells in shown[1]} == {key: id(cells) for key, cells in plan}):
-                # Each row's Name cell is its own object: it tells the sort where the row goes.
-                at = layout.labels.index("Name")
+                # Each row's Job ID cell is its own object: it tells the sort where the row goes.
+                at = layout.labels.index("Job ID")
                 position = {id(cells[at]): index for index, (_key, cells) in enumerate(plan)}
-                table.sort("Name", key=lambda name: position[id(name)])
+                table.sort("Job ID", key=lambda name: position[id(name)])
             else:
                 self._set_columns(table, layout)
                 table.replace_rows(plan)
@@ -2280,7 +2191,7 @@ class JobListScreen(FollowsPointer, Screen):
             # Every call about the job goes to its own database and schema.
             client = self._job_client(job)
             if client is not None:
-                self.app.push_screen(JobSummaryScreen(client, jid, job=job, aliases=self._aliases,
+                self.app.push_screen(JobSummaryScreen(client, jid, job=job,
                                                       poll_interval=self._poll_interval, on_job=self.job_fetched))
         elif key in self._sub_by_item:
             jid, sid = self._sub_by_item[key]
@@ -2288,7 +2199,7 @@ class JobListScreen(FollowsPointer, Screen):
             client = self._job_client(job)
             if client is not None:
                 self.app.push_screen(JobDetailScreen(client, jid, job=job, sub_job_id=sid, initial_tab="logs",
-                                                     aliases=self._aliases, poll_interval=self._poll_interval))
+                                                     poll_interval=self._poll_interval))
 
     def _job_client(self, job: dict | None):
         """The client for the calls about ``job``, or None (and a notice) when it can't be made.
@@ -2360,13 +2271,13 @@ class FittedFooter(Footer):
 
     Textual's footer cuts what doesn't fit at the command palette's key, docked
     at its right, mid-word (``a All G``). Here the keys that would be cut are
-    left out instead, from the right; a group of keys (``23 Tabs``) goes as one.
+    left out instead, from the right.
     ``?`` still lists every key.
     """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Where each key (or group) ends, measured once all of them are laid out.
+        # Where each key ends, measured once all of them are laid out.
         self._edges: list[int] | None = None
 
     async def recompose(self) -> None:
@@ -2378,21 +2289,17 @@ class FittedFooter(Footer):
         self._fit()
 
     def _units(self) -> tuple[list[list[Widget]], Widget | None]:
-        """The keys left to right, each key or group (its keys, then its label) as one unit; and the palette key."""
+        """The keys left to right, each key as one unit; and the palette key."""
         units: list[list[Widget]] = []
         palette = None
         for child in self.children:
             if child.has_class("-command-palette"):
                 palette = child
-            elif isinstance(child, FooterLabel) and units and isinstance(units[-1][-1], KeyGroup):
-                units[-1].append(child)  # a group's label goes with its keys
             else:
                 units.append([child])
         return units, palette
 
     def _fit(self) -> None:
-        for label in self.query(FooterLabel):
-            label.ALLOW_SELECT = False  # a group's name ("Tabs") isn't text to copy, as the keys aren't
         units, palette = self._units()
         if not units or self.region.width <= 0:
             return
@@ -2461,7 +2368,7 @@ class LogScreen(FollowsPointer, Screen):
     #log-status { height: auto; padding: 0 1; color: $warning; }
     """
 
-    # Back and quit first, then the digits (JobDetailScreen's tab keys take these places)
+    # Back and quit first, then the digits
     # and the keys panel: a narrow terminal cuts the footer's end, and "?" lists
     # every key, the ones hidden here too.
     BINDINGS = [
@@ -2507,13 +2414,6 @@ class LogScreen(FollowsPointer, Screen):
     # A job's last console chunks upload shortly after it ends, so a saved console
     # is kept (and replayed on the next open) only once the job has been over this long.
     _KEEP_CONSOLE_AFTER_SECONDS = 600
-    # The start of the Resources tab's key help: (entry, the entry's narrow form), in order
-    # (see _resource_keys). The window keys pick a window; w cycles through them.
-    _RESOURCE_KEY_HELP = (
-        ("   ".join(f"{key} {name}" for key, name in enumerate(RANGES, 1)), "w window"),
-        ("r refresh", "r refresh"),
-        ("t tab", "t tab"),
-    )
 
     class _Note(str):
         """One of the TUI's own lines in the log pane (a wait, a restart, where the live
@@ -2644,7 +2544,6 @@ class LogScreen(FollowsPointer, Screen):
                 yield Static("Select Resource to load GPU metrics.", id="resource-status")
                 yield Static("", id="resource-stats")
                 yield Static("", id="resource-charts")
-        yield Static("", id="resource-keys")
 
     def on_mount(self) -> None:
         self._logview = self.query_one("#logview", Log)
@@ -2729,7 +2628,7 @@ class LogScreen(FollowsPointer, Screen):
         after_refresh(self, self._rewrap)
 
     def _sync_footer(self) -> None:
-        # The Resource tab lists its own keys; the footer carries the log keys.
+        # The footer carries the log keys; it is hidden on the Resource tab (? lists every key).
         self.query_one("#footer", Footer).display = self._logs_active()
 
     def _sources_cap(self) -> int:
@@ -3326,7 +3225,7 @@ class LogScreen(FollowsPointer, Screen):
         length (a refresh starting, the age ticking past a minute). Each line drops
         detail until it fits ``width``, in a fixed order (see :func:`_fit_line`).
         On the first, the sub-job's place among the job's sub-jobs goes short
-        (``1 of 2 · space switches`` to ``1/2``), then the window to its key's name and
+        (``1 of 2`` to ``1/2``), then the window to its key's name and
         then away (the stats name it), then the place, then the GPU type (or, in
         the System view, the nodes' CPUs and memory). The first line names the GPUs (requested and
         reporting) in the GPU view, the nodes in the System view. On the second,
@@ -3358,7 +3257,7 @@ class LogScreen(FollowsPointer, Screen):
         named = f"[b {sub_job_color(values['label'])}]$label[/]"
         if source in ids and len(ids) > 1:
             values.update(position=f"{ids.index(source) + 1} of {len(ids)}", pos=f"{ids.index(source) + 1}/{len(ids)}")
-            source_forms = [(f"{named} ($position · space switches)", 0), (f"{named} ($pos)", 0), (named, 0)]
+            source_forms = [(f"{named} ($position)", 0), (f"{named} ($pos)", 0), (named, 0)]
         else:
             source_forms = [(named, 0)]
         if resource is None:
@@ -3432,33 +3331,6 @@ class LogScreen(FollowsPointer, Screen):
         under 28 (see _RESOURCE_BAR_ROWS_BY_HEIGHT)."""
         height = getattr(getattr(self.app, "size", None), "height", 0) or 0
         return next(bars for rows, bars in self._RESOURCE_BAR_ROWS_BY_HEIGHT if height >= rows)
-
-    def _resource_keys(self, width: int = 0) -> str:
-        """The key help, fitted to ``width`` (any length when 0), with only the keys that do something.
-
-        ``space`` shows with two or more sub-jobs, ``↑↓`` with more than one GPU or
-        node in the view. Too wide, the window key goes to its narrow form
-        (``w window``); then whole entries are left out from the end, and the line
-        ends in ``…``.
-        """
-        extra = []
-        if len(self._resource_sub_job_ids()) > 1:
-            extra.append("space sub-job")
-        resource = self._resource_kind_data()
-        if resource is not None and len(resource.units) > 1:
-            extra.append("↑↓ GPU" if self._resource_kind == GPU else "↑↓ node")
-        full = [entry for entry, _narrow in self._RESOURCE_KEY_HELP] + extra
-        narrow = [entry for _full, entry in self._RESOURCE_KEY_HELP] + extra
-        gap = "   "
-        for entries in (full, narrow):
-            line = gap.join(entries)
-            if width <= 0 or views.cell_width(line) <= width:
-                return line
-        for count in range(len(narrow) - 1, 0, -1):
-            line = gap.join(narrow[:count]) + gap + "…"
-            if views.cell_width(line) <= width:
-                return line
-        return views.fit_cells(narrow[0], width)
 
     def _resource_charts(self, resource: KindResource, view: KindView, width: int, complete: bool,
                          missing: str | None) -> Content:
@@ -3542,7 +3414,6 @@ class LogScreen(FollowsPointer, Screen):
             status = self.query_one("#resource-status", Static)
             stats = self.query_one("#resource-stats", Static)
             charts = self.query_one("#resource-charts", Static)
-            keys = self.query_one("#resource-keys", Static)
         except NoMatches:
             return
         source = self._resource_source()
@@ -3566,7 +3437,6 @@ class LogScreen(FollowsPointer, Screen):
             if retry_layout:
                 after_refresh(self, self._render_resource, retry_layout=False)
             return
-        keys.update(Content(self._resource_keys(keys.content_size.width or pane_width)))
         if resource is None:
             status.update(self._resource_status(None, pane_width) if source else self._resource_no_source_text())
             stats.update("")
@@ -3728,7 +3598,7 @@ class LogScreen(FollowsPointer, Screen):
         self._render_log_status()
 
     # ─── export / copy ───────────────────────────────────────────────────
-    # The most a copy of the whole log (ctrl+c or a right-click, nothing highlighted) takes. OSC 52 carries the text
+    # The most a copy of the whole log (ctrl+c, nothing highlighted) takes. OSC 52 carries the text
     # base64-encoded in one escape sequence; many terminals drop a much bigger
     # one without a word, and writing it holds the screen up meanwhile.
     _COPY_MAX_BYTES = 1024 * 1024
@@ -3869,7 +3739,7 @@ class LogScreen(FollowsPointer, Screen):
         self._post(self.app.copy_out, "\n".join(kept), what)
 
     def action_copy_text(self) -> None:
-        """ctrl+c or a right-click, on every tab: what the mouse highlighted, else
+        """ctrl+c, on every tab: what the mouse highlighted, else
         everything the tab holds: the log (its newest lines, up to the cap) on Logs; on
         Resources the panel, the header, every stats row and every chart."""
         if self.app.copy_highlight(self):
@@ -5806,7 +5676,7 @@ class CortexTrainingLogTUI(App):
     /* In the table's place (never shown with it), so the search box stays at the bottom. */
     #nomatch-box { height: 1fr; scrollbar-gutter: stable; }
     #nomatch { padding: 1 2; color: $warning; height: auto; }
-    /* The fixed marker and name columns look like the rest of the row. */
+    /* The fixed marker and job id columns look like the rest of the row. */
     #jobs > .datatable--fixed { background: $surface; }
     #searchhelp { padding: 0 1; height: auto; }
     #sources { width: 16; border-right: solid $panel; }
@@ -5830,7 +5700,6 @@ class CortexTrainingLogTUI(App):
     /* Drawn to the pane's width: a line that is momentarily wider (before a resize
        settles) is clipped, never wrapped into taller charts. */
     #resource-charts { height: auto; margin-top: 1; text-wrap: nowrap; text-overflow: clip; }
-    #resource-keys { color: $text-muted; height: 1; padding: 0 1; dock: bottom; }
     /* The scrollbar's room is kept while the preview fits, so its text never changes
        width (and re-wraps at the edge) when a refresh makes it scroll. */
     #summary-body { padding: 1 1; scrollbar-gutter: stable; }
@@ -5838,9 +5707,6 @@ class CortexTrainingLogTUI(App):
     #health { height: auto; margin: 1 0; }
     #subjobs-title { height: auto; margin-top: 1; }
     #subjobs { height: auto; max-height: 12; margin: 0 1; }
-    PromptScreen { align: center middle; }
-    #prompt { width: 80; height: auto; border: thick $accent; background: $surface; padding: 1 2; }
-    #prompt-hint { color: $text-muted; }
     /* Text-selection highlight: reuse the table's subtle "blurred cursor"
        shade so it's visible but not a heavy saturated block. */
     LogScreen > .screen--selection {
@@ -5884,18 +5750,14 @@ class CortexTrainingLogTUI(App):
         self._clients = JobClients(client)
         self._lister = JobLister(client, schema_only=schema_only)
         self._heap_frozen = False
-        # A left-button press that can start a text selection, whether it has moved since,
-        # and whether the mouse-up that ended it was a drag (see on_event, on_text_selected).
+        # A left-button press, and whether it has moved since (see on_event).
         self._press_at = None
-        self._press_selects = False
         self._press_moved = False
-        self._copy_selection = False
         self._copy_note: Notification | None = None  # the last copy's note (see copy_out)
         self._copy_what: str | None = None  # while copy_out copies: what its note calls the text
         # This machine's clipboard takes one copy at a time, in order (see _copy_locally).
         self._copy_lock = threading.Lock()
         self._copies = 0  # copies started so far: the last one is the one the clipboard keeps
-        self._press_input: Input | None = None  # a text box a left-button press went to
         self._press_table = False  # a press on a table, which tells its own clicks from its drags
         self._dragged = False  # the last press moved before its release
         self._confine: Widget | None = None  # the scrolling area a drag stays in (see _confine_drag)
@@ -5904,7 +5766,7 @@ class CortexTrainingLogTUI(App):
 
     def check_action(self, action: str, parameters) -> bool | None:
         if action == "quit" and isinstance(self.focused, Input):
-            return False  # a letter in a search, filter or prompt
+            return False  # a letter in a search or filter
         return True
 
     def copy_to_clipboard(self, text: str) -> None:
@@ -5940,7 +5802,6 @@ class CortexTrainingLogTUI(App):
                 pass
 
     _COPY_NOTE_SECONDS = 3
-    _BLOCK_COPY_SECONDS = 0.15  # after a click, when a double or triple click's block is copied
     _SENT_NOTE_SECONDS = 8  # the note when only the terminal's clipboard got it: longer, with a tip
 
     def copy_out(self, text: str, what: str) -> None:
@@ -6003,16 +5864,6 @@ class CortexTrainingLogTUI(App):
         :func:`cortex_training.tui.clipboard.screen_dump`)."""
         text = screen_dump(screen)
         self.copy_out(text, f"{what} ({text.count(chr(10)) + 1 if text else 0:,} lines)")
-
-    def on_text_selected(self, event) -> None:
-        """Highlighting is copying: what a drag over text selected goes to the clipboard
-        when the button comes up, on every screen, so Cmd-V (or right-click, paste)
-        has it. Textual sends this on every mouse-up: a click, or a drag that began on
-        a scrollbar, a table or a note, copies nothing (see on_event)."""
-        if self._copy_selection:
-            self._copy_selection = False
-            if selected_text(self.screen):
-                self.copy_highlight(self.screen)
 
     def action_toggle_keys(self) -> None:
         """``?``: show the keys panel, or close it."""
@@ -6098,10 +5949,8 @@ class CortexTrainingLogTUI(App):
             await super().on_event(event)
             return
         if event.button == 3 and isinstance(event, (events.MouseDown, events.MouseUp)):
-            # A right-click copies, as ctrl+c does. Textual would take it for a click:
+            # A right-click does nothing. Textual would take it for a click:
             # one clears the highlight, and moves a table's cursor or picks an item.
-            if isinstance(event, events.MouseUp):
-                await self.run_action("screen.copy_text")
             return
         self._footer_wander(event)
         if self._footer_click(event):
@@ -6122,7 +5971,6 @@ class CortexTrainingLogTUI(App):
             screen.ALLOW_SELECT = False
             screen.clear_selection()
             self._clear_picked()
-            self._press_selects = False
         try:
             await super().on_event(event)
         finally:
@@ -6130,12 +5978,6 @@ class CortexTrainingLogTUI(App):
                 del screen.ALLOW_SELECT
         if keep and kept and not self.screen.selections:
             self.screen.selections = kept  # a click on a note or the footer: the highlight stays
-        if isinstance(event, events.MouseUp) and not self._dragged:
-            # A double or triple click selects a block (Textual's select-all): copied, as
-            # what a drag selects is, once the click has been handled (a little later
-            # when clicks come in a burst).
-            self.set_timer(self._BLOCK_COPY_SECONDS, partial(self._copy_new_selection, self.screen,
-                                                             self.screen.selections, 5))
 
     def _footer_wander(self, event: events.MouseEvent) -> None:
         """A press on a footer key that moves two cells along it, or off its row, is a drag:
@@ -6213,7 +6055,7 @@ class CortexTrainingLogTUI(App):
 
     def _track_press(self, event: events.MouseEvent) -> bool:
         """Follow a press (left or middle button) to its mouse-up: whether it dragged over
-        text (on_text_selected copies it), or was a click, which drops rows a drag picked
+        text, or was a click, which drops rows a drag picked
         in a table, as it drops a highlight. False for a click on a note or the footer."""
         if event.button not in (1, 2) and not isinstance(event, events.MouseMove):
             return True
@@ -6222,12 +6064,9 @@ class CortexTrainingLogTUI(App):
             self._press_at = event.screen_offset
             self._press_moved = self._dragged = False
             self._press_table = isinstance(widget, PickableTable)
-            # A text box selects its own text with the mouse (see on_event's mouse-up).
-            self._press_input = widget if isinstance(widget, Input) else None
             # As Textual decides it: a selection starts on a widget that allows one.
-            self._press_selects = (widget is not None and widget.allow_select and not self.mouse_captured
-                                   and self.screen.allow_select and self.ALLOW_SELECT)
-            if self._press_selects:
+            if (widget is not None and widget.allow_select and not self.mouse_captured
+                    and self.screen.allow_select and self.ALLOW_SELECT):
                 self._clear_picked()  # one highlight at a time
         elif isinstance(event, events.MouseMove):
             if self._press_at is not None and event.button in (1, 2) and event.screen_offset != self._press_at:
@@ -6235,11 +6074,6 @@ class CortexTrainingLogTUI(App):
         elif isinstance(event, events.MouseUp):
             pressed, self._press_at = self._press_at, None
             self._dragged = pressed is not None and self._press_moved
-            self._copy_selection = self._dragged and self._press_selects
-            box, self._press_input = self._press_input, None
-            if self._dragged and box is not None:
-                # A drag in a text box selected some of its text: copied too, once the box has it.
-                self.call_after_refresh(self._copy_box_selection, box)
             if pressed is not None and not self._press_moved:
                 if self._on_footer(event):
                     return False
@@ -6255,19 +6089,6 @@ class CortexTrainingLogTUI(App):
             return False
         widget, offset = self.screen.get_widget_and_offset_at(event.x, event.y)
         return widget is not None and offset is None and widget.is_container and widget.allow_select
-
-    def _copy_new_selection(self, screen: Screen, after_click, tries: int = 0) -> None:
-        if screen is not self.screen or self._press_at is not None:
-            return  # another screen, or another press since
-        if screen.selections and screen.selections is not after_click:
-            self.copy_highlight(screen)
-        elif tries:  # the click may not have been handled yet
-            self.set_timer(self._BLOCK_COPY_SECONDS, partial(self._copy_new_selection, screen, after_click, tries - 1))
-
-    def _copy_box_selection(self, box: Input) -> None:
-        text = box.selected_text if box.is_attached else ""
-        if text:
-            self.copy_out(text, f"{len(text):,} characters")
 
     def _clear_picked(self) -> None:
         for table in self.screen.query(PickableTable):

@@ -39,15 +39,15 @@ def _matches(text: str) -> list:
 
 
 def test_quotes_group_words_and_a_wholly_quoted_token_is_a_word():
-    query = parse_query("name:\"lora sweep\" model:'qwen3 8b' \"training:0\"")
-    assert query.filters == [("name", ":", "lora sweep"), ("model", ":", "qwen3 8b")]
+    query = parse_query("owner:\"lora sweep\" model:'qwen3 8b' \"training:0\"")
+    assert query.filters == [("owner", ":", "lora sweep"), ("model", ":", "qwen3 8b")]
     assert query.terms == ["training:0"] and not query.errors  # quoted: the text, not a filter
 
 
 def test_an_unbalanced_quote_leaves_every_word_as_typed():
     assert parse_query('lora "sweep 3').terms == ["lora", '"sweep', "3"]
     assert parse_query("bob's run").terms == ["bob's", "run"]  # an apostrophe opens no quote
-    assert parse_query('name:"lora sweep').filters == [("name", ":", '"lora')]
+    assert parse_query('owner:"lora sweep').filters == [("owner", ":", '"lora')]
 
 
 def test_a_dotted_key_reads_that_member_in_any_case():

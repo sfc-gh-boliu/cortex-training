@@ -20,9 +20,7 @@ Flow: job list → :class:`JobSummaryScreen` (preview + sub-jobs) →
 whole job or one sub-job.
 
 Everything here is read-only against the service. The only writes are local:
-job display names (:class:`~cortex_training.tui.stores.AliasStore`) and the GPU
-telemetry download cache. A job's name is its local alias, else its id; the
-preview shows its whole ``comment`` too.
+the GPU telemetry download cache.
 """
 
 from __future__ import annotations
@@ -37,15 +35,12 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.content import Content
-from textual.containers import Vertical
 from textual.containers import VerticalScroll
-from textual.screen import ModalScreen
 from textual.screen import Screen
 from textual.widgets import DataTable
 from textual.widgets import Footer
 from textual.widgets import Header
 from textual.widgets import Input
-from textual.widgets import Label
 from textual.widgets import Static
 from textual.widgets import TabbedContent
 from textual.widgets import TabPane
@@ -67,8 +62,6 @@ from cortex_training.tui.format import one_line
 from cortex_training.tui.format import safe_text
 from cortex_training.tui.format import source_label
 from cortex_training.tui.resource import RANGES
-from cortex_training.tui.stores import ALIAS_MAX_CHARS
-from cortex_training.tui.stores import AliasStore
 
 # Rich's grey62, by value: Textual's markup and styles (the preview's Content)
 # don't know that name and would draw the default color instead.
@@ -120,12 +113,6 @@ _TABLE_FITS = (
     ((), ((_MODEL, 36), (_CONFIG, 24))),
     ((_TYPE,), ((_MODEL, 36), (_CONFIG, 24), (_MODEL, 10), (_CONFIG, 12))),
 )
-
-
-def _rows_of(content, width: int) -> int:
-    """The screen rows ``content`` takes in ``width`` cells, the ones it wraps onto included."""
-    wrap = getattr(content, "wrap", None)
-    return len(wrap(max(1, width))) if wrap is not None else len(str(content).split("\n"))
 
 
 def _column_widths(labels, rows: list) -> list:
@@ -203,62 +190,6 @@ def _fit_text(text: Text, width: int) -> Text:
     return Text(cut[:-1].rstrip(" ·") + "…", style=text.style)
 
 
-class PromptScreen(FollowsPointer, ModalScreen):
-    """One-line text prompt; dismisses with the entered text, or ``None`` on Esc."""
-
-    BINDINGS = [
-        ("escape", "cancel", "Cancel"),
-        # Ahead of the box's own ctrl+c, which copies the text selected in it, and the
-        # box selects its text as the prompt opens: a highlight the mouse made since wins.
-        Binding("ctrl+c", "copy_text", "Copy", show=False, priority=True),
-    ]
-
-    def __init__(self, title: str, value: str = "", placeholder: str = "", *, max_length: int = 0) -> None:
-        """``max_length``: the most characters the text may have (0: no limit); the hint says so."""
-        super().__init__()
-        self._title = title
-        self._value = value
-        self._placeholder = placeholder
-        self._max_length = max_length
-        self._done = False
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="prompt"):
-            yield Label(Content(self._title), id="prompt-title")
-            yield Input(value=self._value, placeholder=self._placeholder, id="prompt-input",
-                        max_length=self._max_length)
-            limit = f" · up to {self._max_length} characters" if self._max_length else ""
-            yield Label(f"Enter to save · Esc to cancel{limit}", id="prompt-hint")
-
-    def on_mount(self) -> None:
-        self.set_focus(self.query_one("#prompt-input", Input))
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        self._finish(event.value)
-
-    def action_copy_text(self) -> None:
-        """ctrl+c or a right-click: what the mouse highlighted, else the text selected in
-        the box, else what the prompt shows (as a copy does on every other screen)."""
-        if self.app.copy_highlight(self):
-            return
-        box = self.query_one(Input)
-        if box.selected_text:
-            self.app.copy_out(box.selected_text, f"{len(box.selected_text):,} characters")
-        else:
-            self.app.copy_everything(self, "the prompt")
-
-    def action_cancel(self) -> None:
-        self._finish(None)
-
-    def _finish(self, value) -> None:
-        # Once. Two quick Enters submit twice, and dismiss() pops whatever screen is
-        # on top: the second would close the screen under this prompt.
-        if self._done or not is_shown(self):
-            return
-        self._done = True
-        self.dismiss(value)
-
-
 # ─── job preview ─────────────────────────────────────────────────────────────
 
 
@@ -273,17 +204,16 @@ class JobSummaryScreen(FollowsPointer, Screen):
         KEYS_BINDING,
         ("l", "open('logs')", "Logs"),
         ("g", "open('resource')", "Resources"),
-        ("n", "rename", "Name job"),
         ("r", "refresh", "Refresh"),
         # One key, two bindings: check_action enables the one that applies, and the
         # footer shows only that one, and only while a value is too long to show
-        # whole. Last, so a narrow footer cuts it rather than r or q (the comment's
+        # whole. Last, so a narrow footer cuts it rather than r or q (a cut value's
         # note names the key too).
         Binding("e", "expand_values", "Full text"),
         Binding("e", "collapse_values", "Less text"),
     ]
 
-    def __init__(self, client, job_id: str, *, job: dict | None = None, aliases: AliasStore | None = None,
+    def __init__(self, client, job_id: str, *, job: dict | None = None,
                  poll_interval: float = 1.0, on_job=None) -> None:
         """``on_job(record)`` is called with the job each time a fresh read of it
         arrives (the job list then shows that status too)."""
@@ -292,7 +222,6 @@ class JobSummaryScreen(FollowsPointer, Screen):
         self._job_id = job_id
         self._job = job or {"job_id": job_id}
         self._on_job = on_job
-        self._aliases = aliases or AliasStore()
         self._poll_interval = poll_interval
         # A thread can't be cancelled, so never stack a second fetch.
         self._loading = False
@@ -321,9 +250,8 @@ class JobSummaryScreen(FollowsPointer, Screen):
         table = self.query_one("#subjobs", DataTable)
         self._refresh_view()
         self._load()
-        # Focus without scrolling: on a short terminal a long comment would put the
-        # preview's top (the name and comment) above the screen, out of reach of the
-        # keys, which all go to the table.
+        # Focus without scrolling: on a short terminal scrolling to the table would put the
+        # preview's top above the screen, out of reach of the keys, which all go to the table.
         self.set_focus(table, scroll_visible=False)
         self.set_interval(self._REFRESH_SECONDS, self._refresh_tick)
         self.set_interval(1, self._fetch_tick)
@@ -335,15 +263,10 @@ class JobSummaryScreen(FollowsPointer, Screen):
 
     def on_screen_resume(self) -> None:
         self._refresh_view()
-        # Back from the details, which may have seen the status move on: re-read the job
-        # now. Not after the rename prompt: a live get_job can take minutes to answer.
+        # Back from the details, which may have seen the status move on: re-read the job now.
         reread, self._reread_on_resume = self._reread_on_resume, False
         if reread and v.is_live(self._job):
             self._start_fetch()
-
-    @property
-    def _display_name(self) -> str:
-        return v.display_name(self._job, self._aliases.all())
 
     _LABEL_WIDTH = 15  # "  " + a 12-column label + " "
 
@@ -356,7 +279,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
         return max(20, (width or 100) - self._LABEL_WIDTH)
 
     def _value_lines(self, value: str) -> list:
-        """A preview value (the comment, a long GPU line) as the rows it takes,
+        """A preview value (a long GPU line) as the rows it takes,
         wrapped to the value column by terminal cells, so wide (CJK, emoji) text
         stays in it. Printable first: a control character would break the count."""
         width = self._value_width()
@@ -372,38 +295,10 @@ class JobSummaryScreen(FollowsPointer, Screen):
         """Rows of a value, the continuation rows under the value column."""
         return ("\n" + " " * self._LABEL_WIDTH).join(rows)
 
-    # Without e, a value other than the comment shows at most this many rows. The
-    # comment gets the rows the rest of the preview leaves on the screen, and at
-    # least the fewest here, so every field shows when the preview opens.
+    # Without e, a value shows at most this many rows.
     _VALUE_ROWS = 3
-    _COMMENT_ROWS_MIN = 3
     # The line under a value cut short: how many rows it has left, and the key.
     _MORE = "\n" + " " * _LABEL_WIDTH + "[dim](+$more rows · e shows the whole {what})[/dim]"
-    # Rows outside the parts measured in _rows_besides: the header and footer, the
-    # body's top and bottom padding, and the health line's margins, the bottom one
-    # shared with the sub-jobs title's top margin (adjacent margins collapse; the
-    # app's CSS for #summary-body, #health, #subjobs-title).
-    _CHROME_ROWS = 2 + 2 + 2
-
-    def _rows_besides(self, fields: list, health: Content, title: Content, table_rows: int) -> int:
-        """The screen rows everything but the comment takes (``table_rows``: the
-        sub-job table's, its header and any sideways scrollbar included)."""
-        width = self._value_width() + self._LABEL_WIDTH
-        fetch = self.query_one("#fetch", Static)
-        lines = [*fields, health, title, *([fetch.render()] if fetch.display else [])]
-        return self._CHROME_ROWS + sum(_rows_of(line, width) for line in lines) + table_rows
-
-    def _comment_rows(self, rows: list, besides: int) -> tuple:
-        """``(rows to show, rows left out, too long)`` for the comment: all of it
-        when it fits in the screen rows the rest leaves (or with e), else as many
-        as do (at least a few), with one more for the note that says so."""
-        room = (self.size.height or self.app.size.height) - besides
-        if len(rows) <= max(room, self._COMMENT_ROWS_MIN):
-            return rows, 0, False
-        if self._expanded:
-            return rows, 0, True
-        keep = max(self._COMMENT_ROWS_MIN, room - 1)
-        return self._cut_rows(rows, keep), len(rows) - keep, True
 
     def check_action(self, action: str, parameters) -> bool | None:
         if action == "expand_values":
@@ -425,19 +320,13 @@ class JobSummaryScreen(FollowsPointer, Screen):
     def _refresh_view(self) -> None:
         job = self._job
         if self.app.screen is self:  # a late load must not retitle the details on top
-            self.app.sub_title = f"job preview  ·  {v.shown_name(job, self._aliases.all())}"
+            self.app.sub_title = f"job preview  ·  {v.job_id_of(job)}"
         now = _now()
         rows = []
-        name = self._display_name
-        hint = "local name on this machine · n renames" if name else "no name · press n to name this job"
-        name_hint = f"  [dim]({hint})[/dim]"
-        # Keep the one-line name and its hint on one line of the preview (cells, not characters).
-        name = v.one_line(name, max(20, self._value_width() - v.cell_width(hint) - 4)) if name else name
-        # Values (names, comments, ids) are user or server text: pass them as
+        # Values (ids, models, owners) are user or server text: pass them as
         # $variables so they are shown literally, never parsed as markup.
-        comment = None  # (its place in rows, its rows): it gets what the rest leaves
         long = False
-        for label, value in v.summary_fields(job, name, now):
+        for label, value in v.summary_fields(job, now):
             more = 0  # rows of the value left out
             if label == "Status":
                 word = v.status_word(job.get("status"))
@@ -447,14 +336,9 @@ class JobSummaryScreen(FollowsPointer, Screen):
                 else:
                     live = "  [green]● live[/green]" if v.is_live(job) else "  [dim]historical[/dim]"
                 value_markup = (f"[{style}]$value[/]" if style else "$value") + live
-            elif label == "Name":
-                value_markup = ("[b]$value[/b]" if name else "[dim]$value[/dim]") + name_hint
             else:
-                # A long value (the comment, a GPU line naming another job) continues under the column.
+                # A long value (a GPU line naming another job) continues under the column.
                 lines = self._value_lines(value)
-                if label == "Comment":
-                    comment = (len(rows), lines)
-                    continue
                 if len(lines) > self._VALUE_ROWS:
                     long = True
                     if not self._expanded:
@@ -490,19 +374,6 @@ class JobSummaryScreen(FollowsPointer, Screen):
             hints.append("← → scroll")
         title = self._subjobs_title(hints, width)
         self.query_one("#subjobs-title", Static).update(title)
-        if comment is not None:
-            # The whole comment when the screen has the rows for it, else its start and a note.
-            at, lines = comment
-            limit = table.styles.max_height
-            table_rows = len(fitted) + 1 + (1 if wider else 0)  # its header, and its sideways scrollbar
-            if limit is not None and limit.is_cells:
-                table_rows = min(table_rows, int(limit.value))
-            shown, more, too_long = self._comment_rows(
-                lines, self._rows_besides(rows, health, title, table_rows))
-            long = long or too_long
-            note = self._MORE.format(what="comment") if more else ""
-            rows.insert(at, Content.from_markup(f"  [dim]{'Comment':<12}[/dim] $value{note}",
-                                                value=self._value_block(shown), more=str(more)))
         self.query_one("#preview", Static).update(Content("\n").join(rows))
         if long != self._long:
             self._long = long
@@ -587,15 +458,15 @@ class JobSummaryScreen(FollowsPointer, Screen):
         return width
 
     def on_resize(self, event) -> None:
-        if self.query_one("#subjobs", DataTable).columns:  # mounted: re-wrap the comment, refit the table
+        if self.query_one("#subjobs", DataTable).columns:  # mounted: re-wrap the values, refit the table
             after_refresh(self, self._refresh_view)
 
     # Keys the sub-job table moves its cursor with.
     _TABLE_MOVES = {"up", "down", "pageup", "pagedown", "ctrl+home", "ctrl+end"}
 
     def on_key(self, event) -> None:
-        # The preview opens at its top (name and comment) and the keys go to the
-        # sub-job table, which a long comment can push below the screen: bring the
+        # The preview opens at its top and the keys go to the
+        # sub-job table, which a short terminal can leave below the screen: bring the
         # table into view once its cursor moves, and go back to the top on up from
         # its first row, or ctrl+home.
         table = self.query_one("#subjobs", DataTable)
@@ -747,7 +618,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
         return self._scope_by_row.get(key) or (self._job_id if key == "all" else None)
 
     def action_copy_text(self) -> None:
-        """ctrl+c or a right-click: what the mouse highlighted, else the whole preview."""
+        """ctrl+c: what the mouse highlighted, else the whole preview."""
         if not self.app.copy_highlight(self):
             self.app.copy_everything(self, "the preview")
 
@@ -773,26 +644,13 @@ class JobSummaryScreen(FollowsPointer, Screen):
         self._reread_on_resume = True
         self.app.push_screen(
             JobDetailScreen(self._client, self._job_id, job=self._job, sub_job_id=sub_job_id, initial_tab=tab,
-                            aliases=self._aliases, poll_interval=self._poll_interval)
+                            poll_interval=self._poll_interval)
         )
-
-    def action_rename(self) -> None:
-        if not is_shown(self):
-            return
-
-        def done(value):
-            if value is not None:
-                self._aliases.set(self._job_id, v.alias_to_store(self._job, value))
-                self._refresh_view()
-
-        current, placeholder = v.rename_prompt(self._job, self._aliases.all())
-        self.app.push_screen(PromptScreen(f"Display name for {self._job_id}", current, placeholder,
-                                          max_length=ALIAS_MAX_CHARS), done)
 
 
 # ─── job detail (tabs) ───────────────────────────────────────────────────────
 
-# Copying (ctrl+c, a right-click) works on every tab, what the mouse highlighted or else everything the tab holds: not here.
+# Copying (ctrl+c) works on every tab, what the mouse highlighted or else everything the tab holds: not here.
 _LOG_ONLY = {"save_log", "cycle_level", "toggle_pause", "shrink_sources", "grow_sources", "filter"}
 # Pane ids match LogScreen's ("logs", "resource"), so its tab logic applies as-is.
 _TAB_IDS = ("logs", "resource")
@@ -811,40 +669,29 @@ class JobDetailScreen(LogScreen):
     the handlers here never call ``super()`` for them.
     """
 
-    # 2 and 3 are one footer entry ("23 Tabs"), in the places LogScreen keeps for
-    # them, after Back and Quit. The preview's letters open the same tabs here;
+    # The preview's letters open the same tabs here;
     # on Logs, l cycles the level instead (LogScreen's binding comes first, and
     # check_action turns it off on the other tabs).
     # w takes LogScreen's place for it, ahead of the Resources tab's sub-job keys.
-    _TABS = Binding.Group("Tabs", compact=True)
     BINDINGS = [
-        Binding("2", "show_tab('logs')", "Logs", group=_TABS),
-        Binding("3", "show_tab('resource')", "Resources", group=_TABS),
         # On Logs, l cycles the level (check_action turns it off elsewhere, where l opens Logs).
         Binding("l", "cycle_level", "Level"),
         Binding("l", "show_tab('logs')", "Logs", show=False),
         Binding("g", "show_tab('resource')", "Resources", show=False),
         Binding("w", "cycle_window", "Window"),
-        # Keep the footer readable next to the tab keys; these still work (? lists them).
-        Binding("[", "shrink_sources", "Narrower", show=False),
-        Binding("]", "grow_sources", "Wider", show=False),
     ]
     _DATA_REFRESH_SECONDS = 30
     _STATUS_REFRESH_SECONDS = 60
     _SUBTITLE_REASON = False  # the summary line shows reason and reason_details
-    # On a narrow line, w leaves out the windows' names: the header names the window shown.
-    _RESOURCE_KEY_HELP = ((f"w window {' · '.join(RANGES)}", "w window"), ("r refresh", "r refresh"))
 
     def __init__(self, client, job_id, *, job: dict | None = None, sub_job_id=None, initial_tab: str = "logs",
-                 aliases: AliasStore | None = None, poll_interval=1.0,
-                 job_status=None) -> None:
+                 poll_interval=1.0, job_status=None) -> None:
         super().__init__(client, job_id, sub_job_id=sub_job_id, poll_interval=poll_interval,
                          job_status=job_status or (job or {}).get("status"))
         self._job = job or {"job_id": job_id}
         self._scope = sub_job_id
         self._initial_tab = initial_tab if initial_tab in _TAB_IDS else "logs"
         self._active_tab = self._initial_tab
-        self._aliases = aliases or AliasStore()
 
     # ── layout ──
     def compose(self) -> ComposeResult:
@@ -865,14 +712,11 @@ class JobDetailScreen(LogScreen):
     def on_screen_resume(self) -> None:
         self._update_subtitle()  # a screen pushed over this one may have replaced it
 
-    # The fewest cells the name and the models are cut to so the summary line fits on one row.
+    # The fewest cells the models are cut to so the summary line fits on one row.
     _SUMMARY_LEAST = 12
 
     def _render_summary_line(self) -> None:
         job = self._job
-        # Short here: this line also carries the id, scope, type, models and reason;
-        # the preview shows the whole name.
-        name = v.one_line(v.display_name(job, self._aliases.all()), 48)
         job_id = v.job_id_of(job) or self._job_id
         # A sub-job's id starts with its job's (JOB_ID:TYPE:INDEX): name it once.
         if not self._scope:
@@ -891,9 +735,9 @@ class JobDetailScreen(LogScreen):
         elsewhere = getattr(self.app, "job_elsewhere", None)
         location = v.location_label(job) if not callable(elsewhere) or elsewhere(job) else ""
         least = self._SUMMARY_LEAST
-        # The name, then the models, are cut to keep the line on one row; the ids,
+        # The models are cut to keep the line on one row; the ids,
         # the location and the reason stay whole.
-        segments = [*([(name, "bold", least)] if name else []), *((text, "", None) for text in ids),
+        segments = [*((text, "", None) for text in ids),
                     (v.job_type_label(job), "", None), (", ".join(v.job_models(job)) or "—", "", least),
                     *([(location, "", None)] if location else []), *([(why, style, None)] if why else [])]
         self._set_summary(fit_line(segments, self._summary_width()))
@@ -980,7 +824,7 @@ class JobDetailScreen(LogScreen):
         if action in _LOG_ONLY:
             return tab == "logs"
         if action == "resource_range":
-            return False  # digits pick tabs here, not windows; w cycles the Resources window
+            return False  # digits do nothing here; w cycles the Resources window
         if action == "cycle_window":
             return tab == "resource"
         if action == "resource_sub_job":

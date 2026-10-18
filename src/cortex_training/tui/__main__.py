@@ -336,15 +336,13 @@ def _run_demo(args, app_class, *, account_list: str | None = None) -> int:
     import tempfile
 
     from cortex_training.tui.demo import DemoClient
-    from cortex_training.tui.stores import AliasStore
 
     previous = os.environ.get("CORTEX_TRAINING_TUI_CACHE_DIR")
     with tempfile.TemporaryDirectory(prefix="cortex-training-demo-") as cache:
-        # Demo names and caches must never land in the real cache dir.
+        # Demo caches must never land in the real cache dir.
         os.environ["CORTEX_TRAINING_TUI_CACHE_DIR"] = cache
         try:
             client = DemoClient(account_list=account_list)
-            client.seed_local(aliases=AliasStore())
             app = app_class(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=args.poll_interval,
                             schema_only=args.schema_only)
             app.title = "cortex training (debug)"  # synthetic jobs: say so on every screen

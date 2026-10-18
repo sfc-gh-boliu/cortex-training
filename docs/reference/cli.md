@@ -807,7 +807,7 @@ Pass `--sub-job-id JOB_ID:training:0` to scope the job details to one matching
 sub-job; without `JOB_ID`, it opens that sub-job's job. An unmatched id is
 shown as an error, with the job's sub-job ids, rather than falling back to a
 different sub-job. `--debug` runs against generated jobs and telemetry, and
-keeps its names and caches in a temporary directory; the
+keeps its caches in a temporary directory; the
 title says `(debug)`. Its jobs are in three locations: the configured
 `CORTEX_TRAINING_DB.PUBLIC`, `TEAM_DB.EXPERIMENTS`, and a lowercase
 `"sandbox"."dev"`. It runs on the wall clock: live jobs keep logging (in the
@@ -856,9 +856,8 @@ never walks the whole history. It asks for no status, so jobs whose status the
 service can't read (`unknown`) are listed too. When it stops with jobs left, it
 also reads the active jobs (`pending`, `placing`, `initializing` and `running`,
 through the same list with `status=active` and the same bounds) and adds those
-created before the newest ones, so a long-running job stays under live. The
-line under the header counts them, for example `newest 2,000 jobs + 3 older
-active`. An `unknown` job older than the newest 2,000 is not listed, as a
+created before the newest ones, so a long-running job stays under live.
+An `unknown` job older than the newest 2,000 is not listed, as a
 status filter leaves those out, and if reading the active jobs fails or is cut
 short too, the header says `older active jobs may be missing`.
 A walk that stops at 20 pages with no job to show says that more may exist and
@@ -922,7 +921,7 @@ When the list holds jobs from more than one database and schema, a
 **Location** column after GPUs shows each job's `DB.SCHEMA`, each name
 double-quoted when it is not a plain uppercase identifier, as SQL needs it
 (`TEAM_DB.EXPERIMENTS`, `"ml"."dev"`). It comes after the columns that fill a
-140-column terminal: on one narrower than about 170 columns, scroll right to see
+136-column terminal: on one narrower than about 168 columns, scroll right to see
 it. The job preview shows
 the location too, and the job's details line names it, after the models, when
 it isn't the configured location. The column is hidden while every job shares
@@ -938,31 +937,29 @@ tab says where it looked and to pass the job's `--database` and `--schema`.
 
 The TUI asks the account-level list only for jobs created in the last six
 months. The configured schema's list has them all, so the list hides those
-itself and counts them in the header (`1 older hidden`). Live jobs (`pending`,
+itself. Live jobs (`pending`,
 `queued`, `placing`, `initializing`, `creating` and `running`, with a green `●`;
 and `unknown`, with a yellow `?`, which means the service could not read the
 job's live state, so it may still be running) are grouped first. Finished jobs
 (`failed`, `cancelled`, `terminated`, `done`, and any other status) follow under
 history with `○`, and so does an `unknown` job the service says the control
 plane has no record of (`the job was not found in the Control Plane`). Sorted
-by status with ended jobs first (`status ↑ ended first`), history comes first.
-The `LIVE` and `HISTORY` rows give their count and what they hold; where the Name
+by status with ended jobs first (`status ↑`), history comes first.
+The `LIVE` and `HISTORY` rows give their count and what they hold; where the Job ID
 column is too narrow for that, it goes on in the columns after it, so it is
-never cut. Each row shows display name, short job id, status, type, created
+never cut. Each row shows job id, status, type, created
 time and owner, then model, requested GPUs, location (when the list spans more
 than one) and updated time. Sorted by updated on a terminal too narrow for the
 Updated column to be in view, the two times swap places, so the sorted time
 shows beside the type. The owner is
 the submitting user; a job that records none shows its owning role, dimmed, as
 `role ROLE`. Every column has its full width when they all fit; otherwise the
-dates drop the year (`10-15 14:05`: the list spans six months), and the Name
-column narrows, to 16 cells at least, until name, id, status, type, the time
+dates drop the year (`10-15 14:05`: the list spans six months), and the Job ID
+column narrows, to 16 cells at least, until job id, status, type, the time
 after it and owner fit (100 columns is enough). The rest scroll into view with
 `→`/`←` (on a row with sub-jobs to unfold or fold, those come first), the
-marker and the name staying in place. The Name column takes the
-width a wide terminal has spare once every column fits, and a name longer than
-the column ends in `…`. A sub-job row's Job ID is the sub-job id after the
-job's (`training:0`). The GPUs column is what the job requested (see the job preview
+marker and the job id staying in place. The Job ID column fits a whole job id;
+narrowed, an id ends in `…`. The GPUs column is what the job requested (see the job preview
 below): `shared` for a job whose sub-jobs all run on another job's GPUs and
 on a sub-job row multiplexed onto another job's sub-job (it requests none of
 its own, whatever its config's `n_gpus` says, as the preview's GPUs line and
@@ -970,7 +967,7 @@ the Resources tab count it too), and `0` for a `log_probability` sub-job. The
 list and the preview
 call such a sub-job `log_prob #N`, as its sub-job id spells it, and a job with
 training and log_prob sub-jobs `train+logprob` (`train+sample` for training and
-sampling). A job with sub-jobs shows `▸` before its name while folded and
+sampling). A job with sub-jobs shows `▸` before its job id while folded and
 `▾` while its sub-job rows show under it. Live jobs start unfolded. A click on
 the `▸`/`▾` unfolds or folds the job (a click anywhere else on a row
 highlights it, and a second click opens it); so do `→` and `←` on its row, and
@@ -983,30 +980,17 @@ switches to every location, by "a lists every database and schema". A walk
 cut short with no job to show says "The account-wide list returned no jobs to
 show in its first 20 pages; more may exist" instead.
 
-A job's display name is its local name if you set one, else its job id. Press
-`n` on a job to give it a local name (up to 80 characters); the prompt starts
-from the local name, if it has one. Local names persist in `aliases.json` in
-the TUI cache directory, are shared by every TUI session on that machine, and
-are not visible to anyone else. A job's server `comment` shows after its name,
-dimmed (trimmed, and cut with `…` when it is long or has more lines); it is
-never the job's name. Names and comments are measured in terminal cells,
-so wide (CJK, emoji) text is cut and wrapped to fit too.
-
 A job whose status is `unknown` has no live state: the service could not reach
 the control plane. Its row shows no times (the account-level list keeps its
 creation time, and a job that turns `unknown` keeps the one it was listed with,
 and its place in the order; a row of the configured schema's list that was
-`unknown` from the start has none, so it stays in the list, sorted last), and
-a line above the list gives
-the service's sentence once, with the number of such jobs (for example
-`? Job status unavailable: Control Plane is unavailable · 3 jobs`). Expanding
+`unknown` from the start has none, so it stays in the list, sorted last). Expanding
 the job shows "? status unavailable" and the sub-jobs it was created with, their
 ids derived from the job id as `JOB_ID:TYPE:INDEX` (only for an `unknown` row;
 a config without a type is listed as `config #N`). `tui JOB_ID --sub-job-id
 ID` on such a job tries that sub-job even when it can't be listed.
 
-Search with `/`. Plain words match the local name, the whole comment, job id
-(partial), sub-job id, status, owner, GPU type,
+Search with `/`. Plain words match job id (partial), sub-job id, status, owner, GPU type,
 job type (as the Type column shows it, `train+sample`, and as the API spells
 it, `log_probability`) and model, and all words must match. Matching ignores
 case and Unicode spelling: an accented letter typed either way (`é` as one
@@ -1021,7 +1005,7 @@ field. `field<op>value` filters narrow further:
 
 | Field | Meaning |
 |-------|---------|
-| `name`, `id`, `status`, `owner`, `type` | local name, job id, status, user or role, `training`/`sampling`/`log_prob` |
+| `id`, `status`, `owner`, `type` | job id, status, user or role, `training`/`sampling`/`log_prob` |
 | `model`, `method`, `dtype` | model name (`=` takes it whole, `Qwen/Qwen3-8B`, or as the Model column shows it, `Qwen3-8B`), `full` or `lora`, dtype |
 | `gpu`, `gpus` | GPU type (`H200`, `B200`, `B300`), requested GPU count |
 | `optimizer`, `lr`, `batch`, `seq` | optimizer name, learning rate, train batch size, max sequence length |
@@ -1040,7 +1024,7 @@ elements does:
 them does. Examples:
 
 ```text
-sweep
+h200
 model:qwen3-8b method:lora lr<=1e-4
 gpu:b200 gpus>=8 lora_r=32
 training_config.optimizer.name=adamw status:cancelled
@@ -1071,34 +1055,29 @@ field help under the search box shows only while the box has focus.
 |-----|--------|
 | `Enter` | Open the job preview (or, on a sub-job row, that sub-job's details, on the Logs tab; on a "status unavailable" line, its job's preview); in the search box, show the matches of all that was typed and move to the list, where `Enter` opens the highlighted match |
 | `/` / `esc` | Search / clear the search. Keys are taken in the order typed, also when they come faster than the list redraws: what is typed before `Enter` or `esc` is in the search they apply or clear, and the keys after `/`, `Enter` and `esc` go to the search box or the list |
-| `s` / `o` | Sort by created, updated, or status (`succeeded` and `completed` sort with `done`, `canceled` with `cancelled`) / reverse the order. The line above the list says which way it runs: `created ↓ newest first` or `↑ oldest first` (the same for updated; jobs without that time, shown as `—`, come last either way), `status ↓ running first` or `↑ ended first` (history first). The cursor goes to the first job |
+| `s` / `o` | Sort by created, updated, or status (`succeeded` and `completed` sort with `done`, `canceled` with `cancelled`) / reverse the order. The line above the list says which way it runs: `created ↓` for newest first or `↑` for oldest first (the same for updated; jobs without that time, shown as `—`, come last either way), `status ↓` for running first or `↑` for ended first (history first). The cursor goes to the first job |
 | `Home` / `End` | First / last job |
 | `→` / `←` | Unfold the highlighted job's sub-jobs / fold them; on a sub-job row, `←` folds its job and moves to it. The job's row stays where it is on screen, and the list scrolls only as far as an unfolded job's sub-jobs need to show. Where there is nothing to unfold or fold, they scroll the columns sideways |
 | click `▸` / `▾` | Unfold or fold that job, as `→` / `←` do |
 | `e` | Expand or collapse every job's sub-jobs |
 | `a` | All schemas / current schema: switch to the account-level list of every database and schema the role can see (the footer's `a All schemas`), or back to the configured one (`a Current schema`); hidden with `--schema-only` |
-| `n` | Name the highlighted job |
-| `ctrl+c` / right-click | Copy what is highlighted (text, or rows a drag picked, with their whole job ids), else every job in the list; the same in the preview |
+| `ctrl+c` | Copy what is highlighted (text, or rows a drag picked, with their whole job ids), else every job in the list; the same in the preview |
 | `r` | Refresh (the list also refreshes every 60 seconds while it is showing); while it shows the configured schema in place of the account-level list (`Current schema only: DB.SCHEMA (reason)`), `r` asks that list again once a minute has passed since the last ask |
 | `?` | Show or close the keys panel |
 | `q` | Quit |
 
-Every screen's footer starts with Back (`b`) and Quit (`q`), then, in the job
-details, the tab keys, then `?`: a narrow terminal cuts the footer's end, and
+Every screen's footer starts with Back (`b`) and Quit (`q`), then
+`?`: a narrow terminal cuts the footer's end, and
 `?` opens a panel that lists every key that works where you are, including the
 ones the footer has no room for. `esc` closes that panel first, before it
 clears a search or goes back.
 
 #### Job preview
 
-Opening a job shows its local name (or that it has none yet), its comment
-wrapped to the screen, id,
+Opening a job shows its id,
 status (live, historical, or `? status unavailable` for an `unknown` job),
 model, type, owner (`role ROLE` when no submitting user is recorded), requested
-GPUs, creation time, elapsed time, and last update. Every field shows when the preview opens: the
-comment is shown whole when the screen has the rows for it next to everything
-else, and otherwise its first rows (at least three) with a note such as
-`(+16 rows · e shows the whole comment)`; any other value stops after three
+GPUs, creation time, elapsed time, and last update. A value stops after three
 rows with `…` and a note such as `(+62 rows · e shows the whole value)`. `e`
 shows every value whole, and the sub-job table with every column and cell
 whole; `e` again shortens them. The footer offers it too while something is
@@ -1128,7 +1107,7 @@ follow, the same way for every state (for example `reason: quota_filled — need
 disappear once the service stops sending them. An `unknown` job says "Job
 status unavailable" with the service's sentence, and that it may still be
 running unless the service says the job was not found.
-Long values (the comment, a GPU line that names another job, the reason)
+Long values (a GPU line that names another job, the reason)
 wrap under where they start. A character carrying more than four combining
 marks keeps the first four (so-called zalgo text would otherwise draw over the
 rows around it). Below
@@ -1165,9 +1144,9 @@ directly, and do the same in the details.
 The line under the title names the job and its scope, and repeats the
 service's `reason` and `reason_details` (or the `unknown` sentence) while it
 sends them. A sub-job's details name it by its id once (`sub-job
-JOB_ID:training:0`). The line keeps to one row when cutting the name and the
+JOB_ID:training:0`). The line keeps to one row when cutting the
 models with `…` is enough for that, and otherwise wraps between its parts,
-with the reason whole. Switch tabs with `2` (Logs) and `3` (Resources), or `t`
+with the reason whole. Switch tabs with `l` (Logs) and `g` (Resources), or `t`
 for the next tab.
 
 - **Logs** is the live and historical log view described below. Each line is
@@ -1187,7 +1166,7 @@ for the next tab.
   time: the one selected on the Logs tab, until `Space` shows the next one
   (`<` and `>` go back and forth). The tab's header names it, and stays at the top while the
   stats and charts scroll under it; with two or more sub-jobs it also names
-  its place among them (`training #0 (1 of 2 · space switches)`).
+  its place among them (`training #0 (1 of 2)`).
   - A panel on the left, sized to its labels as the Logs tab's sub-job list
     is, lists the two views, `GPU Resources` and `System Resources` (the one
     shown is marked `●`), and under them the shown view's units: `ALL`, the
@@ -1245,7 +1224,7 @@ for the next tab.
   - The header is always two lines, so the stats and charts under it never
     move. On a terminal too narrow for all of it, each line drops detail
     instead of wrapping. On the first, the sub-job's place goes short
-    (`1 of 2 · space switches` becomes `1/2`), then the window to its key's name
+    (`1 of 2` becomes `1/2`), then the window to its key's name
     (`10m`), then away, then the place, then the GPU type (in the System
     view, the nodes' CPUs and memory). On the second, the why of the skipped
     rows, the values-change note and the newest sample's time go first, and a
@@ -1330,12 +1309,7 @@ for the next tab.
     two minutes shows seconds, so no two labels read the same.
   - `w` cycles the window through 10 minutes (the default, for every job),
     30 minutes, 1 hour, 6 hours, and the whole job.
-  - The key help stays at the bottom of the tab, with only the keys that do
-    something there: `w window 10m · 30m · 1h · 6h · all   r refresh   space
-    sub-job   ↑↓ GPU` (`space` with two or more sub-jobs, `↑↓` with more than
-    one GPU or node). On a line too narrow for all of it, `w window` leaves
-    out the windows' names, then whole entries are left out from the end and
-    the line ends in `…`. The footer shows `space Sub-job` after `w Window`;
+  - The footer shows `space Sub-job` after `w Window`;
     on a terminal too narrow for every key, the footer leaves out the keys
     that don't fit whole, from the right (`?` lists every key).
   - Telemetry downloads when the tab is first shown; `r` refreshes it, and a
@@ -1375,7 +1349,7 @@ seen it end.
 Logs are cached locally, so reopening a job replays instantly without
 re-fetching from the server: under `~/.cache/cortex-training/jobs/<job>/` (or
 `$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`. The same
-directory holds display names and telemetry. `--debug` uses a temporary cache
+directory holds telemetry. `--debug` uses a temporary cache
 of its own, removed when it ends.
 
 The pane draws each line as text only: escape sequences in a line (colours,
@@ -1547,23 +1521,23 @@ characters of the job id) and its own error log
 the lines its tail cached, else the execution log the pane shows; with nothing
 to save it says so and writes no file.
 
-Copying works on every screen and tab. Highlighting is copying: drag the
-mouse over any text and it is on the clipboard when you let go, so Cmd-V (or
+Copying works on every screen and tab. Drag the mouse over any text to
+highlight it, then press `ctrl+c` (or Cmd-C, where the terminal passes it on) to put it on the clipboard, so Cmd-V (or
 the terminal's paste) pastes it; a double-click (a block) or a triple-click
-(everything around it) highlights and copies too. A drag that starts in the
+(everything around it) highlights too. A drag that starts in the
 log, a list or a scrolling pane stays in it: held past its top or bottom, it
 scrolls that area and the highlight grows with it. Text can't be highlighted
 in a table, so a drag over table rows (the job list, the preview's sub-jobs)
-picks whole rows instead: they show highlighted and are copied, aligned under
-the column names, with a last column for each whole job or sub-job id (the Job
-ID column cuts it short); held past the table's top or bottom, it scrolls the
+picks whole rows instead: they show highlighted and `ctrl+c` copies them, aligned under
+the column names, with a last column for each whole job or sub-job id (a sub-job's
+row shows its label under Job ID); held past the table's top or bottom, it scrolls the
 table. A click drops a highlight; a drag is never a click (it doesn't fold a
 job, pick a list entry or run a footer key), and a footer key runs when it is
 clicked, not as it is pressed. Changing what a view shows (another tab,
 sub-job, GPU, node or window) drops its highlight.
 
-`ctrl+c` and a right-click copy the same way: what is highlighted
-(again, without clearing it), else everything the view holds, including what
+`ctrl+c` copies what is highlighted
+(without clearing it), else everything the view holds, including what
 is scrolled out of view: on Logs the whole log (its newest lines up to 1 MiB);
 on Resources the panel (each GPU's or node's value), the header, every stats
 row and every chart; on the job list every job; in the preview all of it.
@@ -1587,8 +1561,7 @@ Keys in the job details view:
 
 | Key | Action |
 |-----|--------|
-| `2` `3` | Logs / Resources tab |
-| `l` `g` | The same tabs, as in the preview, except `l` on Logs (below) |
+| `l` `g` | Logs / Resources tab, as in the preview, except `l` on Logs (below) |
 | `t` | Next tab |
 | `w` | Cycle the window (Resources) |
 | `Space` | Next sub-job, round to the first after the last, when the job has two or more; the view stays, back to `ALL`. `<` / `>` go back / forward (Resources) |
@@ -1597,7 +1570,7 @@ Keys in the job details view:
 | `l` | Cycle minimum log level (INFO / WARNING / ERROR) (Logs; `L` works too); elsewhere the Logs tab |
 | `p` | Pause / resume auto-scroll; scroll back freely while paused. Resumes a tail paused for no input (Logs) |
 | `s` | Save the current source to `~/cortex-training-<job8>-<type>-<index>.log` (Logs) |
-| `ctrl+c` / right-click | Copy what is highlighted, else everything the tab holds: the log (its newest lines, up to 1 MiB) on Logs; the panel, header, stats and every chart on Resources (any tab) |
+| `ctrl+c` | Copy what is highlighted, else everything the tab holds: the log (its newest lines, up to 1 MiB) on Logs; the panel, header, stats and every chart on Resources (any tab) |
 | `[` / `]` | Narrow / widen the sources panel, which is otherwise sized to its labels; the log keeps at least 40 columns (Logs) |
 | `PgUp` `PgDn` `Home` `End` | Scroll the log, also while the sources panel has the focus (Logs); scroll the stats and charts, also while the panel has the focus (Resources) |
 | `r` | Refresh the visible tab (on Logs, the sub-job list and its tail) |

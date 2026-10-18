@@ -13,8 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the TUI log cache and the display names stored beside it (no
-``textual`` dependency)."""
+"""Unit tests for the TUI log cache (no ``textual`` dependency)."""
 
 from pathlib import Path
 
@@ -190,73 +189,6 @@ def test_rotation_leaves_room_so_appends_at_the_cap_rarely_rewrite_the_file(tmp_
     assert loaded[-1]["i"] == 399 and [e["i"] for e in loaded] == list(range(loaded[0]["i"], 400))
     assert c._jsonl_path("s").stat().st_size <= 10_000
     assert c.head_missing("s")
-
-
-# ─── aliases: renames from every session on the machine are kept ─────────
-
-_RENAMES = """
-import sys, time
-from pathlib import Path
-from cortex_training.tui.stores import AliasStore
-root, tag, count, go = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), Path(sys.argv[4])
-while not go.exists():
-    time.sleep(0.002)
-store = AliasStore(root)
-for i in range(count):
-    store.set(f"{tag}-{i}", f"{tag} run {i}")
-"""
-
-
-def test_renames_in_two_sessions_at_once_are_all_kept(tmp_path):
-    import os
-    import subprocess
-    import sys
-
-    from cortex_training.tui import stores
-
-    pytest.importorskip("fcntl")
-    src = str(Path(stores.__file__).resolve().parents[2])  # the cortex_training these tests import
-    env = {**os.environ, "PYTHONPATH": src}
-    go = tmp_path / "go"
-    sessions = [subprocess.Popen([sys.executable, "-c", _RENAMES, str(tmp_path), tag, "60", str(go)], env=env)
-                for tag in ("a", "b")]
-    go.touch()  # both start renaming together
-    assert [session.wait(timeout=120) for session in sessions] == [0, 0]
-    # Without the lock, a session read the names just before the other one wrote
-    # its rename, and wrote them back without it.
-    names = stores.AliasStore(tmp_path).all()
-    assert names == {f"{tag}-{i}": f"{tag} run {i}" for tag in ("a", "b") for i in range(60)}
-
-
-def test_a_rename_waits_for_another_session_s_then_writes_anyway(tmp_path, monkeypatch):
-    import time
-
-    fcntl = pytest.importorskip("fcntl")
-    from cortex_training.tui import stores
-
-    monkeypatch.setattr(stores, "_LOCK_WAIT_SECONDS", 0.2)
-    store = stores.AliasStore(tmp_path)
-    store.set("a", "first")
-    with open(tmp_path / "aliases.json.lock", "a") as held:
-        fcntl.flock(held.fileno(), fcntl.LOCK_EX)  # another session, stuck in the middle of a rename
-        started = time.monotonic()
-        store.set("b", "second")
-        waited = time.monotonic() - started
-    assert 0.2 <= waited < 5  # the screen it runs on is held up a moment, not for good
-    assert store.all() == {"a": "first", "b": "second"}
-
-
-def test_renames_without_fcntl_still_merge_with_what_is_on_disk(tmp_path, monkeypatch):
-    from cortex_training.tui import stores
-
-    monkeypatch.setattr(stores, "fcntl", None)  # as on Windows
-    one, other = stores.AliasStore(tmp_path), stores.AliasStore(tmp_path)  # two sessions
-    one.set("a", "first")
-    other.set("b", "  second   name ")
-    one.set("c", "x" * 200)
-    one.set("a", "")  # an empty name removes it
-    assert stores.AliasStore(tmp_path).all() == {"b": "second name", "c": "x" * stores.ALIAS_MAX_CHARS}
-    assert not (tmp_path / "aliases.json.lock").exists()
 
 
 # ─── cached_pages: replay then resume ────────────────────────────────────

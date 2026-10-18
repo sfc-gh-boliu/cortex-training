@@ -274,7 +274,7 @@ def printable(text: Any) -> str:
     return s if s.isascii() and s.isprintable() else _printable(s)
 
 
-@functools.lru_cache(maxsize=4096)  # a list render cleans each job's comment several times
+@functools.lru_cache(maxsize=4096)  # a list render cleans each job's text several times
 def _printable(s: str) -> str:
     return _drawable(s)
 
@@ -304,17 +304,14 @@ def _overwritten(line: str) -> str:
     return parts[-1] if parts else ""
 
 
-def one_line(text: Any, width: int = 0) -> str:
+def one_line(text: Any) -> str:
     """``text`` safe for a one-row line, as :func:`printable` makes it, with each
-    line break as `` / `` and each tab as a space; ``width`` > 0 cuts the row to
-    that many terminal cells, ending in ``…``.
+    line break as `` / `` and each tab as a space.
 
     Escape sequences go before the line breaks do, so one left unterminated
     ends with its own line, as it does in a log line.
     """
     row = printable(_LINE_BREAKS.sub(" / ", _strip_escapes(str(text))).replace("\t", " "))
-    if width > 0 and cell_len(row) > width:
-        return cut_cells(row, max(1, width - 1)).rstrip() + "…"
     return row
 
 

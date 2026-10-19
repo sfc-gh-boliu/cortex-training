@@ -107,6 +107,13 @@ _STDOUT_CHUNK_RE = re.compile(
 _GPU_METRICS_CHUNK_RE = re.compile(
     r"^gpu\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
 )
+# Training metrics share the ``_metrics/`` root with the GPU chunks but are their
+# own stream: the training runtime writes them to a file of its own, which is
+# staged and reconstructed separately. They must never be matched with the GPU
+# chunks, which would concatenate the two kinds of rows into one file.
+_TRAINING_METRICS_CHUNK_RE = re.compile(
+    r"^training\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
+)
 _STREAM_COPY_BUFFER_BYTES = 1024 * 1024
 
 # Env var that unlocks create-job debug options. These are an internal-only
@@ -3700,6 +3707,7 @@ class CortexTrainingClient:
         *,
         max_workers: int,
         temporary_prefix: str,
+        label: str | None = None,
         progress: Callable[[str], None] | None = None,
         on_chunk: Callable[[str, int, int, int], None] | None = None,
         strict: bool = False,
@@ -3729,6 +3737,9 @@ class CortexTrainingClient:
         cancel = threading.Event()
         # A resumed plan starts from output an earlier download saved.
         saved_progress = any(plan.known for plan in plans)
+        # What progress calls this stream. Both metric streams are staged under
+        # ``_metrics/``, so artifact_name alone would label them the same.
+        shown = label or artifact_name
         spool_prefix = f"cortex-training-{artifact_name}-artifacts-"
         _artifact_download.Spool.sweep(spool_prefix, self._TEMP_ORPHAN_MIN_AGE_SECONDS)
         with _artifact_download.Spool(spool_prefix) as spool:
@@ -3753,7 +3764,7 @@ class CortexTrainingClient:
                         )
                     if not new_total:
                         self._report_artifact_progress(
-                            progress, f"{artifact_name}: no new chunks for {plan.sub_job_id}\n"
+                            progress, f"{shown}: no new chunks for {plan.sub_job_id}\n"
                         )
 
                     def report(done: int, plan=plan, new_total=new_total) -> None:
@@ -3761,7 +3772,7 @@ class CortexTrainingClient:
                             self._report_artifact_progress(
                                 progress,
                                 self._artifact_progress_status(
-                                    artifact_name, done, new_total, plan.sub_job_id
+                                    shown, done, new_total, plan.sub_job_id
                                 ),
                             )
 
@@ -4018,6 +4029,8 @@ class CortexTrainingClient:
         wanted: set[str] | None,
         stale_after_seconds: float | None,
         cancel: threading.Event | None = None,
+        label: str = "GPU metrics",
+        check_missing: bool = False,
     ) -> dict[str, list[str]]:
         """Warn when a running job's uploads look stalled; never raises.
 
@@ -4047,7 +4060,6 @@ class CortexTrainingClient:
                 stale_after_seconds - self._STALE_PRECHECK_SKEW_SECONDS, 0
             ):
                 candidates[sub_job_id] = newest
-        check_missing = artifact_name == "metrics"
         # A chunk this recent means the job may have only just ended.
         recent_cutoff = local_now - self._RECENTLY_ENDED_SECONDS - self._STALE_PRECHECK_SKEW_SECONDS
         recently_active = any(
@@ -4065,7 +4077,7 @@ class CortexTrainingClient:
         status = self._normalize_job_status(job.get("status"))
         if status in _ENDED_JOB_STATES:
             warnings = self._recently_ended_warnings(
-                job, local_now if server_now is None else server_now, artifact_name, chunks_by_sub_job, wanted
+                job, local_now if server_now is None else server_now, label, chunks_by_sub_job, wanted
             )
             if check_missing:
                 for sub_job_id, messages in self._ended_without_metrics_warnings(
@@ -4092,7 +4104,6 @@ class CortexTrainingClient:
             starts = [t for t in (running_since, started) if t is not None]
             return now - max(starts) if starts else None
 
-        label = "stdout output" if artifact_name == "stdout" else "GPU metrics"
         warnings: dict[str, list[str]] = {}
         for sub_job_id, newest in candidates.items():
             age = now - newest
@@ -4148,7 +4159,7 @@ class CortexTrainingClient:
         self,
         job: Mapping[str, Any],
         now: float,
-        artifact_name: str,
+        label: str,
         chunks_by_sub_job: Mapping[str, list[str]],
         wanted: set[str] | None,
     ) -> dict[str, list[str]]:
@@ -4156,7 +4167,6 @@ class CortexTrainingClient:
         ended_at = self._parse_api_time(job.get("state_changed_at"))
         if ended_at is None or now - ended_at >= self._RECENTLY_ENDED_SECONDS:
             return {}
-        label = "stdout output" if artifact_name == "stdout" else "GPU metrics"
         warnings: dict[str, list[str]] = {}
         for sub_job_id in sorted(chunks_by_sub_job):
             if wanted is not None and sub_job_id not in wanted:
@@ -4209,6 +4219,8 @@ class CortexTrainingClient:
         chunk_pattern: re.Pattern[str],
         destination_name: str,
         temporary_prefix: str,
+        label: str | None = None,
+        check_missing: bool | None = None,
         resume: bool = False,
         max_workers: int | None = None,
         progress: Callable[[str], None] | None = None,
@@ -4235,6 +4247,18 @@ class CortexTrainingClient:
         (in that order); the returned list stays in id order. ``on_commit``
         gets a copy of each sub-job's result entry once its file is committed.
         """
+        # What the warnings call this stream, and whether a sub-job with saved stdout
+        # but none of these chunks is worth a warning. Only the GPU stream is: every
+        # sub-job with GPUs uploads it, while training metrics are written by training
+        # sub-jobs alone, and only when the deployment saves them.
+        if label is None:
+            label = "stdout output" if artifact_name == "stdout" else "GPU metrics"
+        if check_missing is None:
+            check_missing = artifact_name == "metrics"
+        # Progress has always named the stream by its stage root ("metrics: [###] 1/2"),
+        # so the streams that had one keep that word; only a second stream under an
+        # already-used root needs a label of its own.
+        progress_label = label if artifact_name == "metrics" and not check_missing else artifact_name
         if max_workers is None:
             max_workers = self._DOWNLOAD_DEFAULT_WORKERS
         if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
@@ -4307,6 +4331,8 @@ class CortexTrainingClient:
                         wanted,
                         stale_after_seconds,
                         stall_cancel,
+                        label,
+                        check_missing,
                     ),
                     name="cortex-training-stall-check",
                 )
@@ -4367,6 +4393,7 @@ class CortexTrainingClient:
                         plans,
                         max_workers=max_workers,
                         temporary_prefix=temporary_prefix,
+                        label=progress_label,
                         progress=progress,
                         on_chunk=on_chunk,
                         strict=strict,
@@ -4517,6 +4544,58 @@ class CortexTrainingClient:
             chunk_pattern=_GPU_METRICS_CHUNK_RE,
             destination_name="gpu.jsonl",
             temporary_prefix=".gpu-metrics-",
+            resume=resume,
+            max_workers=max_workers,
+            progress=progress,
+            on_chunk=on_chunk,
+            sub_job_ids=sub_job_ids,
+            strict=strict,
+            stale_after_seconds=stale_after_seconds,
+            transfer_timeout_seconds=transfer_timeout_seconds,
+            priority=priority,
+            on_commit=on_commit,
+        )
+
+    @_track_operation("download_training_metrics")
+    def download_training_metrics(
+        self,
+        job_id: str,
+        output_dir: str | os.PathLike[str],
+        *,
+        resume: bool = False,
+        max_workers: int | None = None,
+        progress: Callable[[str], None] | None = None,
+        on_chunk: Callable[[str, int, int, int], None] | None = None,
+        sub_job_ids: Iterable[str] | None = None,
+        strict: bool = False,
+        stale_after_seconds: float | None = _DOWNLOAD_STALE_AFTER_SECONDS,
+        transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
+        priority: Iterable[str] = (),
+        on_commit: Callable[[dict[str, Any]], None] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Reconstruct staged training-metric chunks into one JSONL file per sub-job.
+
+        The training metrics a job's ``/fwd-bwd`` and ``/step`` calls returned,
+        written by the zone to its own file and staged beside the GPU chunks as
+        ``training.*.gz``, reconstructed as
+        ``<output_dir>/<sub_job_id>/training.jsonl``. Takes the same options as
+        :meth:`download_metrics`, and the two can share an output directory:
+        each writes its own file and manifest.
+
+        Only training sub-jobs have these rows, and only where the deployment
+        saves them (a job opts out with ``training_config.save_training_metrics``
+        false), so a sub-job without them is not warned about, unlike a sub-job
+        with no GPU metrics.
+        """
+        return self._download_gzip_artifacts(
+            job_id,
+            output_dir,
+            artifact_name="metrics",
+            chunk_pattern=_TRAINING_METRICS_CHUNK_RE,
+            destination_name="training.jsonl",
+            temporary_prefix=".training-metrics-",
+            label="training metrics",
+            check_missing=False,
             resume=resume,
             max_workers=max_workers,
             progress=progress,

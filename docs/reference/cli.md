@@ -1044,16 +1044,17 @@ A click on the highlighted row (the "entire job" row or a sub-job row), or
 `Enter`, opens the details for that scope, its telemetry dashboard, on the
 Logs tab, as the line above the table says (`Click a job to open its
 telemetry dashboard`); a click on another row highlights it first.
-`l` and `g` open the Logs and Resources tabs
-directly, and do the same in the details.
+`l`, `g`, `m` and `c` open the Logs, Resources, Training metrics and
+Checkpoints tabs directly, and do the same in the details.
 
 #### Job details
 
 The line under the title names the job and its scope, and repeats the
 service's `reason` and `reason_details` (or the `unknown` sentence) while it
 sends them. A sub-job's details name it by its id once (`sub-job
-JOB_ID:training:0`). Switch tabs with `l` (Logs) and `g` (Resources), or `t`
-for the next tab.
+JOB_ID:training:0`). Switch tabs with `l` (Logs), `g` (Resources), `m`
+(Training metrics) and `c` (Checkpoints), or `t` for the next tab, round to
+Logs after the last.
 
 - **Logs** is the live and historical log view described below. Each line is
   tagged with the sub-job being tailed, for example `training:0 │ …`, and its
@@ -1188,6 +1189,64 @@ for the next tab.
     chunks are in; later opens download only the new chunks.
     The first read of a long job's cache shows the selected sub-job's newest
     samples before the rest of its history.
+- **Training metrics** charts what the training sub-job's `/fwd-bwd` and
+  `/step` calls returned, saved by the service at each step in its own
+  `training.jsonl`
+  ([Training metrics download](rest-api.md#125-training-metrics-download)):
+  `mean_loss`, `sum_loss`, `grad_norm` and `last_lr` first, then every other
+  metric in the order the rows first have them (`approx_kl`, `entropy`, ... as
+  the loss function returns them).
+  - A row carries `sum_loss` (the sum of the step's `/fwd-bwd` losses) and
+    `num_calls` (how many were combined), not a mean, since whether a step's
+    loss is the sum or the mean depends on how the loss was scaled. The tab
+    charts both: **`mean_loss`** is `sum_loss / num_calls`, the usual reading,
+    with `sum_loss` beside it. A row with no usable `num_calls` gets no
+    `mean_loss`, rather than a made-up divisor. `num_calls` itself is a count,
+    so it gets no chart.
+  - The header names the sub-job, its newest step and how old the newest row
+    is, and the window. A job with two or more training sub-jobs names the
+    shown one's place among them, and `Space` shows the next.
+  - The stats block has a row per metric: its latest value, min and max over
+    the window, each with the step it was at (`0.0137 @ 1,234`).
+  - Under it, a chart per metric against the step, two to a row in a pane at
+    least 90 cells wide, each titled with the metric and the window and ending
+    with its latest value. The y axis runs from the window's lowest value to
+    its highest (a loss rarely starts at 0, and a policy loss can be negative);
+    with more steps than columns, a column is the mean of the steps it covers.
+    The steps are labelled under the bars.
+  - `w` cycles the window through all steps (the default), the last 100 steps
+    and the last 1,000 steps, counted back from the newest step.
+  - The tab downloads when it is first shown and `r` refreshes it, reading only
+    the rows added since. The file sits in the same cache directory as the
+    Resources tab's, and the two never download at once, but they are separate
+    streams: each fetches its own chunks. A live job's refreshes every 30
+    seconds while the tab is showing. Two rows for one step and call type (a
+    step run again after a resume) keep the later one. Training rows that
+    can't be read (malformed, or a record version this client doesn't read)
+    are counted in the header.
+  - A job with no training sub-job says so and downloads nothing; a training
+    sub-job that hasn't run yet says `no training metrics yet: training #0 is
+    PLACING (the first rows arrive after its first step)`; one that has ended
+    without rows (it ran on a service version that didn't save them) says
+    `training #0 saved no training metrics`.
+- **Checkpoints** lists the job's saved checkpoints (`list_checkpoints`),
+  newest first: id, type (`weights-only` or `resumable`), step, up to three
+  numeric fields the records carry (such as `avg_loss`), and when each was
+  saved, in local time and as an age.
+  - The header counts them and names the newest. `↑` `↓` move the highlight,
+    and the pane under the table shows the highlighted checkpoint's fields and
+    how to use it: for a `weights-only` checkpoint, the `source_checkpoint_info`
+    a sampling sub-job takes to start from it; for a `resumable` one, the same
+    for a training sub-job (with `load_optimizer_states` false to change
+    `n_gpus`) and the `load` command for a running training job. Both name
+    `export_checkpoint`, for short-lived download URLs of the files. The TUI
+    only reads: it never exports or deletes a checkpoint.
+  - The list is read when the tab is first shown; `r` reads it again, keeping
+    the highlight on the checkpoint it was on, and a live job's is read again
+    every 30 seconds while the tab is showing. A failed read keeps the list
+    shown and says `refresh failed: ...` in the header.
+  - A job with no training sub-job says it saves no checkpoints, without
+    asking the service.
 
 #### Logs
 
@@ -1378,16 +1437,17 @@ Keys in the job details view (`/`, `p`, `s`, `[` and `]` work on Logs):
 
 | Key | Action |
 |-----|--------|
-| `l` `g` | Logs / Resources tab, as in the preview, except `l` on Logs (below) |
-| `t` | Next tab |
-| `w` | Cycle the window; so does a click on the window in the header (Resources) |
-| `Space` | Next sub-job, round to the first after the last, when the job has two or more; the view stays, back to `ALL`. `<` / `>` go back / forward; a click on the sub-job's name in the header goes forward (Resources) |
+| `l` `g` `m` `c` | Logs / Resources / Training metrics / Checkpoints tab, as in the preview, except `l` on Logs (below) |
+| `t` | Next tab, round to Logs after the last |
+| `w` | Cycle the window; so does a click on the window in the header (Resources, Training metrics) |
+| `Space` | Next sub-job, round to the first after the last, when the job has two or more; the view stays, back to `ALL`. `<` / `>` go back / forward; a click on the sub-job's name in the header goes forward (Resources). On Training metrics, the next training sub-job |
+| `↑` `↓` | Highlight a checkpoint, and show its details and use under the list (Checkpoints) |
 | `↑` `↓` | Pick GPU Resources or System Resources, `ALL` or one GPU or node in the panel; the charts follow the highlight (Resources) |
 | `/` | Filter the current source |
 | `l` | Cycle minimum log level (INFO / WARNING / ERROR) (Logs; `L` works too); elsewhere the Logs tab |
 | `p` | Pause / resume auto-scroll |
 | `s` | Save the current source to `~/cortex-training-<job8>-<source>.log` |
-| `ctrl+c` | Copy what is highlighted, else everything the tab holds: the log (its newest lines, up to 1 MiB) on Logs; the panel, header, stats and every chart on Resources (any tab) |
+| `ctrl+c` | Copy what is highlighted, else everything the tab holds: the log (its newest lines, up to 1 MiB) on Logs; the panel, header, stats and every chart on Resources; the header, stats and charts on Training metrics; the list and the highlighted checkpoint's details on Checkpoints (any tab) |
 | `[` / `]` | Narrow / widen the sources panel |
 | `PgUp` `PgDn` `Home` `End` | Scroll the log, also while the sources panel has the focus (Logs); scroll the stats and charts, also while the panel has the focus (Resources) |
 | `r` | Refresh the visible tab (on Logs, the sub-job list and its tail) |

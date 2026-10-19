@@ -153,6 +153,8 @@ class JobSummaryScreen(FollowsPointer, Screen):
         KEYS_BINDING,
         ("l", "open('logs')", "Logs"),
         ("g", "open('resource')", "Resources"),
+        Binding("m", "open('training')", "Training metrics", show=False),
+        Binding("c", "open('checkpoints')", "Checkpoints", show=False),
         ("r", "refresh", "Refresh"),
         # One key, two bindings: check_action enables the one that applies, and the
         # footer shows only that one, and only while a value is too long to show

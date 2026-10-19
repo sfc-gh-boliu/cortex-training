@@ -109,6 +109,8 @@ from cortex_training.tui.account import empty_text
 from cortex_training.tui.account import loaded_text
 from cortex_training.tui.account import scope_text
 from cortex_training.tui.account import unavailable_text
+from cortex_training.tui.detail_tabs import CheckpointsPane
+from cortex_training.tui.detail_tabs import TrainingPane
 from cortex_training.tui.format import display_line
 from cortex_training.tui.format import entry_at_level
 from cortex_training.tui.format import entry_matches
@@ -2196,6 +2198,8 @@ class LogScreen(FollowsPointer, Screen):
         Binding("comma", "resource_sub_job(-1)", "Prev sub-job", show=False),
         Binding("full_stop", "resource_sub_job(1)", "Next sub-job", show=False),
         Binding("g", "show_tab('resource')", "Resources", show=False),
+        Binding("m", "show_tab('training')", "Training metrics", show=False),
+        Binding("c", "show_tab('checkpoints')", "Checkpoints", show=False),
     ]
 
     # The sources panel is sized to its labels ("training #0"), at least
@@ -2213,6 +2217,9 @@ class LogScreen(FollowsPointer, Screen):
     _DATA_REFRESH_SECONDS = 30
     _STATUS_REFRESH_SECONDS = 60
     # Copying (ctrl+c) works on every tab, what the mouse highlighted or else everything the tab holds: not here.
+    # The tabs, in the order t cycles them, and their names.
+    _TABS = ("logs", "resource", "training", "checkpoints")
+    _TAB_NAMES = {"logs": "Logs", "resource": "Resources", "training": "Training metrics", "checkpoints": "Checkpoints"}
     _LOG_ONLY = {"save_log", "cycle_level", "toggle_pause", "shrink_sources", "grow_sources", "filter"}
 
     class _Note(str):
@@ -2269,7 +2276,7 @@ class LogScreen(FollowsPointer, Screen):
         self._stdout_failed = False
         self._held: tuple[list[str], bool] | None = None
         self._init_log_state()
-        self._active_tab = initial_tab if initial_tab in ("logs", "resource") else "logs"
+        self._active_tab = initial_tab if initial_tab in self._TABS else "logs"
         self._log_focus_id = "sources"
         self._metrics_root = job_cache_dir(job_id) / "metrics"
         self._resource_data = ResourceData({})
@@ -2332,6 +2339,11 @@ class LogScreen(FollowsPointer, Screen):
                         yield _ColoredLinks("Select Resource to load GPU metrics.", id="resource-status")
                         yield Static("", id="resource-stats")
                         yield Static("", id="resource-charts")
+            with TabPane("Training metrics", id="training"):
+                yield TrainingPane(self._client, self._job_id, self._metrics_root, job=self._tab_job,
+                                   download=self._download_training_metrics, id="training-tab")
+            with TabPane("Checkpoints", id="checkpoints"):
+                yield CheckpointsPane(self._client, self._job_id, job=self._tab_job, id="checkpoints-tab")
         yield FittedFooter(id="footer")
 
     def on_mount(self) -> None:
@@ -2357,6 +2369,18 @@ class LogScreen(FollowsPointer, Screen):
 
     def _focus_active_tab(self) -> None:
         try:
+            # Queued at mount (see on_mount). A tab key pressed before it runs has
+            # already switched the tabs, and focusing the tab left behind would put the
+            # focus in a hidden pane, which re-activates that pane and undoes the key
+            # (the alternating activations on_tabbed_content_tab_activated guards
+            # against). That activation focuses its own pane, so there is nothing to do.
+            if (self.query_one("#job-tabs", TabbedContent).active or "logs") != self._active_tab:
+                return
+            pane = self._detail_pane()
+            if pane is not None:
+                self.set_focus(pane.focus_target())
+                pane.activate()
+                return
             self.set_focus(self.query_one("#resource-list" if self._resource_active() else "#sources"))
         except Exception:  # noqa: BLE001 - not mounted yet
             pass
@@ -2389,12 +2413,48 @@ class LogScreen(FollowsPointer, Screen):
     def _resource_active(self) -> bool:
         return self._active_tab == "resource"
 
+    def _detail_pane(self) -> TrainingPane | CheckpointsPane | None:
+        """The Training metrics or Checkpoints tab's pane, when one of them is shown (see detail_tabs.py)."""
+        if self._active_tab not in ("training", "checkpoints"):
+            return None
+        try:
+            return self.query_one(f"#{self._active_tab}-tab")
+        except NoMatches:  # not mounted yet
+            return None
+
+    def _tab_job(self) -> dict:
+        """The job as this screen knows it, with its newest status, for the Training metrics and Checkpoints tabs."""
+        return {**self._job, "status": self._job_status or self._job.get("status")}
+
+    def _download_training_metrics(self, *, priority, on_commit, cancelled) -> bool:
+        """Worker thread. The Training metrics tab's download: the zone's own training rows,
+        into the same cache directory as the Resources tab's GPU file and under its lock, so
+        the two tabs don't list and write the directory at once. The streams are separate, so
+        this fetches its own chunks. False when the screen closed (or ``cancelled()``) first."""
+        lock = _resource_lock(self._metrics_root)
+        while not lock.acquire(timeout=0.1):
+            if cancelled() or not self._screen_open:
+                return False
+        try:
+            self._client.download_training_metrics(
+                self._job_id,
+                self._metrics_root,
+                resume=True,
+                priority=priority,
+                on_commit=on_commit,
+                **_quiet_download(self._client.download_training_metrics),
+            )
+        finally:
+            lock.release()
+        return True
+
     def action_show_tab(self, tab: str) -> None:
         self.query_one("#job-tabs", TabbedContent).active = tab
 
     def action_cycle_tab(self) -> None:
         tabs = self.query_one("#job-tabs", TabbedContent)
-        tabs.active = "resource" if self._active_tab == "logs" else "logs"
+        order = self._TABS
+        tabs.active = order[(order.index(self._active_tab) + 1) % len(order)] if self._active_tab in order else "logs"
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         # Two quick tab keys queue two activations. Acting on the stale one moves
@@ -2406,10 +2466,15 @@ class LogScreen(FollowsPointer, Screen):
         self.clear_selection()  # what was highlighted is on the tab left behind
         self.refresh_bindings()  # check_action scopes the footer's keys to the tab
         self._update_subtitle()  # the Logs tab's state shows only on Logs
+        focused = self.focused
+        if not self._logs_active() and focused is not None and focused.id in {"sources", "logview", "logfilter"}:
+            self._log_focus_id = focused.id
+        pane = self._detail_pane()
+        if pane is not None:
+            self.set_focus(pane.focus_target())
+            pane.activate()
+            return
         if self._resource_active():
-            focused = self.focused
-            if focused is not None and focused.id in {"sources", "logview", "logfilter"}:
-                self._log_focus_id = focused.id
             self.set_focus(self.query_one("#resource-list", ListView))  # its arrows pick a view or unit
             self.call_after_refresh(self._render_resource)
             self._start_resource_refresh(force=False)
@@ -2487,6 +2552,10 @@ class LogScreen(FollowsPointer, Screen):
         self._rewrap_timer = self.set_timer(self._REWRAP_SETTLE_SECONDS, partial(after_refresh, self, self._rewrap))
 
     def action_refresh_sources(self) -> None:
+        pane = self._detail_pane()
+        if pane is not None:
+            pane.action_refresh()
+            return
         if self._resource_active():
             self._start_resource_refresh(force=True)
             return
@@ -3529,7 +3598,7 @@ class LogScreen(FollowsPointer, Screen):
         elif self._logs_active():
             self._copy_log()
         else:
-            self.app.copy_everything(self, "the Resources tab")
+            self.app.copy_everything(self, f"the {self._TAB_NAMES[self._active_tab]} tab")
 
     def _load_sources(self) -> None:
         """UI thread. Read the job, then show its sub-jobs (see _read_sources)."""
@@ -4241,6 +4310,9 @@ class LogScreen(FollowsPointer, Screen):
             return
         if self._resource_active() and self._resource_waiting() is None:
             self._start_resource_refresh(force=True)
+        pane = self._detail_pane()
+        if pane is not None:
+            pane.refresh_live()
 
     def _next_job_read(self) -> int:
         """Any thread. The number of a get_job about to be sent: a read sent later has a larger one."""
@@ -5484,7 +5556,8 @@ class CortexTrainingLogTUI(App):
     /* The fixed marker and job id columns look like the rest of the row. */
     #jobs > .datatable--fixed { background: $surface; }
     #sources { width: 16; border-right: solid $panel; }
-    #job-tabs, #job-tabs ContentSwitcher, #logs, #resource, #logs-body {
+    #job-tabs, #job-tabs ContentSwitcher, #logs, #resource, #logs-body,
+    #training, #checkpoints, #training-tab, #checkpoints-tab {
         height: 1fr;
     }
     #logview { height: 1fr; padding: 0 1; }
@@ -5504,6 +5577,13 @@ class CortexTrainingLogTUI(App):
     /* Drawn to the pane's width: a line that is momentarily wider (before a resize
        settles) is clipped, never wrapped into taller charts. */
     #resource-charts { height: auto; margin-top: 1; text-wrap: nowrap; text-overflow: clip; }
+    /* The Training metrics and Checkpoints tabs (detail_tabs.py): a header on top, as on Resources. */
+    #training-status, #checkpoints-status { color: $text-muted; height: auto; padding: 0 1; }
+    #training-pane { height: 1fr; padding: 0 1; scrollbar-gutter: stable; scrollbar-size-vertical: 1; }
+    #training-stats { height: auto; margin-top: 1; text-wrap: nowrap; text-overflow: clip; }
+    #training-charts { height: auto; text-wrap: nowrap; text-overflow: clip; }
+    #checkpoints-table { height: auto; max-height: 50%; margin: 1 1 0 1; }
+    #checkpoints-detail-pane { height: 1fr; padding: 1 1 0 1; scrollbar-size-vertical: 1; }
     /* The scrollbar's room is kept while the preview fits, so its text never changes
        width (and re-wraps at the edge) when a refresh makes it scroll. */
     #summary-body { padding: 1 1; scrollbar-gutter: stable; }

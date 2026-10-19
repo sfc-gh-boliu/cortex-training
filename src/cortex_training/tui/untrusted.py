@@ -36,8 +36,8 @@ from typing import Any
 
 from cortex_training.tui.views import printable_data
 
-# The client methods whose answers are job records.
-_RECORD_READS = frozenset({"get_job", "list_jobs", "list_jobs_page"})
+# The client methods whose answers are job (or checkpoint) records.
+_RECORD_READS = frozenset({"get_job", "list_jobs", "list_jobs_page", "list_checkpoints"})
 
 
 class PrintableClient:

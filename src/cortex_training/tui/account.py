@@ -54,10 +54,6 @@ ACCOUNT_MANUAL_REPROBE_SECONDS = 60
 # minutes on, give or take a fraction of a second: this much slack keeps it from
 # waiting for the eleventh.
 _ASK_SLACK_SECONDS = 5.0
-# Each call of a refresh: the client's own defaults retry a failing call ten
-# times with a ten-minute read timeout, far too long for a list on screen.
-REFRESH_MAX_RETRIES = 2
-REFRESH_TIMEOUT = (10.0, 45.0)
 # The account-level list's status group for pending, placing, initializing and
 # running jobs. Under any status filter the service leaves out the jobs whose
 # status it can't read, so only the walk for the jobs a cut-short list may miss
@@ -316,7 +312,7 @@ class JobLister:
 
     def _schema(self, scope: ListScope) -> Listing:
         try:
-            jobs = self._client.list_jobs(max_retries=REFRESH_MAX_RETRIES, request_timeout=REFRESH_TIMEOUT)
+            jobs = self._client.list_jobs()
         except Exception as exc:
             raise JobListError(_failure_text(_SCHEMA_ROUTE, exc)) from exc
         return Listing([job for job in (jobs or []) if isinstance(job, dict)], scope)
@@ -374,8 +370,6 @@ class JobLister:
                 **filters,
                 page_size=ACCOUNT_PAGE_SIZE,
                 page_token=token,
-                max_retries=REFRESH_MAX_RETRIES,
-                request_timeout=REFRESH_TIMEOUT,
             )
             rows, token = _page(page)
             for job in rows:

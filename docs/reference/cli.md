@@ -703,47 +703,6 @@ warning that no GPU metrics were saved for it (for example, because the job ran
 on an image from before GPU metrics were uploaded). Two downloads of the same directory at once are unsupported; a TUI
 download of the same directory is refused as for stdout.
 
-### Roles And Access
-
-`checkpoints` is a REST call: a role with only
-`MONITOR` on the account can list a job's checkpoints. The
-checkpoint files are stored on the job's Experiment too, but the service reads
-them there for you. Saved logs and GPU metrics are read with SQL on the job's
-Experiment instead (`download-log`, `download-metrics`), so they need
-privileges on that Experiment, and a `MONITOR`-only role can't read them.
-
-When the service can't resolve the job's Experiment for your role, it answers
-500, in one of two wordings. The experiment-run lookup that `download-log` and
-`download-metrics` start with, before any SQL runs, says `Linked experiment is
-not found for job JOB_ID`: the role can't see the Experiment, or it no longer
-exists. `checkpoints` says `Linked experiment is not
-found or not authorized for the training job`. The client retries neither, so
-the command fails at once and adds `hint: this role can't read the job's
-Experiment ...` (with `or it no longer exists` for the first wording). Ask for
-access to the Experiment, or use the role that created the job.
-
-A role the service lets through that has no privileges on the Experiment, such
-as a `MONITOR`-only one, gets Snowflake's refusal of the SQL instead:
-`Experiment '...' does not exist or not authorized`, or `Insufficient
-privileges to operate on experiment '...'`. `download-log` and
-`download-metrics` print Snowflake's message after `error:`, with its
-`snowflake query id:` when it has one and without a traceback, add
-`hint: this role has no privileges on the job's Experiment ...`, and exit with
-status 1; `checkpoints` still works. See
-[REST API reference section 2.5](rest-api.md#25-roles-and-access).
-
-The TUI explains a refused read in one line on the view that needed it, worded
-the same on every view: the Logs tab's saved console and execution log, and the
-Resources tab (`GPU metrics unavailable: ...`). For the service's answer above,
-the line says the role can't read the job's Experiment, and, for `Linked
-experiment is not found for job ...`, that it may no longer exist. When
-Snowflake refuses the SQL on the Experiment, as it does for a `MONITOR`-only
-role, the line says that saved logs and GPU metrics live there and that
-`checkpoints` still works. A refusal about another object (a warehouse, a
-schema) keeps its own text. A 403 whose message names a privilege says the role
-isn't allowed to read that view's data; one with no such message keeps the
-standard error text.
-
 ### Job TUI
 
 `cortex-training tui` is a read-only terminal dashboard for job logs and GPU
@@ -787,6 +746,19 @@ section 3.5](rest-api.md#35-retries)). So a job id that isn't found (404), or
 a service that keeps failing, shows its error within a few seconds rather than
 after about a minute. Pressing `r` while a refresh is still reading says so.
 
+The TUI explains a refused read in one line on the view that needed it, worded
+the same on every view: the Logs tab's saved console and execution log, and the
+Resources tab (`GPU metrics unavailable: ...`). When the service can't resolve
+the job's Experiment for this role (a 500 that says `Linked experiment is not
+found ...`), the line says the role can't read the job's Experiment, and, for
+`Linked experiment is not found for job ...`, that it may no longer exist. When
+Snowflake refuses the SQL on the Experiment, as it does for a `MONITOR`-only
+role, the line says that saved logs and GPU metrics live there and that
+`checkpoints` still works. A refusal about another object (a warehouse, a
+schema) keeps its own text. A 403 whose message names a privilege says the role
+isn't allowed to read that view's data; one with no such message keeps the
+standard error text.
+
 A config the TUI can't use, such as one with a value of the wrong type (a
 quoted number: `"poll_interval": "2"`), JSON that doesn't parse, an unknown
 key, or a path that isn't there, stops it before it starts, with one line on
@@ -817,7 +789,7 @@ The job list shows the jobs created in the last six months (183 days) that the
 current role can see in the configured database and schema (`list_jobs`).
 Press `a`, or click `a All schemas` in the footer, to list the jobs in every
 database and schema the role can see instead, from the account-level list
-([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2cortex-training));
+([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2endpoint));
 the footer then offers `a Current schema`, which goes back. With `--schema-only`
 the list never leaves the configured schema and the footer has no `a`. The
 header line starts with when the list was last refreshed (`refreshing…` while

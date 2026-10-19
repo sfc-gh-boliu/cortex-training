@@ -3112,7 +3112,7 @@ _ENGINE = {"max_workers", "progress", "on_chunk", "sub_job_ids", "strict", "stal
 NOT_IN_DEMO = {
     "tail_logs": {"sub_job_type"},
     "download_metrics": _ENGINE,
-    "download_stdout_logs": _ENGINE | {"priority", "on_commit"},
+    "download_stdout_logs": _ENGINE,
 }
 
 

@@ -41,7 +41,7 @@ _CONNECT_HINT = ("to connect, run 'cortex-training login config.json', set CORTE
                  "--config config.json, --connection NAME, --base-url (local/mock), or --host + --pat; "
                  "or try the TUI without a connection: --debug")
 # Retries after a failed read, and the (connect, read) timeout in seconds, for
-# every call the TUI makes (the job list's pages use the same).
+# every call the TUI makes, the job list's included (it has no bounds of its own).
 READ_MAX_RETRIES = 2
 READ_TIMEOUT = (10.0, 45.0)
 # The oldest Textual the TUI is tested on (pyproject.toml requires it, below 9).
@@ -237,7 +237,7 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     ):
         parser.error(f"no connection configured: {_CONNECT_HINT}")
 
-    # Every read the TUI makes is bounded like the job list's: the client's own
+    # Every read the TUI makes, the job list's too, is bounded here: the client's own
     # defaults (ten retries, a ten-minute read timeout) left a view silent for
     # about a minute on a 404 or a failing service.
     args.max_retries, args.request_timeout = READ_MAX_RETRIES, READ_TIMEOUT

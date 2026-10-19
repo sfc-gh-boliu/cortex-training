@@ -75,7 +75,7 @@ class _Client:
             raise self.account_error
         return {"jobs": [{"job_id": "account-job", "database_name": "DB", "schema_name": "S"}], "next_page_token": None}
 
-    def list_jobs(self, status=None, *, max_retries=None, request_timeout=None) -> list:
+    def list_jobs(self, status=None) -> list:  # the real client's signature: bounds passed here fail
         self.schema_asks += 1
         if self.schema_error is not None:
             raise self.schema_error

@@ -196,8 +196,8 @@ _STUCK_EVERY = timedelta(minutes=10)
 # What the client raises for each reason the account-wide list is unavailable.
 _UNAVAILABLE = {
     AccountJobListUnavailable.NOT_DEPLOYED: (
-        "account-level job listing is not available on this service yet: GET /api/v2/cortex-training "
-        "answered 404 with no error body, so the route is not deployed"),
+        "account-level job listing is not available on this service yet: the account-level route "
+        "answered 404 with no error body, so it is not deployed"),
     AccountJobListUnavailable.DISABLED: (
         "account-level job listing is not enabled for this account (HTTP 404); Snowflake enables it per account"),
     AccountJobListUnavailable.FORBIDDEN: (
@@ -376,11 +376,10 @@ class DemoClient:
             raise RuntimeError(_EXPERIMENT_SQL.format(database=database, schema=schema, name="TRAINING_RUNS"))
 
     # ── client surface used by the TUI ──
-    def list_jobs(self, status: Optional[str] = None, *, max_retries: Optional[int] = None,
-                  request_timeout: Any = None) -> list:
+    def list_jobs(self, status: Optional[str] = None) -> list:
         """This client's location's jobs, as the per-schema list returns them (no location fields).
 
-        The arguments are accepted, as the real client takes them, and unused (the job list sends no status).
+        ``status`` is accepted, as the real client takes it, and unused (the job list sends none).
         """
         return [self._served(j) for j in self._jobs if self._here(j["job_id"])]
 

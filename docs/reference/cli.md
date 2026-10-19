@@ -676,9 +676,7 @@ completes.
 
 `--parallel`, `--strict`, and `--stale-after-minutes` do not apply to
 execution logs, including `download-log` without `--log-type stdout`. Two downloads of the same
-directory at once are unsupported. If the TUI is downloading into the same
-directory (its cache, as named in a skipped-chunk warning), the command stops
-with an error instead of writing alongside it.
+directory at once are unsupported.
 
 ### Download GPU Metrics
 
@@ -700,8 +698,7 @@ sub-job that has saved stdout but no GPU metrics is also listed, with
 `chunk_count` 0, `saved_path` `null`, and a warning that metric uploads may be
 stalled. After the job has ended, such a sub-job is listed the same way with a
 warning that no GPU metrics were saved for it (for example, because the job ran
-on an image from before GPU metrics were uploaded). Two downloads of the same directory at once are unsupported; a TUI
-download of the same directory is refused as for stdout.
+on an image from before GPU metrics were uploaded). Two downloads of the same directory at once are unsupported.
 
 ### Job TUI
 

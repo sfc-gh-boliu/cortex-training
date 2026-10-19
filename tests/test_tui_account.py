@@ -13,10 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The job list's account-wide list: its fallback to the configured schema, and when it is asked again.
-
-No ``textual`` needed: :class:`JobLister` runs on a fake client and a fake clock.
-"""
+"""The job list's account-wide list: its fallback to the configured schema, and when it is asked again."""
 
 import json
 from datetime import datetime
@@ -34,7 +31,6 @@ from cortex_training.tui.account import SCHEMA_ONLY
 from cortex_training.tui.account import JobLister
 from cortex_training.tui.account import JobListError
 from cortex_training.tui.account import ListScope
-from cortex_training.tui.account import unavailable_text
 
 NOW = datetime(2026, 10, 1, tzinfo=timezone.utc)
 NOT_DEPLOYED = AccountJobListUnavailable.NOT_DEPLOYED
@@ -83,7 +79,7 @@ class _Client:
         self.schema_asks += 1
         if self.schema_error is not None:
             raise self.schema_error
-        return [{"job_id": "schema-job"}]
+        return [{"job_id": "schema-job"}, "not a job"]
 
 
 def test_an_unavailable_account_list_falls_back_and_is_asked_again_only_when_due():
@@ -91,7 +87,7 @@ def test_an_unavailable_account_list_falls_back_and_is_asked_again_only_when_due
     lister = JobLister(client, account_wide=True, clock=clock)
     listing = lister.load(NOW)
     assert listing.scope == ListScope(FALLBACK, reason=NOT_DEPLOYED) and listing.jobs == [{"job_id": "schema-job"}]
-    assert lister.fallback_reason == NOT_DEPLOYED and client.account_asks == 1
+    assert lister._fallback == NOT_DEPLOYED and client.account_asks == 1
 
     clock.now += ACCOUNT_MANUAL_REPROBE_SECONDS / 2
     lister.load(NOW, manual=True)  # r, too soon after the last ask
@@ -104,7 +100,7 @@ def test_an_unavailable_account_list_falls_back_and_is_asked_again_only_when_due
     clock.now += ACCOUNT_REPROBE_SECONDS
     client.account_error = None
     listing = lister.load(NOW)
-    assert client.account_asks == 3 and listing.scope == ListScope(ACCOUNT) and lister.fallback_reason is None
+    assert client.account_asks == 3 and listing.scope == ListScope(ACCOUNT) and lister._fallback is None
 
 
 def test_asking_again_while_falling_back_never_raises_and_restarts_the_wait():
@@ -147,7 +143,7 @@ def test_a_403_without_the_services_message_asks_the_configured_schema_once():
     client = _Client(account_error=_unavailable(FORBIDDEN))  # a proxy or a network policy may have sent it
     lister = JobLister(client, account_wide=True)
     assert lister.load(NOW).scope == ListScope(FALLBACK, reason=FORBIDDEN) and client.schema_asks == 1
-    assert lister.fallback_reason == FORBIDDEN
+    assert lister._fallback == FORBIDDEN
 
     refused = requests.exceptions.HTTPError("403 Client Error", response=_response(403))
     client = _Client(account_error=_unavailable(FORBIDDEN), schema_error=refused)
@@ -156,14 +152,7 @@ def test_a_403_without_the_services_message_asks_the_configured_schema_once():
     assert not failed.value.refused and str(failed.value).endswith("; and list_jobs answered HTTP 403 Forbidden")
 
 
-def test_a_client_without_the_account_list_or_with_schema_only_lists_the_configured_schema():
-    class _OlderClient:
-        def list_jobs(self) -> list:  # takes no retry bounds either
-            return [{"job_id": "schema-job"}, "not a job"]
-
-    listing = JobLister(_OlderClient(), account_wide=True).load(NOW)
-    assert listing.scope == ListScope(FALLBACK) and listing.jobs == [{"job_id": "schema-job"}]
-    assert unavailable_text(listing.scope) == "no account-wide list"
+def test_schema_only_lists_the_configured_schema_and_never_asks_the_account_list():
     client = _Client()
     assert JobLister(client, schema_only=True, account_wide=True).load(NOW).scope == ListScope(SCHEMA_ONLY)
     assert client.account_asks == 0

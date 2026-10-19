@@ -23,14 +23,9 @@ Metrics are discovered, not listed: a numeric field is one when its name
 (``[a-z0-9_]+``) ends in a unit suffix, ``_pct``, ``_bytes``, ``_watts`` or
 ``_c`` (see :func:`is_metric_field`). A number without one (an id, a count, a
 duration or a counter, such as ``seq``, ``pid`` or ``*_total``) has no average
-worth charting, and a field that is null in every row has nothing to chart. A
-node's ``cpu_count`` and ``mem_total_bytes`` stay the same through a job, so the
-System view names them in its header and charts neither. Each kind also derives
-its memory used %: a GPU's ``fb_used / (fb_used + fb_free)``, a node's
-``mem_used / mem_total``.
-:class:`KindResource` is one kind of one sub-job: its metrics in the order they
-are shown, its units, and a :class:`KindView` per window for each unit and for
-the mean across units, with every metric's chart and stats.
+worth charting, and a field that is null in every row has nothing to chart. Each
+kind also derives its memory used %: a GPU's ``fb_used / (fb_used + fb_free)``,
+a node's ``mem_used / mem_total``.
 
 ``gpu_util_pct`` is the share of time a kernel was running on the GPU (how
 busy it was, not how saturated).
@@ -52,11 +47,13 @@ from dataclasses import dataclass
 from dataclasses import field
 from datetime import datetime, timedelta, timezone
 from functools import reduce
+from itertools import groupby
 from itertools import repeat
 from operator import add
 from operator import itemgetter
 from operator import mul
 from pathlib import Path
+from statistics import median
 from typing import Callable
 from typing import Mapping
 
@@ -133,9 +130,6 @@ _FALLBACK_INTERVAL_MAX_S = 5 * 60.0
 # its timing) is carried across the gap even where no unit sampled, so a single
 # miss leaves no blank column. A longer hole stays a gap.
 _BRIDGE_INTERVALS = 2.5
-# A running sub-job whose newest sample is older than this (or six sampling
-# intervals, if longer) has stopped sending samples (see stale()).
-STALE_SECONDS = 180.0
 _NAN = float("nan")
 _INF = math.inf
 _OK, _SKIP, _IGNORED = 0, 1, 2
@@ -146,7 +140,6 @@ _SCAN = json.JSONDecoder().scan_once
 
 GPU = "gpu"
 SYSTEM = "system"
-KINDS = (GPU, SYSTEM)
 
 
 @dataclass(frozen=True)
@@ -186,7 +179,7 @@ class Metric:
     """One metric of a kind: a numeric field of its rows, or the derived memory used %.
 
     ``name`` comes from the field by :func:`metric_name`, ``unit`` from its suffix
-    (:func:`metric_unit`). Values are in that unit (bytes as GiB). ``scale`` is the
+    (``_UNIT_SUFFIXES``). Values are in that unit (bytes as GiB). ``scale`` is the
     top of the metric's chart axis: 100 for a percentage, otherwise the
     :func:`nice_ceiling` of the sub-job's highest sample across every unit, so the
     axis doesn't move with the window or the unit.
@@ -196,12 +189,11 @@ class Metric:
     name: str
     unit: str
     scale: float
-    derived: bool = False
 
     @property
     def short(self) -> str:
-        """The name for a narrow column: ``memory`` as ``mem``, and a unit other than % left to the values."""
-        return _short_name(self.name)
+        """The name for a narrow column: ``power``, ``GPU mem used`` (a percentage keeps its ``%``)."""
+        return re.sub(r" \((GiB|W|°C)\)$", "", self.name).replace("memory", "mem")
 
 
 @dataclass(frozen=True)
@@ -209,7 +201,6 @@ class Unit:
     """One GPU (``global_gpu_index``) or node (``worker_num``) of a kind."""
 
     id: int
-    # "GPU 3" (as the rows number it), "node 2" (worker_num 1: nodes count from 1).
     name: str
     # False once it has dropped out of the newest capture: shown dimmed and marked stale.
     reporting: bool
@@ -225,17 +216,13 @@ class KindView:
 
     ``charts`` holds each metric's chart values (bucket averages, None where no
     sample), keyed by :attr:`Metric.key`; ``stats`` its :class:`SeriesStats` over
-    the window. ``units`` counts the units in the view: those with a sample in the
-    window for the mean, 1 for a unit. ``label`` names what the values are:
-    ``mean of 8 GPUs``, or one unit's name (also for a mean over one unit).
+    the window. ``label`` names what the values are: ``mean of 8 GPUs``, or one
+    unit's name (also for a mean over one unit).
     """
 
-    kind: str
     name: str  # the window, a key of RANGES
     start: datetime
     end: datetime
-    unit: int | None  # None: the mean across units
-    units: int
     label: str
     charts: Mapping[str, tuple[float | None, ...]] = field(default_factory=dict)
     stats: Mapping[str, SeriesStats] = field(default_factory=dict)
@@ -279,9 +266,6 @@ class KindResource:
     def unit_ids(self) -> tuple[int, ...]:
         return tuple(unit.id for unit in self.units)
 
-    def unit(self, unit_id: int | None) -> Unit | None:
-        return next((unit for unit in self.units if unit.id == unit_id), None)
-
     def metric(self, key: str) -> Metric | None:
         return next((metric for metric in self.metrics if metric.key == key), None)
 
@@ -321,11 +305,7 @@ class ResourceData:
 
 # ─── metric names, units and scales ──────────────────────────────────────────
 
-# A metric's unit, by its field's suffix. Only a field with one is a metric: a gauge,
-# whose average over a window means something. Any other number in a row identifies
-# or counts something (global_gpu_index, seq, a pid, cpu_count), is a duration
-# (sample_interval_s, an uptime) or a counter that only grows (*_total, ECC and XID
-# error counts); averaged as a gauge, it would chart nonsense.
+# A metric's unit, by its field's suffix: only a field with one is a metric (see the module docstring).
 _UNIT_SUFFIXES = (("_pct", "%"), ("_bytes", "GiB"), ("_watts", "W"), ("_c", "°C"))
 # A metric's field: its name is made into the metric's, which the terminal draws, so
 # only plain lowercase words, and an escape sequence in a field's name never reaches it.
@@ -335,8 +315,8 @@ _NAME_WORDS = {"gpu": "GPU", "cpu": "CPU", "sm": "SM", "dram": "DRAM", "fb": "GP
 
 
 def is_metric_field(name: object) -> bool:
-    """Whether a field is a metric: a name of ``[a-z0-9_]`` that ends in a unit suffix (:func:`metric_unit`)."""
-    return type(name) is str and _METRIC_FIELD_RE.fullmatch(name) is not None and metric_unit(name) != ""
+    """Whether a field is a metric: a name of ``[a-z0-9_]`` that ends in a unit suffix (``_UNIT_SUFFIXES``)."""
+    return type(name) is str and _METRIC_FIELD_RE.fullmatch(name) is not None and _split_unit(name)[1] != ""
 
 
 def _split_unit(field_name: str) -> tuple[str, str]:
@@ -346,32 +326,13 @@ def _split_unit(field_name: str) -> tuple[str, str]:
     return field_name, ""
 
 
-def metric_unit(field_name: str) -> str:
-    """``%``, ``GiB``, ``W``, ``°C`` by the field's suffix (``_pct``, ``_bytes``, ``_watts``, ``_c``), else ``""``."""
-    return _split_unit(field_name)[1]
-
-
 def metric_name(field_name: str) -> str:
-    """A field's name as shown: ``power_watts`` → ``power (W)``, ``fb_free_bytes`` → ``GPU memory free (GiB)``.
-
-    The unit suffix goes into the name, ``_`` become spaces, ``gpu``, ``cpu``,
-    ``sm`` and ``dram`` are upper-cased, ``fb`` reads as ``GPU memory`` and
-    ``mem`` as ``memory``.
-    """
+    """A field's name as shown: ``power_watts`` → ``power (W)``, ``fb_free_bytes`` → ``GPU memory free (GiB)``."""
     base, unit = _split_unit(field_name)
     name = " ".join(_NAME_WORDS.get(word, word) for word in base.split("_") if word) or field_name
     if unit == "%":
         return f"{name} %"
     return f"{name} ({unit})" if unit else name
-
-
-def _short_name(name: str) -> str:
-    """A metric's name for a narrow column: ``power``, ``GPU mem used`` (a percentage keeps its ``%``)."""
-    for ending in (" (GiB)", " (W)", " (°C)"):
-        if name.endswith(ending):
-            name = name[: -len(ending)]
-            break
-    return name.replace("memory", "mem")
 
 
 def nice_ceiling(value: float | None) -> float:
@@ -397,14 +358,6 @@ def _compact(value: float) -> str:
     return f"{value:g}"
 
 
-def _number_text(value: float) -> str:
-    if value == int(value) and abs(value) < 1e6:
-        return str(int(value))
-    if abs(value) >= 1e6:
-        return _compact(value)
-    return f"{value:.3g}"
-
-
 def format_value(value: float | None, unit: str = "") -> str:
     """``85%``, ``1.8%``, ``87.4 GiB``, ``215 GiB``, ``117 W``, ``34 °C``, ``88``; ``—`` when unmeasured."""
     if value is None or value != value:
@@ -415,7 +368,8 @@ def format_value(value: float | None, unit: str = "") -> str:
     if unit == "GiB":
         size = abs(value)
         return f"{value:.2f} GiB" if 0 < size < 9.995 else f"{value:.1f} GiB" if size < 99.95 else f"{value:.0f} GiB"
-    text = _number_text(value)
+    text = str(int(value)) if value == int(value) and abs(value) < 1e6 else _compact(value) if abs(value) >= 1e6 \
+        else f"{value:.3g}"
     return f"{text} {unit}" if unit else text
 
 
@@ -439,12 +393,6 @@ def across_text(kind: str, units: int) -> str:
     return f"mean of {units} {_KIND_SPECS[kind].unit_word}s" if units > 1 else ""
 
 
-def stale(resource: KindResource, now: datetime) -> bool:
-    """Whether the newest sample is too old for a running sub-job (the caller checks it runs)."""
-    interval = resource.sample_interval_s or resource.reported_interval_s or 0
-    return (now - resource.latest_sample_ts).total_seconds() > max(STALE_SECONDS, 6 * interval)
-
-
 # ─── parsing ─────────────────────────────────────────────────────────────────
 
 
@@ -461,15 +409,6 @@ def _finite_number(value) -> float | None:
 def _bounded_number(value, lower: float, upper: float) -> float | None:
     result = _finite_number(value)
     return result if result is not None and lower <= result <= upper else None
-
-
-def _gauge(value, upper: float) -> float | None:
-    """``_bounded_number(value, 0, upper)`` with a fast path for JSON floats."""
-    if type(value) is float:
-        return value if 0.0 <= value <= upper else None  # NaN and infinities fail
-    if value is None:
-        return None
-    return _bounded_number(value, 0, upper)
 
 
 def _number(value, low: float, high: float) -> float:
@@ -548,35 +487,6 @@ def _read_manifest(path: Path) -> tuple[list[str], int, bool] | None:
     return names, committed, partial
 
 
-def _manifest_bytes(path: Path) -> int | None:
-    manifest = _read_manifest(path)
-    return None if manifest is None else manifest[1]
-
-
-def _printable_name(name: str) -> bool:
-    """Whether ``name`` is safe to draw as it is: no control, bidi or zero-width
-    character (``str.isprintable``), and nothing :func:`views.printable` changes."""
-    return name.isprintable() and views.printable(name) == name
-
-
-def _metric_files(metrics_root: Path) -> list[Path]:
-    """Each ``<sub_job_id>/gpu.jsonl`` under ``metrics_root``, in name order.
-
-    The directory's name is the sub-job's id, which the TUI draws, and it comes
-    from the stage's listing. One that isn't printable as it is (an escape
-    sequence, say) is no sub-job's id, so it is passed over rather than shown.
-    """
-    try:
-        paths = sorted(metrics_root.glob("*/gpu.jsonl"))
-    except OSError:
-        return []
-    return [path for path in paths if _printable_name(path.parent.name)]
-
-
-def cached_metric_sources(metrics_root: Path) -> list[str]:
-    return [path.parent.name for path in _metric_files(metrics_root) if _manifest_bytes(path) is not None]
-
-
 # ─── per-unit and per-kind state ─────────────────────────────────────────────
 
 
@@ -615,7 +525,7 @@ class _Field:
 
     def __init__(self, key: str, derived: bool = False) -> None:
         self.key = key
-        self.unit = metric_unit(key)
+        self.unit = _split_unit(key)[1]
         self.derived = derived
         if self.unit == "%":
             self.low, self.high = 0.0, 100.0
@@ -646,26 +556,19 @@ class _Plan:
                  "unit", "stamp", "interval", "memory", "ranked")
 
 
-def _new_cell(slots: int) -> array:
-    """A unit's bin: for each slot its samples' interval-weighted sum and their intervals' sum."""
-    return array("d", (0.0, 0.0)) * slots
+# A unit's bin (a cell): for each slot its samples' interval-weighted sum and their intervals' sum.
+_SUMS = (0.0, 0.0)
+# For each slot the lowest and the highest value: [low, high, low, high, ...].
+_EXTREMES = (_INF, -_INF)
 
 
-def _grow_cell(cell: array, slots: int) -> array:
-    if len(cell) < 2 * slots:
-        cell.extend(_new_cell(slots - len(cell) // 2))
-    return cell
-
-
-def _new_extremes(slots: int) -> array:
-    """For each slot the lowest and the highest value: [low, high, low, high, ...]."""
-    return array("d", (_INF, -_INF)) * slots
-
-
-def _grow_extremes(extremes: array, slots: int) -> array:
-    if len(extremes) < 2 * slots:
-        extremes.extend(_new_extremes(slots - len(extremes) // 2))
-    return extremes
+def _pairs(fill: tuple[float, float], slots: int, values: array | None = None) -> array:
+    """``values`` (a new array when None) with a ``fill`` pair for each of ``slots`` it lacks."""
+    if values is None:
+        return array("d", fill) * slots
+    if len(values) < 2 * slots:
+        values.extend(array("d", fill) * (slots - len(values) // 2))
+    return values
 
 
 class _Unit:
@@ -695,9 +598,9 @@ class _Unit:
         # Samples without a usable interval read so far.
         self.blank = 0
         # Per slot: the weighted sum and the weight of every binned sample, and its
-        # lowest and highest sample (see _new_extremes).
+        # lowest and highest sample (see _EXTREMES).
         self.totals = [0.0] * (2 * slots)
-        self.extremes = _new_extremes(slots)
+        self.extremes = _pairs(_EXTREMES, slots)
         # The row shape last read; where each of its metric values goes (a column's
         # append, or what makes the column on its first value); and the slots with a
         # column that shape lacks.
@@ -709,7 +612,7 @@ class _Unit:
         if len(self.cols) < slots:
             self.cols.extend([None] * (slots - len(self.cols)))
             self.totals.extend([0.0] * (2 * slots - len(self.totals)))
-            _grow_extremes(self.extremes, slots)
+            _pairs(_EXTREMES, slots, self.extremes)
 
     def sort(self) -> None:
         """Put the samples in time order, in place: ``appends`` holds the columns' own appends."""
@@ -755,7 +658,7 @@ class _Series:
         # Raw samples are complete from this time on (older ones live only in bins).
         self.raw_start = -math.inf
         self.bin_width = _BIN_START_S
-        # bin index -> unit -> cell (see _new_cell)
+        # bin index -> unit -> cell (see _SUMS)
         self.bins: dict[int, dict[int, array]] = {}
         # bin index -> per slot [lowest, highest] average across units at one
         # sampling interval, folded in from the raw samples before they leave the
@@ -764,7 +667,7 @@ class _Series:
         # Bins holding rows that arrived after their time had been folded: those
         # rows never reached the raw samples, so their bins' extremes are bounds.
         self.inexact: set[int] = set()
-        # bin index -> per slot the lowest and highest value of those rows (see _new_extremes).
+        # bin index -> per slot the lowest and highest value of those rows (see _EXTREMES).
         self.late: dict[int, array] = {}
         # The newest sample time of the read in progress (see ResourceLoader._read).
         self.pass_newest = -_INF
@@ -773,19 +676,10 @@ class _Series:
         self.horizon = _INF
 
     @property
-    def gpus(self) -> dict[int, _Unit]:
-        """The units (a GPU series' GPUs)."""
-        return self.units
-
-    @property
     def chart_start(self) -> float | None:
         return self.data_first if self.data_first is not None else self.first
 
     # ── reading rows ──
-
-    def begin_read(self) -> None:
-        """Start a read: row shapes are looked at afresh, so each read can move a field's first sighting earlier."""
-        self._plans = {}
 
     def _slot(self, key: str, derived: bool = False) -> int:
         slot = self.slot_of.get(key)
@@ -889,7 +783,7 @@ class _Series:
             return _IGNORED
         interval = values[plan.interval] if plan.interval is not None else None
         if type(interval) is not float or not 0.0 < interval <= _MAX_SAMPLE_INTERVAL_S:
-            interval = _gauge(interval, _MAX_SAMPLE_INTERVAL_S) or None
+            interval = _bounded_number(interval, 0, _MAX_SAMPLE_INTERVAL_S) or None
 
         unit = self.units.get(unit_id)
         if unit is None:
@@ -1015,12 +909,10 @@ class _Series:
         key = int(ts // self.bin_width)
         cells = self.bins.setdefault(key, {})
         slots = len(self.fields)
-        cell = cells.get(unit_id)
-        cell = cells[unit_id] = _new_cell(slots) if cell is None else _grow_cell(cell, slots)
+        cell = cells[unit_id] = _pairs(_SUMS, slots, cells.get(unit_id))
         unit = self.units[unit_id]
         totals, extremes = unit.totals, unit.extremes
-        late = self.late.get(key)
-        late = self.late[key] = _new_extremes(slots) if late is None else _grow_extremes(late, slots)
+        late = self.late[key] = _pairs(_EXTREMES, slots, self.late.get(key))
         for slot, value in found:
             offset = 2 * slot
             cell[offset] += value * interval
@@ -1053,18 +945,13 @@ class _Series:
             start, stop = unit.binned, len(unit.ts)
             if start >= stop:
                 continue
-            ts, weight = unit.ts, unit.weight
+            ts = unit.ts
             live = [(slot, column) for slot, column in enumerate(unit.cols) if column is not None]
-            _grow_extremes(unit.extremes, slots)
-            # The unit's lowest and highest samples: min and max pass over NaN unless it comes first.
-            for slot, column in live:
-                segment = column[start:stop]
-                low, high = min(segment), max(segment)
-                if low != low or high != high or unit.blank:
-                    found = [value for value, w in zip(segment, weight[start:stop]) if value == value and w > 0]
-                    if not found:
-                        continue
-                    low, high = min(found), max(found)
+            _pairs(_EXTREMES, slots, unit.extremes)
+            for slot, _column in live:
+                low, high = _exact(unit, slot, start, stop)
+                if low is None:
+                    continue
                 extremes = unit.extremes
                 if low < extremes[2 * slot]:
                     extremes[2 * slot] = low
@@ -1096,11 +983,8 @@ class _Series:
             if not keep:
                 return
             weights = array("d", (weights[k] for k in keep))
-        cells = self.bins.get(key)
-        if cells is None:
-            cells = self.bins[key] = {}
-        cell = cells.get(unit_id)
-        cell = cells[unit_id] = _new_cell(slots) if cell is None else _grow_cell(cell, slots)
+        cells = self.bins.setdefault(key, {})
+        cell = cells[unit_id] = _pairs(_SUMS, slots, cells.get(unit_id))
         totals = unit.totals
         folded: dict[float, float] = {}  # interval sums by the sum they start from
 
@@ -1145,8 +1029,8 @@ class _Series:
                     if existing is None:
                         target[unit_id] = cell
                         continue
-                    _grow_cell(existing, slots)
-                    _grow_cell(cell, slots)
+                    _pairs(_SUMS, slots, existing)
+                    _pairs(_SUMS, slots, cell)
                     for offset in range(0, 2 * slots, 2):
                         existing[offset] += cell[offset]
                         existing[offset + 1] += cell[offset + 1]
@@ -1204,9 +1088,7 @@ class _Series:
                     continue
                 if values is None:
                     key = int((right - (last - k) * width) // self.bin_width)
-                    values = self.extremes.get(key)
-                    values = self.extremes[key] = _new_extremes(slots) if values is None \
-                        else _grow_extremes(values, slots)
+                    values = self.extremes[key] = _pairs(_EXTREMES, slots, self.extremes.get(key))
                 if mean < values[2 * slot]:
                     values[2 * slot] = mean
                 if mean > values[2 * slot + 1]:
@@ -1237,15 +1119,15 @@ class _Series:
 
 
 def _merge_extremes(by_bin: dict[int, array], slots: int) -> dict[int, array]:
-    """Per-bin extremes for bins twice as wide (see _new_extremes)."""
+    """Per-bin extremes for bins twice as wide (see _EXTREMES)."""
     merged: dict[int, array] = {}
     for key, values in by_bin.items():
         existing = merged.get(key // 2)
         if existing is None:
             merged[key // 2] = values
             continue
-        _grow_extremes(existing, slots)
-        _grow_extremes(values, slots)
+        _pairs(_EXTREMES, slots, existing)
+        _pairs(_EXTREMES, slots, values)
         for offset in range(0, 2 * slots, 2):
             existing[offset] = min(existing[offset], values[offset])
             existing[offset + 1] = max(existing[offset + 1], values[offset + 1])
@@ -1537,12 +1419,8 @@ def _accumulate(series: _Series, left: float, latest: float, width: float, count
 _NO_OLDER: tuple[float | None, float | None] = (None, None)
 
 
-def _whole_percent(a: float, b: float) -> bool:
-    return round(a) == round(b)
-
-
-def _stats(low: float | None, high: float | None, avg: float | None, latest: float | None,
-           older: tuple[float | None, float | None] = _NO_OLDER, same: Callable = _whole_percent) -> SeriesStats:
+def _stats(low: float | None, high: float | None, avg: float | None, latest: float | None, same: Callable,
+           older: tuple[float | None, float | None] = _NO_OLDER) -> SeriesStats:
     """``avg``: the unit-time mean; ``older``: the lowest and highest sample of the history known only as bins.
 
     ``same(a, b)``: whether two values read the same at the precision shown.
@@ -1632,11 +1510,7 @@ def _value_interval(series: _Series) -> float | None:
         runs = sorted(b - a for a, b in zip(changes, changes[1:]))
         if len(runs) >= 2:
             per_unit.append(runs[len(runs) // 4])
-    if not per_unit:
-        return None
-    per_unit.sort()
-    middle = len(per_unit) // 2
-    return per_unit[middle] if len(per_unit) % 2 else (per_unit[middle - 1] + per_unit[middle]) / 2
+    return median(per_unit) if per_unit else None
 
 
 def _derived_interval(series: _Series) -> float | None:
@@ -1646,11 +1520,7 @@ def _derived_interval(series: _Series) -> float | None:
         unit.sort()
         ts = unit.ts[-(_INTERVAL_DELTAS + 1):]
         deltas.extend(b - a for a, b in zip(ts, ts[1:]) if b - a > 1e-3)
-    if not deltas:
-        return None
-    deltas.sort()
-    middle = len(deltas) // 2
-    return deltas[middle] if len(deltas) % 2 else (deltas[middle - 1] + deltas[middle]) / 2
+    return median(deltas) if deltas else None
 
 
 class _Capture:
@@ -1668,38 +1538,38 @@ class _Capture:
 class _Frame:
     """One window of one kind, as built on the loading thread: every unit's and the mean's values."""
 
-    __slots__ = ("name", "start", "end", "count", "keys", "units", "charts", "stats", "unit_charts", "unit_stats")
+    __slots__ = ("name", "start", "end", "keys", "units", "charts", "stats", "unit_charts", "unit_stats")
 
     def view(self, kind: str, unit: int | None, units: tuple[Unit, ...]) -> KindView | None:
         if unit is None:
             # The mean of one unit is that unit's values: it goes by its name.
             label = across_text(kind, self.units) or (units[0].name if len(units) == 1 else "")
-            return KindView(kind=kind, name=self.name, start=self.start, end=self.end, unit=None, units=self.units,
-                            label=label, charts=self.charts, stats=self.stats)
+            return KindView(name=self.name, start=self.start, end=self.end, label=label, charts=self.charts,
+                            stats=self.stats)
         columns = self.unit_charts.get(unit)
         if columns is None:
             return None
         charts = {key: tuple(None if value != value else value for value in column)
                   for key, column in zip(self.keys, columns) if column is not None}
         stats = dict(zip(self.keys, self.unit_stats[unit]))
-        return KindView(kind=kind, name=self.name, start=self.start, end=self.end, unit=unit, units=1,
-                        label=unit_name(kind, unit), charts=charts, stats=stats)
+        return KindView(name=self.name, start=self.start, end=self.end, label=unit_name(kind, unit), charts=charts,
+                        stats=stats)
 
 
 def _same_shown(unit: str) -> Callable[[float, float], bool]:
     return lambda a, b: format_value(a, unit) == format_value(b, unit)
 
 
-def _exact(unit: _Unit, slot: int, begin: int) -> tuple[float | None, float | None]:
-    """The lowest and highest of one unit's samples from ``begin`` on (those with an interval)."""
+def _exact(unit: _Unit, slot: int, begin: int, stop: int | None = None) -> tuple[float | None, float | None]:
+    """The lowest and highest of one unit's samples from ``begin`` on, before ``stop`` (those with an interval)."""
     column = unit.cols[slot] if slot < len(unit.cols) else None
     if column is None or begin >= len(column):
         return None, None
-    segment = column[begin:]
+    segment = column[begin:stop]
     low, high = min(segment), max(segment)  # they pass over NaN, unless it comes first
     if low == low and high == high and not unit.blank:
         return low, high
-    values = [value for value, w in zip(segment, unit.weight[begin:]) if value == value and w > 0]
+    values = [value for value, w in zip(segment, unit.weight[begin:stop]) if value == value and w > 0]
     return (min(values), max(values)) if values else (None, None)
 
 
@@ -1715,24 +1585,31 @@ def _column(values, factor: float) -> array:
     return array("d", (_NAN if v is None else v * factor for v in values))
 
 
-def _finish_frame(series: _Series, frame: _Frame, slots: list[int], keys: list[str], capture: _Capture,
-                  extremes, pooled, older, unit_extremes, averages) -> None:
-    """The stats of a frame's mean and units, from their parts, in each metric's unit."""
+def _finish_frame(series: _Series, name: str, left: float, slots: list[int], capture: _Capture, means, per_unit,
+                  extremes, pooled, older, unit_extremes, averages) -> _Frame:
+    """A frame from its parts: its charts, and the stats of its mean and units, in each metric's unit."""
+    keys = [series.fields[slot].key for slot in slots]
     shown = [_same_shown(series.fields[slot].unit) for slot in slots]
     factors = [series.fields[slot].factor for slot in slots]
+    frame = _Frame()
+    frame.name, frame.start, frame.end, frame.keys = name, _utc(left), _utc(series.latest), keys
+    frame.charts = {key: _chart(values, factor) for key, values, factor in zip(keys, means, factors)}
+    frame.unit_charts = {unit_id: [None if values is None else _column(values, factor)
+                                   for values, factor in zip(columns, factors)]
+                         for unit_id, columns in per_unit.items()}
     parts = [tuple(_scaled(value, factors[j]) for value in (low, high, pooled[j], capture.mean[slot]))
              + (tuple(_scaled(value, factors[j]) for value in older[j]),)
              for j, (slot, (low, high)) in enumerate(zip(slots, extremes))]
-    frame.stats = {keys[j]: _stats(low, high, avg, latest, bounds, shown[j])
+    frame.stats = {keys[j]: _stats(low, high, avg, latest, shown[j], bounds)
                    for j, (low, high, avg, latest, bounds) in enumerate(parts)}
     frame.unit_stats = {}
     for unit_id in series.units:
         latest = capture.values[unit_id]
         frame.unit_stats[unit_id] = [
-            _stats(*(_scaled(value, factors[j]) for value in (low, high, averages[unit_id][j], latest[slot])),
-                   same=shown[j])
+            _stats(*(_scaled(value, factors[j]) for value in (low, high, averages[unit_id][j], latest[slot])), shown[j])
             for j, (slot, (low, high)) in enumerate(zip(slots, unit_extremes[unit_id]))]
     frame.units = sum(1 for unit_id in series.units if any(avg is not None for avg in averages[unit_id]))
+    return frame
 
 
 def _raw_frame(series: _Series, name: str, duration: timedelta | None, capture: _Capture, native: _Native,
@@ -1745,28 +1622,17 @@ def _raw_frame(series: _Series, name: str, duration: timedelta | None, capture: 
     per_unit: dict = {}
     means, averages, pooled = _accumulate(series, left, latest, width, count, hold_s, per_unit=per_unit,
                                           slots=slots)
-    keys = [series.fields[slot].key for slot in slots]
-    factors = [series.fields[slot].factor for slot in slots]
-    frame = _Frame()
-    frame.name, frame.start, frame.end, frame.count, frame.keys = name, _utc(left), _utc(latest), count, keys
-    frame.charts = {key: _chart(values, factor) for key, values, factor in zip(keys, means, factors)}
-    frame.unit_charts = {unit_id: [None if values is None else _column(values, factor)
-                                   for values, factor in zip(columns, factors)]
-                         for unit_id, columns in per_unit.items()}
     unit_extremes = {}
     for unit_id, unit in series.units.items():
         begin = bisect_left(unit.ts, left - 1e-6)
         unit_extremes[unit_id] = [_exact(unit, slot, begin) for slot in slots]
-    _finish_frame(series, frame, slots, keys, capture, native.extremes(left), pooled, [_NO_OLDER] * len(slots),
-                  unit_extremes, averages)
-    return frame
+    return _finish_frame(series, name, left, slots, capture, means, per_unit, native.extremes(left), pooled,
+                         [_NO_OLDER] * len(slots), unit_extremes, averages)
 
 
 def _binned_frame(series: _Series, name: str, capture: _Capture, native: _Native, slots: list[int]) -> _Frame:
     """The whole job from the running bins, once it is longer than the raw retention."""
     width = series.bin_width
-    keys = [series.fields[slot].key for slot in slots]
-    count_s = len(slots)
     charts: list[list] = [[] for _ in slots]
     own: dict[int, list[list]] = {unit_id: [[] for _ in slots] for unit_id in series.units}
     # Per slot the lowest and highest average across units at one interval in the
@@ -1778,7 +1644,7 @@ def _binned_frame(series: _Series, name: str, capture: _Capture, native: _Native
     # Per unit and slot its lowest and highest sample: every one of them has been binned.
     exact = {}
     for unit_id, unit in series.units.items():
-        extremes = _grow_extremes(unit.extremes, len(series.fields))
+        extremes = _pairs(_EXTREMES, len(series.fields), unit.extremes)
         exact[unit_id] = [[extremes[2 * slot], extremes[2 * slot + 1]] for slot in slots]
     if series.bins:
         # rebin() keeps the bins' keys within _MAX_BINS of each other, and every bin
@@ -1811,7 +1677,7 @@ def _binned_frame(series: _Series, name: str, capture: _Capture, native: _Native
                     folded[j][0] = min(folded[j][0], mean)
                     folded[j][1] = max(folded[j][1], mean)
             for unit_id, columns in own.items():
-                for j in range(count_s):
+                for j in range(len(slots)):
                     if len(columns[j]) < len(charts[j]):
                         columns[j].append(None)
     averages = {}
@@ -1834,16 +1700,8 @@ def _binned_frame(series: _Series, name: str, capture: _Capture, native: _Native
     older = [tuple(value if math.isfinite(value) else None for value in pair) for pair in limits]
     unit_extremes = {unit_id: [tuple(value if math.isfinite(value) else None for value in pair) for pair in found]
                      for unit_id, found in exact.items()}
-    factors = [series.fields[slot].factor for slot in slots]
-    frame = _Frame()
-    frame.name, frame.start, frame.end = name, _utc(series.chart_start), _utc(series.latest)
-    frame.count = len(charts[0]) if charts else 0
-    frame.keys = keys
-    frame.charts = {key: _chart(values, factor) for key, values, factor in zip(keys, charts, factors)}
-    frame.unit_charts = {unit_id: [_column(values, factor) for values, factor in zip(columns, factors)]
-                         for unit_id, columns in own.items()}
-    _finish_frame(series, frame, slots, keys, capture, extremes, pooled, older, unit_extremes, averages)
-    return frame
+    return _finish_frame(series, name, series.chart_start, slots, capture, charts, own, extremes, pooled, older,
+                         unit_extremes, averages)
 
 
 def _snapshot(series: _Series, partial: bool) -> KindResource:
@@ -1879,7 +1737,7 @@ def _snapshot(series: _Series, partial: bool) -> KindResource:
                 peak = max((row[slot] for row in capture.values.values() if row[slot] is not None), default=None)
             scale = nice_ceiling(_scaled(peak, column.factor))
         name = metric_name(column.key)
-        metrics.append(Metric(key=column.key, name=name, unit=column.unit, scale=scale, derived=column.derived))
+        metrics.append(Metric(key=column.key, name=name, unit=column.unit, scale=scale))
     keys = [series.fields[slot].key for slot in slots]
     factors = [series.fields[slot].factor for slot in slots]
     reporting = set(capture.reporting)
@@ -1934,7 +1792,7 @@ def _kind_series(sub_job_id: str) -> dict[str, _Series]:
 @dataclass
 class _FileState:
     series: _Series  # the GPU rows
-    system: _Series | None = None  # the system rows
+    system: _Series  # the system rows
     ino: tuple[int, int] = (0, 0)
     names: list[str] = field(default_factory=list)
     offset: int = 0  # bytes read: the end of the last complete line
@@ -1946,10 +1804,6 @@ class _FileState:
     built: dict = field(default_factory=dict)
     # The manifest says the file holds only the newest chunks so far.
     older_pending: bool = False
-
-    def __post_init__(self) -> None:
-        if self.system is None:
-            self.system = _Series(self.series.sub_job_id, _SYSTEM_KIND)
 
     @property
     def kinds(self) -> tuple[_Series, _Series]:
@@ -2150,7 +2004,7 @@ class ResourceLoader:
         handle.seek(start)
         lines = handle.read(committed - start).split(b"\n")[:-1]
         tail = scan(lines[1:] if start else lines)  # the first may be the end of an earlier line
-        return {kind: (head[kind].data_first, tail[kind].data_last) for kind in KINDS}
+        return {kind: (head[kind].data_first, tail[kind].data_last) for kind in _KIND_SPECS}
 
     def _read(self, state: _FileState, handle, start: int, end: int, *, fold: bool = True) -> int:
         """Ingest the complete lines in [start, end); return the offset after the last one.
@@ -2165,7 +2019,7 @@ class ResourceLoader:
         gpu, system = state.series, state.system
         for series in (gpu, system):
             series.pass_newest = -_INF
-            series.begin_read()
+            series._plans = {}  # row shapes looked at afresh: each read can move a field's first sighting earlier
         gpu_ingest, system_ingest = gpu.ingest, system.ingest
         loads, scan = json.loads, _SCAN
         handle.seek(start)
@@ -2242,6 +2096,30 @@ def load_resource_data(metrics_root: Path) -> ResourceData:
     return ResourceLoader(metrics_root).load()
 
 
+def cached_metric_sources(metrics_root: Path) -> list[str]:
+    return [path.parent.name for path in _metric_files(metrics_root) if _read_manifest(path) is not None]
+
+
+def _printable_name(name: str) -> bool:
+    """Whether ``name`` is safe to draw as it is: no control, bidi or zero-width
+    character (``str.isprintable``), and nothing :func:`views.printable` changes."""
+    return name.isprintable() and views.printable(name) == name
+
+
+def _metric_files(metrics_root: Path) -> list[Path]:
+    """Each ``<sub_job_id>/gpu.jsonl`` under ``metrics_root``, in name order.
+
+    The directory's name is the sub-job's id, which the TUI draws, and it comes
+    from the stage's listing. One that isn't printable as it is (an escape
+    sequence, say) is no sub-job's id, so it is passed over rather than shown.
+    """
+    try:
+        paths = sorted(metrics_root.glob("*/gpu.jsonl"))
+    except OSError:
+        return []
+    return [path for path in paths if _printable_name(path.parent.name)]
+
+
 _LOADERS: OrderedDict[str, ResourceLoader] = OrderedDict()
 _LOADERS_GUARD = threading.Lock()
 _MAX_LOADERS = 4
@@ -2262,10 +2140,7 @@ def resource_loader(metrics_root: Path) -> ResourceLoader:
 
 
 # ─── GPU type and allocation ─────────────────────────────────────────────────
-# The control plane's rule for what a sub-job adds to its job's GPU request: its
-# config's ``n_gpus``, except that a log_prob sub-job uses none, and a sub-job
-# with ``multiplex_job_id`` runs on that sub-job's GPUs and adds none. The job
-# list and the preview apply it through the same helpers in ``views``.
+# What a sub-job adds to its job's GPU request is views.requested_gpus's rule, as in the job list and the preview.
 
 
 @dataclass(frozen=True)
@@ -2281,13 +2156,7 @@ class GpuAllocation:
 
 
 def gpu_allocation(job: dict | None, sub_job_id: str | None) -> GpuAllocation:
-    """What ``sub_job_id`` of ``job`` asked for, read as the job list and the preview read it.
-
-    The sub-job is looked up among :func:`views.sub_jobs` (which derives the ids
-    of an UNKNOWN job's configs), and its type, the sub-job it is multiplexed
-    onto and its GPUs come from :func:`views.sub_job_kind`,
-    :func:`views.multiplex_target` and :func:`views.requested_gpus`.
-    """
+    """What ``sub_job_id`` of ``job`` asked for, read as the job list and the preview read it."""
     job = job if isinstance(job, dict) else {}
     hardware = views.collapse(job.get("hardware")) or None
     sub_job = next(
@@ -2298,10 +2167,7 @@ def gpu_allocation(job: dict | None, sub_job_id: str | None) -> GpuAllocation:
         return GpuAllocation(hardware=hardware)
     kind = views.sub_job_kind(sub_job)
     shared = views.multiplex_target(sub_job)
-    try:
-        count = views.requested_gpus(sub_job)
-    except (OverflowError, ValueError):  # a count no int holds, such as an infinite n_gpus
-        count = 0
+    count = views.requested_gpus(sub_job)
     # requested_gpus reads a missing or unusable n_gpus as 0: unknown here.
     requested = 0 if kind == "log_prob" or shared else (count if count > 0 else None)
     return GpuAllocation(hardware=hardware, requested=requested, shared_with=shared or None,
@@ -2418,15 +2284,11 @@ def _collapse(values: tuple[float | None, ...], width: int) -> list[float | None
     return collapsed
 
 
-def _glyph(value: float | None, scale: float = 100.0) -> str:
+def level_glyph(value: float | None, scale: float = 100.0) -> str:
+    """One cell, a bar as tall as ``value`` of ``scale`` (``▁`` to ``█``); blank when unmeasured."""
     if value is None:
         return " "
     return _BLOCKS[min(len(_BLOCKS) - 1, max(0, math.ceil(value / scale * len(_BLOCKS)) - 1))]
-
-
-def level_glyph(value: float | None, scale: float = 100.0) -> str:
-    """One cell, a bar as tall as ``value`` of ``scale`` (``▁`` to ``█``); blank when unmeasured."""
-    return _glyph(value, scale)
 
 
 def _bar_row(values: list[float | None], height: int, level: int, scale: float = 100.0) -> str:
@@ -2505,7 +2367,7 @@ def _chart_spans(values, start: datetime, end: datetime, width: int, height: int
     axis_style, grid_style = (CHART_AXIS, CHART_GRID) if hue else ("", "")
     axis = max(len(label) for label in labels)
     if width < axis + 3:
-        return [[("".join(_glyph(value, scale) for value in _collapse(values, width)), hue or "")]]
+        return [[("".join(level_glyph(value, scale) for value in _collapse(values, width)), hue or "")]]
     height = max(1, height)
     inner = max(1, width - axis - 2)
     columns = _collapse(values, inner)
@@ -2525,44 +2387,19 @@ def _chart_spans(values, start: datetime, end: datetime, width: int, height: int
         cells = _bar_row(columns, height, level, scale)
         if index == middle_row and height > 2:
             cells = cells.replace(" ", _GRID)
-        spans = [(mark, axis_style), (padding, "")]
         # Runs of bar and of gridline, each in its own style.
-        run, kind = "", None
-        for cell in cells:
-            this = "grid" if cell == _GRID else "gap" if cell == " " else "bar"
-            if this != kind and run:
-                spans.append((run, grid_style if kind == "grid" else bar(level) if kind == "bar" else ""))
-                run = ""
-            run, kind = run + cell, this
-        if run:
-            spans.append((run, grid_style if kind == "grid" else bar(level) if kind == "bar" else ""))
-        lines.append(spans)
+        styles = {_GRID: grid_style, " ": "", "█": bar(level)}
+        runs = groupby(cells, lambda cell: cell if cell in (_GRID, " ") else "█")
+        lines.append([(mark, axis_style), (padding, ""), *(("".join(run), styles[kind]) for kind, run in runs)])
     lines.append([(f"{bottom:>{axis}} └{padding}{'─' * chart_width}", axis_style)])
     lines.append([((" " * (axis + 2) + _time_labels(start, end, chart_width, inner)).rstrip(), axis_style)])
     return lines
 
 
-def _draw(values, start: datetime, end: datetime, width: int, height: int, labels: tuple[str, str, str],
-          scale: float) -> str:
-    """A bar chart of ``values`` from 0 to ``scale``, ``height`` rows tall, its axis labelled ``labels``."""
-    lines = _chart_spans(values, start, end, width, height, labels, scale, None)
-    return "\n".join("".join(text for text, _style in line) for line in lines)
-
-
-def render_metric_chart(view: KindView, metric: Metric, width: int, *, height: int = 2) -> str:
-    """``metric``'s chart in ``view``: from 0 to ``metric.scale``, ``height`` rows of bars, ``width`` cells wide.
-
-    The axis is labelled with :func:`axis_labels`, its label column as wide as its
-    longest label; with an even ``height`` the middle label's row tops out at
-    exactly half the scale. Under the bars, the window's times (see
-    :func:`_time_labels`).
-    """
-    return _draw(view.chart(metric.key), view.start, view.end, width, height, axis_labels(metric), metric.scale)
-
-
 def metric_chart_spans(view: KindView, metric: Metric, width: int, *, height: int = 2,
                        hue: str | None = None) -> list[list[tuple[str, str]]]:
-    """:func:`render_metric_chart` as lines of ``(text, style)`` spans, the bars in ``hue``."""
+    """``metric``'s chart in ``view`` as lines of ``(text, style)`` spans (see :func:`_chart_spans`), its axis
+    labelled by :func:`axis_labels`: with an even ``height`` the middle label's row tops out at half the scale."""
     return _chart_spans(view.chart(metric.key), view.start, view.end, width, height, axis_labels(metric),
                         metric.scale, hue)
 
@@ -2585,13 +2422,7 @@ def format_interval(seconds: float | None) -> str:
 
 def format_age(seconds: float) -> str:
     seconds = int(max(0, seconds))
-    if seconds < 60:
-        return f"{seconds} s"
-    if seconds < 3600:
-        return f"{seconds // 60}m {seconds % 60:02d}s"
-    if seconds < 86400:
-        return f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
-    return f"{seconds // 86400}d {seconds % 86400 // 3600}h"
+    return f"{seconds} s" if seconds < 60 else views.fmt_duration(seconds)
 
 
 def scrape_text(sub_job: KindResource, *, notes: bool = True) -> str:
@@ -2667,20 +2498,9 @@ def window_complete(sub_job: KindResource, view: KindView) -> bool:
 
 
 def metric_stats_spans(view: KindView, whole: KindView | None, metrics, *, width: int, partial: bool = False,
-                       window_partial: bool = False, missing: str = LOADING_OLDER,
-                       hues=None) -> list[list[tuple[str, str]]]:
-    """The stats block as lines of ``(text, style)`` spans: each metric's
-    name in its chart's colour (``hues``, in the metrics' order; :func:`chart_hue`
-    without), the latest values bold, the column heads muted."""
-    metrics = list(metrics)
-    hues = list(hues) if hues is not None else [chart_hue(index) for index in range(len(metrics))]
-    return _stats_lines(view, whole, metrics, width=width, partial=partial, window_partial=window_partial,
-                        missing=missing, hues=hues)
-
-
-def _stats_lines(view: KindView, whole: KindView | None, metrics, *, width: int, partial: bool,
-                 window_partial: bool, missing: str, hues) -> list[list[tuple[str, str]]]:
-    """The stats block's lines, as ``(text, style)`` spans (styled with ``hues``)."""
+                       window_partial: bool = False, missing: str = LOADING_OLDER) -> list[list[tuple[str, str]]]:
+    """The stats block as lines of ``(text, style)`` spans: each metric's name in its
+    chart's colour (:func:`chart_hue`), the latest values bold, the column heads muted."""
     metrics = list(metrics)
     window_partial = window_partial or (partial and view.name == "all")
     scopes = [(window_label(view.name), None if window_partial else view)]
@@ -2706,17 +2526,11 @@ def _stats_lines(view: KindView, whole: KindView | None, metrics, *, width: int,
     block = 4 * cell
     missing_cell = missing if len(missing) <= block else missing[: block - 1] + "…"
 
-    styled = hues is not None
-    head_style, muted = (CHART_AXIS, CHART_MUTED) if styled else ("", "")
-
     def scope_cells(found: list[str] | None) -> list[tuple[str, str]]:
         if found is None:
-            return [(f"{missing_cell:>{block}}", f"italic {muted}" if styled else "")]
+            return [(f"{missing_cell:>{block}}", f"italic {CHART_MUTED}")]
         # The latest value stands out: it is what the panel and the chart titles show.
-        return [(f"{text:>{cell}}", "bold" if styled and index == 3 else "") for index, text in enumerate(found)]
-
-    def hue(index: int) -> str:
-        return hues[index] if styled and index < len(hues) else ""
+        return [(f"{text:>{cell}}", "bold" if index == 3 else "") for index, text in enumerate(found)]
 
     label = view.label
     # Each scope says what its own values are: a GPU that stopped reporting is in the whole
@@ -2730,12 +2544,11 @@ def _stats_lines(view: KindView, whole: KindView | None, metrics, *, width: int,
         name_width = max([len(name) for name in names] + [0]) + 2
         if width >= name_width + (block + 2) * len(scopes):
             lines = [
-                [((" " * name_width + "".join(f"  {title:^{block}}" for title in titles)).rstrip(),
-                  "bold" if styled else "")],
-                [(" " * name_width + "".join("  " + header for _ in scopes), head_style)],
+                [((" " * name_width + "".join(f"  {title:^{block}}" for title in titles)).rstrip(), "bold")],
+                [(" " * name_width + "".join("  " + header for _ in scopes), CHART_AXIS)],
             ]
             for index, (name, row) in enumerate(zip(names, table)):
-                line = [(f"{name:<{name_width}}", hue(index))]
+                line = [(f"{name:<{name_width}}", chart_hue(index))]
                 for found in row:
                     line += [("  ", ""), *scope_cells(found)]
                 lines.append(line)
@@ -2748,11 +2561,11 @@ def _stats_lines(view: KindView, whole: KindView | None, metrics, *, width: int,
         names = [view.name, "job"]
     scope_width = max(len(name) for name in names) + 1 if len(scopes) > 1 else 0
     name_width = max(4, width - scope_width - block)
-    lines = [[(views.fit_cells(label, name_width + scope_width).ljust(name_width + scope_width),
-               "bold" if styled else ""), (header, head_style)]]
+    lines = [[(views.fit_cells(label, name_width + scope_width).ljust(name_width + scope_width), "bold"),
+              (header, CHART_AXIS)]]
     for index, (metric, row) in enumerate(zip(metrics, table)):
         for position, (name, found) in enumerate(zip(names, row)):
             shown = views.fit_cells(metric.short, name_width - 1) if position == 0 else ""
-            lines.append([(f"{shown:<{name_width}}", hue(index)), (f"{name:<{scope_width}}", muted),
+            lines.append([(f"{shown:<{name_width}}", chart_hue(index)), (f"{name:<{scope_width}}", CHART_MUTED),
                           *scope_cells(found)])
     return lines

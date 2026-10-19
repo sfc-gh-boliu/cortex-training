@@ -172,18 +172,6 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
     return p
 
 
-def read_only_client(client):
-    """``client`` with database creation turned off, for the read-only TUI.
-
-    By default a request answered "database or schema not found" makes the
-    client run ``CREATE DATABASE`` (and ``CREATE SCHEMA``) and retry. The TUI
-    only reads, so, like a client from ``CortexTrainingClient.for_job``, it
-    shows that error instead (``CortexTrainingClient.auto_create_database``).
-    """
-    client.auto_create_database = False
-    return client
-
-
 def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     parser = _build_arg_parser(prog=prog)
     args = parser.parse_args(argv)
@@ -214,9 +202,9 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
 
     import cortex_training._cli as cli
 
-    # Reuse the CLI's resolution: --config / login state / env / defaults. The
-    # config file's poll_interval applies unless --poll-interval is given; with
-    # neither, the TUI's default does, not the CLI's.
+    # Reuse the CLI's resolution: --config / login state / env / defaults.
+    # The config file's poll_interval applies unless --poll-interval is given;
+    # with neither, the TUI's default does, not the CLI's.
     explicit_poll = args.poll_interval is not None
     try:
         args = cli._resolve_args(args)
@@ -224,7 +212,8 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
         # config file they came from (the CLI's resolution reads it for itself):
         # whether it sets poll_interval, and the host or base URL it gives by
         # itself (for the commands the TUI shows to copy).
-        config = _selected_config(cli, args)
+        selected = getattr(args, "_legacy_config_selected", False) and args.config
+        config = cli._load_config(args.config) if selected else {}
         configured = cli._config_float(config, "poll_interval")
         from_config = _config_connection(cli, config)
     except (OSError, ValueError, RuntimeError) as exc:
@@ -255,11 +244,14 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     from cortex_training.snowflake_auth import SnowflakeProfileError
 
     try:
-        client = read_only_client(cli.build_client(args, cli._load_cortex_training_client_class()))
+        client = cli.build_client(args, cli._load_cortex_training_client_class())
     except (SnowflakeProfileError, ValueError) as exc:
         # With no config, login state or flags, the TUI tries the configured-default
         # Snowflake connection, which a first run doesn't have: say how to connect.
         parser.exit(2, f"{parser.prog}: error: {exc}\n{_CONNECT_HINT}\n")
+    # The TUI only reads: "database or schema not found" is shown, as a for_job client
+    # shows it, not answered with CREATE DATABASE / SCHEMA and a retry.
+    client.auto_create_database = False
 
     # job_id is optional: given, open that job's details; omitted, open the job
     # list so the user can choose one.
@@ -271,16 +263,9 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
 
 
 def _sign_in(cli, args, from_config: dict) -> dict:
-    """How the TUI's client connects, from the resolved arguments, for the
-    commands it shows to copy (``views.sign_in_options``).
-
-    It never holds the PAT. ``config`` is the config file read, as an
-    absolute path, so a copied command finds it from any directory.
-    ``host_in_config`` (a PAT) and ``base_url_in_config`` say whether that file
-    by itself gives the host or base URL the client uses (``from_config``, see
-    :func:`_config_connection`); when a flag or the environment set or overrode
-    it, the copied command names it after ``--config FILE`` (``views.sign_in_options``).
-    """
+    """How the TUI's client connects, for the commands it shows to copy (read by
+    ``views.sign_in_options``). It never holds the PAT; ``config`` is the config
+    file as an absolute path, so a copied command finds it from any directory."""
     if args.use_connection_profile:
         return {"kind": "profile"}
     config = None
@@ -294,18 +279,9 @@ def _sign_in(cli, args, from_config: dict) -> dict:
             "host_in_config": bool(host) and from_config.get("host") == host}
 
 
-def _selected_config(cli, args) -> dict:
-    """The config file the resolved arguments came from, as the CLI reads it; empty
-    for a connection profile, or flags and env only."""
-    if not getattr(args, "_legacy_config_selected", False) or not args.config:
-        return {}
-    return cli._load_config(args.config)
-
-
 def _config_connection(cli, values: dict) -> dict:
-    """What the config file (``values``, see :func:`_selected_config`) gives by
-    itself, as the CLI reads it: its ``base_url`` and PAT ``host`` (normalized),
-    None where it gives neither."""
+    """What the config file (``values``, as the CLI reads it; empty for none) gives by
+    itself: its ``base_url`` and PAT ``host`` (normalized), None where it gives neither."""
     base_url, host = cli._config_str(values, "base_url"), cli._config_str(values, "host")
     if base_url and not cli._has_url_scheme(base_url) and host is None:
         base_url, host = None, base_url  # the CLI reads a base URL without a scheme as the PAT host
@@ -328,11 +304,8 @@ def _demo_account_list() -> str | None:
 
 
 def _run_demo(args, app_class, *, account_list: str | None = None) -> int:
-    """Run against :class:`~cortex_training.tui.demo.DemoClient` with throwaway local stores.
-
-    ``account_list`` is an ``AccountJobListUnavailable`` reason for the demo's
-    account-wide list to answer with, or None for it to list every location.
-    """
+    """Run against :class:`~cortex_training.tui.demo.DemoClient` with throwaway local stores
+    (``account_list``: see :func:`_demo_account_list`)."""
     import tempfile
 
     from cortex_training.tui.demo import DemoClient

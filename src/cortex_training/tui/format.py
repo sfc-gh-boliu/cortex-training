@@ -27,9 +27,9 @@ import re
 from datetime import datetime
 from datetime import timezone
 from typing import Any
-from typing import Optional
 
 from rich.cells import cell_len
+
 
 def format_log_entry(entry: Any) -> str:
     """Render one log entry (a parsed JSONL object or ``{"_raw": ...}``)."""
@@ -122,19 +122,19 @@ def _wrap_pieces(text: str, room: int, later: int) -> list[str]:
 def wrap_log_line(text: Any, width: int, *, first: str = "", rest: str = "", max_rows: int = 0) -> list[str]:
     """Soft-wrap one log line to rows of at most ``width`` terminal cells.
 
-    The ``Log`` widget (unlike ``RichLog``) does not wrap, so we pre-wrap. The
-    width counts cells, not characters, so wide (CJK, emoji) text stays inside
-    the pane. Word boundaries are preferred (the space at a break is dropped)
-    but long tokens (URLs, JSON blobs) are hard-broken so nothing overflows.
-    Embedded newlines split into separate lines first, and a line's leading
-    whitespace (indentation) is kept.
+    The ``Log`` widget (unlike ``RichLog``) does not wrap, so we pre-wrap. Word
+    boundaries are preferred but long tokens (URLs, JSON blobs) are hard-broken
+    so nothing overflows. Embedded newlines split into separate lines first, and
+    leading whitespace (indentation) is preserved. ``width <= 0`` (not laid out
+    yet) returns the line unwrapped.
+    The width counts cells, not characters, so wide (CJK, emoji) text stays
+    inside the pane; the space at a break is dropped.
 
     ``first`` starts the first row and ``rest`` each row after it (a sub-job
     tag, and the gutter under it), so continuation rows line up under the
     text. ``max_rows`` > 0 keeps at most that many rows: the line's first and
     last ones (a traceback's error is at its end), around one that says how
-    many are left out. ``width <= 0`` (not laid out yet) returns the line
-    unwrapped.
+    many are left out.
     """
     lines = str(text).split("\n")
     if width <= 0:
@@ -263,20 +263,13 @@ def _drawable(s: str) -> str:
 
 
 def printable(text: Any) -> str:
-    """``text`` safe to draw: escape sequences removed, tabs as spaces, Unicode
-    line separators as newlines, other control or bidi characters replaced with
-    U+FFFD, the joiner between two emoji dropped (see ``_JOINED_EMOJI``), and at
-    most :data:`MAX_COMBINING_MARKS` combining diacritics on one character.
-
-    A string with nothing to replace is returned as it is.
-    """
+    """``text`` safe to draw (see :func:`_drawable`); a string with nothing to
+    replace is returned as it is."""
     s = text if isinstance(text, str) else str(text)
     return s if s.isascii() and s.isprintable() else _printable(s)
 
 
-@functools.lru_cache(maxsize=4096)  # a list render cleans each job's text several times
-def _printable(s: str) -> str:
-    return _drawable(s)
+_printable = functools.lru_cache(maxsize=4096)(_drawable)  # a list render cleans each job's text several times
 
 
 def safe_text(text: Any) -> str:
@@ -311,8 +304,7 @@ def one_line(text: Any) -> str:
     Escape sequences go before the line breaks do, so one left unterminated
     ends with its own line, as it does in a log line.
     """
-    row = printable(_LINE_BREAKS.sub(" / ", _strip_escapes(str(text))).replace("\t", " "))
-    return row
+    return printable(_LINE_BREAKS.sub(" / ", _strip_escapes(str(text))).replace("\t", " "))
 
 
 # ─── Log lines as the pane shows them ────────────────────────────────────────
@@ -327,7 +319,7 @@ _RECORD_LOGGER_FIELDS = ("logger", "name")
 
 
 @functools.lru_cache(maxsize=4096)
-def _local_time(day: str, clock: str, zone: Optional[str]) -> str:
+def _local_time(day: str, clock: str, zone: str | None) -> str:
     """``YYYY-MM-DD HH:MM:SS`` in local time, as the rest of the TUI shows times."""
     offset = "+00:00" if zone in (None, "Z") else (zone if ":" in zone else f"{zone[:3]}:{zone[3:]}")
     try:
@@ -446,7 +438,7 @@ def wrap_lines(lines: list, width: int, *, first: str = "", rest: str = "", max_
     return chunks, displays, len(chunks) < len(lines)
 
 
-def line_moment(text: Any) -> Optional[datetime]:
+def line_moment(text: Any) -> datetime | None:
     """When a log line was written: its leading RFC 3339 timestamp, or a JSON
     record's own ``ts`` (after any ``(Actor pid=...)`` groups); None if neither."""
     s = _strip_escapes(str(text))
@@ -479,7 +471,7 @@ def unstamped(line: str) -> str:
     return (line[match.end():] if match else line).rstrip()
 
 
-def lines_after(saved_tail: list, live: list) -> Optional[list]:
+def lines_after(saved_tail: list, live: list) -> list | None:
     """The lines of ``live`` (a tail's newest lines, in log order) that come
     after ``saved_tail`` (the last lines of a saved console of the same log,
     which may lag behind the tail).
@@ -523,7 +515,7 @@ def source_label(source: Any) -> str:
     return sjid or str(source)
 
 
-ACTIVE_STATUSES = {
+_ACTIVE_STATUSES = {
     "running",
     "initializing",
     "pending",
@@ -553,7 +545,7 @@ def is_active_status(status: Any) -> bool:
     if not status:
         return True
     s = str(status).lower().removeprefix("job_state_")
-    if s in ACTIVE_STATUSES:
+    if s in _ACTIVE_STATUSES:
         return True
     if s in _TERMINAL_STATUSES:
         return False
@@ -566,7 +558,7 @@ _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _NEVER_YEAR = 9999
 
 
-def parse_ts(raw: Any) -> Optional[datetime]:
+def parse_ts(raw: Any) -> datetime | None:
     """An ISO-8601 timestamp (nanosecond precision allowed) as an aware UTC datetime.
 
     A time without a zone is UTC. None when it is missing or unparseable, or
@@ -626,7 +618,7 @@ _SUMMARY_SUBJOB_KEYS = [
 ]
 
 
-def compact_number(v: Any) -> str:
+def _num(v: Any) -> str:
     """Render a value compactly: integral floats lose the .0 (n_gpus 1.0 -> 1)."""
     if isinstance(v, bool):
         return str(v)
@@ -635,8 +627,7 @@ def compact_number(v: Any) -> str:
     return str(v)
 
 
-def subjob_config(sj: dict) -> dict:
-    """A sub-job's config block: its ``training_config``, ``inference_config`` or ``sampling_config``."""
+def _subjob_config(sj: dict) -> dict:
     for key in ("training_config", "inference_config", "sampling_config"):
         cfg = sj.get(key)
         if isinstance(cfg, dict):
@@ -656,20 +647,20 @@ def _job_config_segments(job: dict) -> list:
             seg.append(jt)
         if sj.get("model_name"):
             seg.append(str(sj["model_name"]))
-        cfg = subjob_config(sj)
+        cfg = _subjob_config(sj)
         for key, label in _SUMMARY_CONFIG_KEYS:
             if cfg.get(key) is not None:
-                seg.append(f"{label}={compact_number(cfg[key])}")
+                seg.append(f"{label}={_num(cfg[key])}")
         opt = cfg.get("optimizer")
         if isinstance(opt, dict):
             o = [str(opt["name"])] if opt.get("name") else []
             if opt.get("lr") is not None:
-                o.append(f"lr={compact_number(opt['lr'])}")
+                o.append(f"lr={_num(opt['lr'])}")
             if o:
                 seg.append("opt=" + "/".join(o))
         for key, label in _SUMMARY_SUBJOB_KEYS:
             if sj.get(key) is not None:
-                seg.append(f"{label}={compact_number(sj[key])}")
+                seg.append(f"{label}={_num(sj[key])}")
         if seg:
             segs.append(" ".join(seg))
     return segs
@@ -711,7 +702,7 @@ _RAW_JSON_LEVEL = re.compile(r'"(?:level|levelname|severity)"\s*:\s*"([A-Za-z]+)
 _RAW_WORD_LEVEL = re.compile(r"\b(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL)\b")
 
 
-def _entry_level(entry: Any) -> Optional[str]:
+def _entry_level(entry: Any) -> str | None:
     if not isinstance(entry, dict):
         return None
     if entry.get("level"):
@@ -733,10 +724,10 @@ _RAW_FAILURE = re.compile(
 
 
 def entry_at_level(entry: Any, min_level: Any) -> bool:
-    """Whether an entry is at or above min_level. The level comes from a
-    structured entry or from a raw line's JSON ``level`` or level word; entries
-    with no recognizable level (tracebacks, plain output) always pass, so the
-    filter never hides output it cannot classify. A record that carries an
+    """Whether an entry is at or above min_level. A raw line's level comes from
+    its JSON ``level`` field or a level word near its start; a structured entry's, from ``level``.
+    Entries without a parseable level always pass, so the filter only trims
+    lower-severity logs and never hides other output. A record that carries an
     error or an exception counts as ERROR, whatever its level says."""
     if not min_level:
         return True

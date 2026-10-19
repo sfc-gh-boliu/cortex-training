@@ -44,9 +44,9 @@ class PrintableClient:
     """A client whose job reads come back printable (see the module docstring).
 
     Every other attribute and method is the wrapped client's own, read and set
-    through to it, and a method the wrapped client lacks is missing here too
-    (the job list checks for ``list_jobs_page``). ``for_job`` returns its
-    per-location client wrapped the same way. :attr:`wrapped` is the client.
+    through to it, and a method the wrapped client lacks is missing here too.
+    ``for_job`` returns its per-location client wrapped the same way.
+    :attr:`wrapped` is the client.
     """
 
     def __init__(self, client: Any) -> None:
@@ -78,8 +78,6 @@ def printable_client(client: Any) -> Any:
     return PrintableClient(client)
 
 
-# functools.wraps keeps each method's signature for inspect.signature: the job
-# list passes retry bounds to list_jobs only when the client's method takes them.
 def _printable_answer(method):
     @functools.wraps(method)
     def read(*args, **kwargs):

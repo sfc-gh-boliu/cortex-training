@@ -19,26 +19,16 @@ Implements the read-only client methods the TUI calls, returning records in
 the shapes the service returns (job / sub-job metadata,
 ``gpu.jsonl`` telemetry, tail-logs pages). Every value is generated from a
 fixed seed relative to "now"; nothing touches the network.
-
-Its jobs live in three locations. The configured one, ``CORTEX_TRAINING_DB.PUBLIC``,
-holds most of them and is what ``list_jobs`` lists; the account-wide
-``list_jobs_page`` also has ``TEAM_DB.EXPERIMENTS`` and a lowercase
-``"sandbox"."dev"``, a few rows per page, and ``for_job`` returns a view of
-the client bound to a row's location. ``DemoClient(account_list=REASON)`` makes
-the account-wide list answer as an unavailable one does, for previewing the job
-list's fallback to the configured schema.
 """
 
 from __future__ import annotations
 
 import bisect
 import copy
-import hashlib
 import json
 import math
 import random
 import uuid
-from datetime import date
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
@@ -64,10 +54,6 @@ def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _uid(rng: random.Random) -> str:
-    return str(uuid.UUID(int=rng.getrandbits(128), version=4))
-
-
 def _training(model, gpus, *, lr=2e-5, bs=8, seq=4096, lora=None, opt="AdamW"):
     cfg: dict = {"n_gpus": float(gpus), "max_seq_len": float(seq), "train_batch_size": float(bs),
                  "optimizer": {"name": opt, "lr": lr}}
@@ -91,13 +77,24 @@ def _log_prob(model, *, seq=4096):
             "inference_config": {"n_gpus": 2.0, "max_seq_len": float(seq)}}
 
 
-def _kind(sj: dict) -> str:
-    """``training``, ``sampling`` or ``log_prob``: the type a sub-job id carries."""
-    return views.sub_job_kind(sj) or str(sj.get("job_type") or "").lower()
+# Where the demo's jobs live: the TUI's configured location, and two more that
+# only the account-wide list shows (one a lowercase name, which SQL quotes).
+DEMO_LOCATION = ("CORTEX_TRAINING_DB", "PUBLIC")
+_TEAM = ("TEAM_DB", "EXPERIMENTS")
+_LOWERCASE = ("sandbox", "dev")
 
-
-# (status, reason, age, duration, hardware, sub-jobs, kind[, overrides]) — kind
-# drives the training log; the overrides are those _NAME_SPECS and _STATE_SPECS describe.
+# (status, reason, age, duration, hardware, sub-jobs, kind[, overrides]): kind drives the
+# training log. The overrides: "system_metrics": False leaves a job's telemetry without
+# system rows (CPU and memory); "reason_details" is the service's sentence beside the
+# reason; "multiplex_onto" is the index of the job whose training sub-job this one runs
+# on; "unreachable" makes the service answer UNKNOWN for the job, as it does when it can't
+# reach the control plane; "experiment" says how this role is refused the job's
+# Experiment ("missing" or "sql", see _EXPERIMENT_GONE); "location" is its (database_name,
+# schema_name) outside the configured location; "log_every" spaces a sub-job's log lines
+# that many seconds apart; "stuck" gives a running job's log a 300 KiB line every ten
+# minutes, which this service version never delivers (the tail stops before it, and the
+# Logs tab restarts it from the end); "not_found" makes the service answer UNKNOWN with
+# no sub-jobs, as it does for a job its control plane doesn't know.
 _SPECS = [
     # Its nodes report GPU rows only, as on a deployment that doesn't collect CPU and memory.
     ("RUNNING", "", timedelta(hours=2, minutes=14), None, "H200",
@@ -137,17 +134,6 @@ _SPECS = [
      [_training("Qwen/Qwen3-8B", 4)], None),  # older than six months: hidden
     ("FAILED", "sub_job_readiness", timedelta(days=230), timedelta(minutes=12), "H200",
      [_sampling("Qwen/Qwen3-8B", 2)], None),  # older than six months: hidden
-]
-
-# Jobs that show server-side state: the same fields as _SPECS plus
-# overrides. "system_metrics": False leaves a job's telemetry without system rows
-# (CPU and memory).
-# "reason_details" is the service's sentence beside the reason; "multiplex_onto"
-# is the _SPECS index of the job whose training sub-job this one runs on;
-# "unreachable" makes the service answer UNKNOWN for the job, as it does when
-# it can't reach the control plane. "experiment" says how this role is refused
-# the job's Experiment ("missing" or "sql", see _EXPERIMENT_GONE).
-_NAME_SPECS = [
     ("RUNNING", "", timedelta(minutes=25), None, "H200",
      [_training("Qwen/Qwen3-8B", 8, lr=1e-4, bs=8, seq=4096, lora=8)], None,
      {"multiplex_onto": 0}),
@@ -162,18 +148,6 @@ _NAME_SPECS = [
      {"reason_details": "The node running this job was taken out of service; resume from its last checkpoint"}),
     ("CANCELLED", "cancelled_by_client", timedelta(days=11), timedelta(minutes=40), "H200",
      [_sampling("Qwen/Qwen3-8B", 1)], None),
-]
-
-
-# Where the demo's jobs live: the TUI's configured location, and two more that
-# only the account-wide list shows (one a lowercase name, which SQL quotes).
-DEMO_LOCATION = ("CORTEX_TRAINING_DB", "PUBLIC")
-_TEAM = ("TEAM_DB", "EXPERIMENTS")
-_LOWERCASE = ("sandbox", "dev")
-
-# Jobs outside the configured location: the same fields as _NAME_SPECS, with
-# "location" (database_name, schema_name).
-_LOCATION_SPECS = [
     ("RUNNING", "", timedelta(hours=1, minutes=5), None, "B200",
      [_training("Qwen/Qwen3-8B", 8, lr=3e-5, bs=16, seq=8192)], "sft",
      {"location": _TEAM}),
@@ -189,15 +163,6 @@ _LOCATION_SPECS = [
     ("TERMINATED", "idle_timeout", timedelta(days=20), timedelta(hours=1), "H200",
      [_training("Qwen/Qwen3-0.6B", 1, lr=1e-5, bs=1, seq=128)], "sft",
      {"location": _LOWERCASE}),
-]
-
-# Jobs in states and shapes the jobs above don't show, in the configured location:
-# the same fields as _NAME_SPECS. "log_every" spaces a sub-job's log lines that many
-# seconds apart; "stuck" gives a running job's log a 300 KiB line every ten minutes,
-# which this service version never delivers (the tail stops before it, and the Logs
-# tab restarts it from the end); "not_found" makes the service answer UNKNOWN with no
-# sub-jobs, as it does for a job its control plane doesn't know.
-_STATE_SPECS = [
     ("CANCELLED", "cancelled_by_client", timedelta(days=5, hours=3), timedelta(hours=7), "H200",
      [_sampling("Qwen/Qwen3-8B", 4)], None,
      {"log_every": 1.0}),
@@ -218,7 +183,7 @@ _STATE_SPECS = [
 ]
 _NOT_FOUND = "Job status unavailable: job not found on Control Plane"
 # What the service answers when the role can't read a job's Experiment, by how
-# (views.experiment_access): the Experiment is gone or hidden ("missing": its
+# (views.experiment_access_hint): the Experiment is gone or hidden ("missing": its
 # saved logs and GPU metrics fail), or Snowflake refuses SQL on it ("sql", a
 # MONITOR-only role: saved logs and GPU metrics fail).
 _EXPERIMENT_GONE = "Linked experiment is not found for job {job}"
@@ -243,8 +208,7 @@ _UNAVAILABLE = {
 }
 # account_list=UNAVAILABLE: the account-wide list fails as when the control plane is down (503).
 UNAVAILABLE = "unavailable"
-_STATUS_GROUPS = {"active": ("pending", "placing", "initializing", "running"),
-                  "terminal": ("cancelled", "terminated", "failed")}
+_ACTIVE = ("pending", "placing", "initializing", "running")  # status="active", the job list's only status filter
 
 
 def _http_error(status: int, message: str) -> requests.HTTPError:
@@ -258,22 +222,6 @@ def _http_error(status: int, message: str) -> requests.HTTPError:
     return requests.HTTPError(f"{status} {response.reason}", response=response)
 
 
-def _raw_ts(dt: datetime) -> str:
-    """RFC 3339 with nanoseconds, as the service stamps each log line."""
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "000Z"
-
-
-def _bound(value: Any) -> Optional[datetime]:
-    """A created_after / created_before bound as an aware datetime (naive means UTC)."""
-    if value is None or value == "":
-        return None
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if isinstance(value, date):
-        return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
-    return views.parse_ts(value)
-
-
 class DemoClient:
     """Deterministic in-memory stand-in for :class:`CortexTrainingClient` (read paths only).
 
@@ -282,11 +230,10 @@ class DemoClient:
     ``rest_disabled``), or fail as the service does when its control plane is
     down (:data:`UNAVAILABLE`, a 503); None lists every location.
 
-    Without ``now`` the demo runs on the wall clock: live jobs keep logging and
+    It runs on the wall clock: live jobs keep logging and
     reporting GPUs every 5 s, the placing job starts up
     and runs, a running job is cancelled a few minutes in, and a debug run's
-    tail gets stuck behind an oversized line. With ``now`` everything stays as
-    it was then.
+    tail gets stuck behind an oversized line.
     """
 
     # Seconds between a training sub-job's step lines, and a sampling engine's batch lines.
@@ -296,46 +243,34 @@ class DemoClient:
     # Rows the account-wide list puts on a page at most, so that even this short list pages.
     _ACCOUNT_PAGE_ROWS = 10
 
-    def __init__(self, *, now: Optional[datetime] = None, seed: int = 7, account_list: Optional[str] = None) -> None:
+    def __init__(self, *, account_list: Optional[str] = None) -> None:
         if account_list is not None and account_list not in (*_UNAVAILABLE, UNAVAILABLE):
             raise ValueError(f"account_list must be None or one of {', '.join(sorted((*_UNAVAILABLE, UNAVAILABLE)))}")
-        self.now = (now or datetime.now(timezone.utc)).replace(microsecond=0)
-        self._fixed_now = now is not None
-        # Jobs whose state moves on while the demo runs (on the wall clock only):
+        self.now = datetime.now(timezone.utc).replace(microsecond=0)
+        # Jobs whose state moves on while the demo runs:
         # job id -> [(seconds after the demo started, status, reason)].
         self._timeline: dict = {}
         self._run_steps: dict = {}  # job id -> the epoch of each step of its training run, computed once
-        self._rng = random.Random(seed)
+        self._rng = random.Random(7)
         self._account_list = account_list
         # The location this client is bound to: the configured one, or a for_job() row's.
         self._location = DEMO_LOCATION
         self.database, self.schema = DEMO_LOCATION
         self._jobs: list = []
         self._kinds: dict = {}
-        self._unreachable: set = set()  # jobs the service answers UNKNOWN for
-        self._not_found: set = set()  # ... with no sub-jobs: its control plane doesn't know them
-        self._location_of: dict = {}  # job id -> (database_name, schema_name), outside the configured location
-        self._log_every: dict = {}  # job id -> seconds between its sub-jobs' periodic log lines
-        self._stuck: set = set()  # running jobs whose log has lines the tail never delivers
-        self._experiment: dict = {}  # job id -> how this role is refused its Experiment ("missing", "sql")
-        self._gpu_rows_only: set = set()  # jobs whose telemetry has no system rows (CPU and memory)
-        overrides: dict = {}
-        specs = (*_SPECS, *_NAME_SPECS, *_LOCATION_SPECS, *_STATE_SPECS)
-        for status, reason, age, duration, hw, subs, kind, *extra in specs:
-            jid = _uid(self._rng)
+        self._extra: dict = {}  # job id -> its spec's overrides
+        for status, reason, age, duration, hw, subs, kind, *extra in _SPECS:
+            jid = str(uuid.UUID(int=self._rng.getrandbits(128), version=4))
             created = self.now - age
             ended = created + duration if duration else None
             updated = ended or self.now - timedelta(seconds=self._rng.randint(4, 40))
             counts: dict = {}
             sub_jobs = []
             for sj in subs:
-                t = _kind(sj)
+                t = views.sub_job_kind(sj)
                 i = counts.get(t, 0)
                 counts[t] = i + 1
-                sub_status = status
-                if status == "FAILED" and reason == "sub_job_readiness" and len(subs) > 1 and t == "training":
-                    sub_status = "CANCELLED"
-                sub_jobs.append({"sub_job_id": f"{jid}:{t}:{i}", "status": sub_status, **json.loads(json.dumps(sj))})
+                sub_jobs.append({"sub_job_id": f"{jid}:{t}:{i}", "status": status, **json.loads(json.dumps(sj))})
             self._jobs.append({
                 "job_id": jid, "status": status, "reason": reason, "created_at": _iso(created),
                 "updated_at": _iso(updated), "state_changed_at": _iso(ended or updated), "sub_jobs": sub_jobs,
@@ -344,43 +279,25 @@ class DemoClient:
                 "idle_timeout_seconds": 1800, "pending_timeout_seconds": 86400,
             })
             self._kinds[jid] = kind
-            if extra:
-                overrides[jid] = extra[0]
-        for jid, more in overrides.items():
+            self._extra[jid] = extra[0] if extra else {}
+        for jid, more in self._extra.items():
             job = self._find(jid)
             job.update({key: more[key] for key in ("reason_details",) if key in more})
-            if "location" in more:
-                self._location_of[jid] = more["location"]
             if "multiplex_onto" in more:
                 host = self._jobs[more["multiplex_onto"]]["job_id"]
                 for sj in job["sub_jobs"]:  # its training sub-job runs on the host's
                     if isinstance(sj.get("training_config"), dict):
                         sj["training_config"]["multiplex_job_id"] = f"{host}:training:0"
-            if more.get("unreachable"):
-                self._unreachable.add(jid)
-            if more.get("system_metrics") is False:
-                self._gpu_rows_only.add(jid)
-            if more.get("not_found"):
-                self._not_found.add(jid)
-            if "log_every" in more:
-                self._log_every[jid] = float(more["log_every"])
-            if more.get("stuck"):
-                self._stuck.add(jid)
-            if "experiment" in more:
-                self._experiment[jid] = more["experiment"]
         # The placing job starts up and runs; the team's running job is cancelled.
         placing = next(j for j in self._jobs if j["status"] == "PLACING")
         self._timeline[placing["job_id"]] = [(45, "INITIALIZING", ""), (100, "RUNNING", "")]
-        team = next(j for j in self._jobs if self._location_of.get(j["job_id"]) == _TEAM and j["status"] == "RUNNING")
+        team = next(j for j in self._jobs if self._extra[j["job_id"]].get("location") == _TEAM and j["status"] == "RUNNING")
         self._timeline[team["job_id"]] = [(300, "CANCELLED", "cancelled_by_client")]
 
     def _clock(self) -> datetime:
-        """The demo's now: the wall clock, or the fixed ``now`` it was built with."""
-        return self.now if self._fixed_now else datetime.now(timezone.utc)
+        return datetime.now(timezone.utc)
 
     def _steps_reached(self, job_id: str) -> list:
-        if self._fixed_now:
-            return []
         elapsed = (self._clock() - self.now).total_seconds()
         return [step for step in self._timeline.get(job_id, []) if step[0] <= elapsed]
 
@@ -410,7 +327,7 @@ class DemoClient:
 
     def _here(self, job_id: str) -> bool:
         """Whether the job is in the location this client is bound to."""
-        return self._location_of.get(job_id, DEMO_LOCATION) == self._location
+        return self._extra[job_id].get("location", DEMO_LOCATION) == self._location
 
     def _record(self, job_id: str) -> dict:
         """The demo's own record of a job in this client's location (what the control plane would know).
@@ -437,10 +354,11 @@ class DemoClient:
         a reason sentence.
         """
         out = json.loads(json.dumps(self._as_of_now(job)))
-        if job["job_id"] not in self._unreachable | self._not_found:
+        more = self._extra[job["job_id"]]
+        if not (more.get("unreachable") or more.get("not_found")):
             return out
         fallback = {key: out[key] for key in ("job_id", "owner_role", "submitted_by") if key in out}
-        if job["job_id"] in self._not_found:  # its control plane doesn't know it: no sub-jobs either
+        if more.get("not_found"):  # its control plane doesn't know it: no sub-jobs either
             fallback.update(status="UNKNOWN", reason=_NOT_FOUND, sub_jobs=[])
             return fallback
         fallback.update(status="UNKNOWN", reason="Job status unavailable: Control Plane is unavailable")
@@ -448,35 +366,23 @@ class DemoClient:
                                 for sj in out["sub_jobs"]]
         return fallback
 
-    def _experiment_refusal(self, job: dict) -> Optional[Exception]:
-        """What reading ``job``'s Experiment raises for this role, or None when it may."""
-        how = self._experiment.get(job["job_id"])
+    def _check_experiment(self, job: dict) -> None:
+        """Raise what reading ``job``'s Experiment raises for this role, if it may not."""
+        how = self._extra[job["job_id"]].get("experiment")
         if how == "missing":
-            return _http_error(500, _EXPERIMENT_GONE.format(job=job["job_id"]))
+            raise _http_error(500, _EXPERIMENT_GONE.format(job=job["job_id"]))
         if how == "sql":
-            database, schema = self._location_of.get(job["job_id"], DEMO_LOCATION)
-            return RuntimeError(_EXPERIMENT_SQL.format(database=database, schema=schema, name="TRAINING_RUNS"))
-        return None
-
-    @staticmethod
-    def _config_lr(job: dict, default: float) -> float:
-        """The training sub-job's optimizer learning rate, as configured."""
-        for sj in job["sub_jobs"]:
-            opt = (sj.get("training_config") or {}).get("optimizer")
-            if isinstance(opt, dict) and isinstance(opt.get("lr"), (int, float)):
-                return float(opt["lr"])
-        return default
+            database, schema = self._extra[job["job_id"]].get("location", DEMO_LOCATION)
+            raise RuntimeError(_EXPERIMENT_SQL.format(database=database, schema=schema, name="TRAINING_RUNS"))
 
     # ── client surface used by the TUI ──
     def list_jobs(self, status: Optional[str] = None, *, max_retries: Optional[int] = None,
                   request_timeout: Any = None) -> list:
         """This client's location's jobs, as the per-schema list returns them (no location fields).
 
-        ``max_retries`` and ``request_timeout`` are accepted, as the real client
-        takes them, and unused: nothing here goes over the network.
+        The arguments are accepted, as the real client takes them, and unused (the job list sends no status).
         """
-        jobs = [self._served(j) for j in self._jobs if self._here(j["job_id"])]
-        return [j for j in jobs if status is None or j["status"].lower() == status.lower()]
+        return [self._served(j) for j in self._jobs if self._here(j["job_id"])]
 
     def get_job(self, job_id: str) -> dict:
         return self._served(self._record(job_id))
@@ -487,25 +393,8 @@ class DemoClient:
         row = self._served(job)
         if views.is_unknown(row):
             row["created_at"] = job["created_at"]
-        database, schema = self._location_of.get(job["job_id"], DEMO_LOCATION)
+        database, schema = self._extra[job["job_id"]].get("location", DEMO_LOCATION)
         return {**row, "database_name": database, "schema_name": schema}
-
-    def _account_match(self, row: dict, database, schema, status, submitted_by, after, before) -> bool:
-        if database and row["database_name"] != views.identifier_name(database):
-            return False
-        if schema and row["schema_name"] != views.identifier_name(schema):
-            return False
-        if submitted_by and row.get("submitted_by") != views.identifier_name(submitted_by):
-            return False
-        created = views.parse_ts(row.get("created_at"))
-        if (after and (created is None or created < after)) or (before and (created is None or created >= before)):
-            return False
-        if status:
-            words = {w.strip().lower() for w in (status.split(",") if isinstance(status, str) else status)}
-            wanted = {state for w in words for state in _STATUS_GROUPS.get(w, (w,))}
-            # A job whose status can't be read never matches a status filter.
-            return views.status_word(row.get("status")) in wanted - {"unknown"}
-        return True
 
     def list_jobs_page(self, *, database: Optional[str] = None, schema: Optional[str] = None,
                        status: Any = None, submitted_by: Optional[str] = None, created_after: Any = None,
@@ -513,27 +402,21 @@ class DemoClient:
                        max_retries: Optional[int] = None, request_timeout: Any = None) -> dict:
         """One page of the account-wide list: every location, newest first, a few rows per page.
 
-        A page token only opens with the filters it was issued for, as on the service.
+        Only what the job list sends applies: ``created_after``, and ``status`` as the active group (a
+        job whose status can't be read never matches a status filter).
         """
         if self._account_list == UNAVAILABLE:
             raise _http_error(503, "Control Plane unavailable")
         if self._account_list is not None:
             raise AccountJobListUnavailable(_UNAVAILABLE[self._account_list], reason=self._account_list)
-        after, before = _bound(created_after), _bound(created_before)
-        filters = repr((database, schema, status, submitted_by, after, before))
-        seal = hashlib.sha256(filters.encode("utf-8")).hexdigest()[:12]
-        start = 0
-        if page_token:
-            sealed, _, offset = page_token.rpartition(".")
-            if sealed != f"demo-{seal}" or not offset.isdigit():
-                raise ValueError("page_token does not match the request filters")
-            start = int(offset)
         newest = sorted(self._jobs, key=lambda j: j["created_at"], reverse=True)
-        rows = [row for row in (self._account_row(j) for j in newest)
-                if self._account_match(row, database, schema, status, submitted_by, after, before)]
+        rows = [row for row in map(self._account_row, newest)
+                if (created_after is None or views.parse_ts(row["created_at"]) >= created_after)
+                and (not status or views.status_word(row.get("status")) in _ACTIVE)]
+        start = int(page_token or 0)
         page = rows[start:start + min(int(page_size), self._ACCOUNT_PAGE_ROWS)]
         end = start + len(page)
-        return {"jobs": page, "next_page_token": f"demo-{seal}.{end}" if end < len(rows) else None}
+        return {"jobs": page, "next_page_token": str(end) if end < len(rows) else None}
 
     def for_job(self, job: dict) -> "DemoClient":
         """A view of this client bound to ``job``'s database and schema, as ``CortexTrainingClient.for_job``."""
@@ -572,9 +455,7 @@ class DemoClient:
                          on_commit=None) -> list:
         """The client's download, generated: ``priority`` sub-jobs first, ``on_commit`` after each file."""
         job = self._on_stage(job_id)
-        refused = self._experiment_refusal(job)
-        if refused is not None:
-            raise refused  # the samples live on the job's Experiment
+        self._check_experiment(job)  # the samples live on the job's Experiment
         created = self._started(job) + timedelta(minutes=2)
         end = self._clock() if job["status"] in ("RUNNING",) else datetime.fromisoformat(job["state_changed_at"].replace("Z", "+00:00"))
         if job["status"] in ("PLACING", "PENDING") or job.get("reason") in _NEVER_PLACED:
@@ -582,18 +463,17 @@ class DemoClient:
         fb_total = _GPU_MEMORY.get(job.get("hardware"), _H200_FB)
         loading = job.get("reason") == "out_of_memory"  # it ran out of memory loading the weights
         written = []
-        first = [sid for sid in priority if any(sj["sub_job_id"] == sid for sj in job["sub_jobs"])]
-        ordered = sorted(job["sub_jobs"], key=lambda sj: (sj["sub_job_id"] not in first,
-                                                        first.index(sj["sub_job_id"]) if sj["sub_job_id"] in first else 0))
+        first = list(priority)
+        ordered = sorted(job["sub_jobs"], key=lambda sj: first.index(sj["sub_job_id"]) if sj["sub_job_id"] in first else len(first))
         for sj in ordered:
             sid = sj["sub_job_id"]
             if not views.requested_gpus(sj):
                 continue  # a log_prob sub-job runs on no GPUs of its own
             n_gpus = int((sj.get("training_config") or sj.get("inference_config") or {}).get("n_gpus", 1))
-            sampling = _kind(sj) == "sampling"
+            sampling = views.sub_job_kind(sj) == "sampling"
             rng = random.Random("gpu" + sid)
             # The system rows draw from their own stream, so the GPU rows are the same with or without them.
-            host = random.Random("system" + sid) if job["job_id"] not in self._gpu_rows_only else None
+            host = random.Random("system" + sid) if self._extra[job["job_id"]].get("system_metrics", True) else None
             missed: set = set()  # nodes whose previous scrape was missed
             path = Path(output_dir) / sid / "gpu.jsonl"
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -652,12 +532,7 @@ class DemoClient:
 
     def _system_row(self, rng: random.Random, sid: str, node: int, gpus: int, t: float, phase: float, stamp: str,
                     seq: int, *, sampling: bool, loading: bool) -> dict:
-        """One node's system row at one scrape, in the service's shape (record version 3).
-
-        CPU is the node's share of its CPUs, a few percent while it trains (more
-        while it checkpoints), more while it samples; memory is what its
-        processes hold, apart from the page cache. Both vary by node and over time.
-        """
+        """One node's system row at one scrape, in the service's shape (record version 3)."""
         cpus = self._CPUS_PER_GPU * gpus
         limit = self._MEMORY_PER_GPU * gpus
         if loading:  # copying the weights in
@@ -689,7 +564,7 @@ class DemoClient:
     def _startup(self, job: dict, sj: dict) -> list:
         """(seconds after the sub-job started, level, logger, message) of its startup lines."""
         cfg = sj.get("training_config") or sj.get("inference_config") or {}
-        if _kind(sj) == "log_prob":  # no GPUs of its own: it scores on the training sub-job's
+        if views.sub_job_kind(sj) == "log_prob":  # no GPUs of its own: it scores on the training sub-job's
             return [(2.0, "INFO", "zone", "log_prob worker scheduled beside training:0 (no GPUs of its own)"),
                     (60.0, "INFO", "loader", f"loading reference {sj['model_name']} weights (bfloat16)"),
                     (130.0, "INFO", "log_prob", "reference model ready")]
@@ -698,7 +573,7 @@ class DemoClient:
                  (40.0, "INFO", "ray", f"ray head ready; {max(1, n // 8)} worker node(s) joined"),
                  (48.0, "INFO", "loader", f"loading {sj['model_name']} weights (bfloat16)"),
                  (122.0, "INFO", "loader", "weights loaded in 74.2s")]
-        if _kind(sj) == "sampling":
+        if views.sub_job_kind(sj) == "sampling":
             lines.append((140.0, "INFO", "vllm", f"engine ready: max_model_len={int(cfg.get('max_seq_len', 4096))} "
                                                  f"gpu_memory_utilization={cfg.get('gpu_memory_utilization', 0.85)}"))
         else:
@@ -708,9 +583,9 @@ class DemoClient:
     def _period(self, job: dict, sj: dict) -> float:
         """Seconds between periodic lines: a sampling engine's batches, or a training step,
         spaced as the steps of the job's run are (an RL step takes about 45 s)."""
-        if job["job_id"] in self._log_every:
-            return self._log_every[job["job_id"]]
-        if _kind(sj) in ("sampling", "log_prob"):
+        if self._extra[job["job_id"]].get("log_every"):
+            return float(self._extra[job["job_id"]]["log_every"])
+        if views.sub_job_kind(sj) in ("sampling", "log_prob"):
             return self._GENERATE_SECONDS
         times = self._step_times(job["job_id"])
         if len(times) > 1:
@@ -728,7 +603,7 @@ class DemoClient:
         after them, seconds between lines). A training sub-job logs one step line per step
         of its run; then, and without a run, one line every period."""
         period = self._period(job, sj)
-        times = self._step_times(job["job_id"]) if _kind(sj) == "training" else []
+        times = self._step_times(job["job_id"]) if views.sub_job_kind(sj) == "training" else []
         if times:
             return times, times[-1] + period, period
         startup = self._startup(job, sj)
@@ -743,10 +618,7 @@ class DemoClient:
         return len(self._startup(job, sj)) + periodic + len(self._closing(job))
 
     def _step_times(self, job_id: str) -> list:
-        """The epoch of each step of the job's training run, in order (none for a job without
-        a kind). The run trains from 6 minutes after the job was created until it ended (20 s
-        before the demo started, for a running job), a step every 6 s (45 s for RL), at most
-        1,500 steps (400 for RL; the failed run stopped at 140), each at its share of that time."""
+        """The epoch of each step of the job's training run, in order (none for a job without a kind)."""
         if job_id not in self._run_steps:
             kind = self._kinds.get(job_id)
             times: list = []
@@ -765,9 +637,9 @@ class DemoClient:
         return self._run_steps[job_id]
 
     def _stuck_lines(self, job: dict, sj: dict) -> list:
-        """Indices of the lines of ``sj``'s log that are 300 KiB or more (see _STATE_SPECS):
+        """Indices of the lines of ``sj``'s log that are 300 KiB or more (see _SPECS):
         one line every _STUCK_EVERY from _STUCK_AFTER after the demo started, on the clock."""
-        if job["job_id"] not in self._stuck or self._fixed_now:
+        if not self._extra[job["job_id"]].get("stuck"):
             return []
         times, after, period = self._periodic(job, sj)
         skip = len(self._startup(job, sj)) + len(times)
@@ -782,16 +654,16 @@ class DemoClient:
         """The k-th periodic line: a generate batch, a reference log-prob batch, or a
         training step that follows the job's run and config."""
         rng = random.Random(f"log{sj['sub_job_id']}:{k}")
-        kind = _kind(sj)
+        kind = views.sub_job_kind(sj)
         if kind == "log_prob":
             return "INFO", "log_prob", (f"scored batch={rng.choice([16, 32])} sequences "
                                         f"tokens={rng.randint(40000, 130000)} in {rng.uniform(3.5, 9.0):.1f}s")
         if kind == "sampling":
-            if job["job_id"] in self._log_every:  # a batch eval that logs each request
+            if self._extra[job["job_id"]].get("log_every"):  # a batch eval that logs each request
                 return "INFO", "vllm", (f"request {k:>6}: prompt_tokens={rng.randint(200, 2400)} "
                                         f"completion_tokens={rng.randint(20, 512)} "
                                         f"latency={rng.uniform(0.4, 3.9):.2f}s")
-            trains = any(_kind(other) == "training" for other in job["sub_jobs"])
+            trains = any(views.sub_job_kind(other) == "training" for other in job["sub_jobs"])
             if trains and k % 12 == 11:  # only an RL job's engine gets weights from its trainer
                 return "INFO", "weight-sync", "received weights from training:0 (broadcast, 4.1s); prefix cache reset"
             return "INFO", "vllm", (f"generate batch={rng.choice([32, 64, 128])} prompt_tokens={rng.randint(9000, 30000)} "
@@ -801,7 +673,7 @@ class DemoClient:
         # The k-th line is the run's step k, and past its last step (the run stops when the
         # demo starts) the steps go on; a job without a run logs every tenth step.
         step = k if self._step_times(job["job_id"]) else k * 10
-        lr = self._config_lr(job, 1e-4)
+        lr = float(sj["training_config"]["optimizer"]["lr"])
         if self._kinds.get(job["job_id"]) == "rl":
             # A reward that climbs, a KL that grows, and a policy loss that eases off, with some noise.
             reward = 0.18 + 0.55 * (1 - math.exp(-k / 150)) + rng.gauss(0, 0.025)
@@ -836,7 +708,7 @@ class DemoClient:
             if i in self._stuck_lines(job, sj):  # (a saved console keeps it, cut short here)
                 level, logger, msg = "INFO", "debug", "activations of layer 31: [0.0132, -0.0871, ...] (300 KiB)"
         record = json.dumps({"level": level, "logger": logger, "msg": msg}, ensure_ascii=False)
-        return {"_raw": f"{_raw_ts(at)} {record}"}
+        return {"_raw": f"{at.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%S.%f}000Z {record}"}  # RFC 3339, ns
 
     # Jobs that failed before their head pod wrote a console: no saved console,
     # and (once placed) an execution log that records the error.
@@ -847,7 +719,7 @@ class DemoClient:
 
     def tail_logs(self, job_id: str, *, cursor: Optional[str] = None, max_lines: Optional[int] = None,
                   sub_job_id: Optional[str] = None) -> dict:
-        if job_id in self._not_found:
+        if self._extra[job_id].get("not_found"):
             raise _http_error(503, _NOT_FOUND)  # its control plane doesn't know it: no session to tail
         job = self._as_of_now(self._record(job_id))  # (served UNKNOWN rows carry no sub-job ids)
         word = views.status_word(job["status"])
@@ -878,9 +750,7 @@ class DemoClient:
 
     def download_stdout_logs(self, job_id: str, output_dir, *, resume: bool = False) -> list:
         job = self.get_job(job_id)
-        refused = self._experiment_refusal(self._find(job_id))
-        if refused is not None:
-            raise refused  # the saved consoles live on the job's Experiment
+        self._check_experiment(self._find(job_id))  # the saved consoles live on the job's Experiment
         if job["reason"] in self._NO_CONSOLE_REASONS:
             return []
         for sj in job["sub_jobs"]:
@@ -893,9 +763,7 @@ class DemoClient:
     def fetch_execution_logs(self, job_id: str, *, sub_job_id: Optional[str] = None,
                              filename: Optional[str] = None) -> list:
         job = self.get_job(job_id)
-        refused = self._experiment_refusal(self._find(job_id))
-        if refused is not None:
-            raise refused  # the execution logs live on the job's Experiment
+        self._check_experiment(self._find(job_id))  # the execution logs live on the job's Experiment
         if job["reason"] != "out_of_memory" or filename not in (None, "execution.jsonl"):
             return []  # a job that never left pending has no execution log
         created = datetime.fromisoformat(job["created_at"].replace("Z", "+00:00"))

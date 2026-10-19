@@ -13,14 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Job preview and tabbed job detail screens for the TUI.
+"""The job preview screen for the TUI.
 
 Flow: job list → :class:`JobSummaryScreen` (preview + sub-jobs) →
-:class:`JobDetailScreen` (Logs | Resources) for the
+:class:`~cortex_training.tui.app.LogScreen` (Logs | Resources) for the
 whole job or one sub-job.
 
-Everything here is read-only against the service. The only writes are local:
-the GPU telemetry download cache.
+Everything here is read-only against the service.
 """
 
 from __future__ import annotations
@@ -40,16 +39,12 @@ from textual.screen import Screen
 from textual.widgets import DataTable
 from textual.widgets import Footer
 from textual.widgets import Header
-from textual.widgets import Input
 from textual.widgets import Static
-from textual.widgets import TabbedContent
-from textual.widgets import TabPane
 
 from cortex_training.tui import views as v
+from cortex_training.tui.app import ENDED_STYLE
 from cortex_training.tui.app import KEYS_BINDING
-from cortex_training.tui.app import FittedFooter
 from cortex_training.tui.app import FollowsPointer
-from cortex_training.tui.app import JobTabs
 from cortex_training.tui.app import LogScreen
 from cortex_training.tui.app import PickableTable
 from cortex_training.tui.app import after_refresh
@@ -57,15 +52,7 @@ from cortex_training.tui.app import call_on_screen
 from cortex_training.tui.app import close_keys_panel
 from cortex_training.tui.app import hanging
 from cortex_training.tui.app import is_shown
-from cortex_training.tui.format import is_active_status
-from cortex_training.tui.format import one_line
-from cortex_training.tui.format import safe_text
-from cortex_training.tui.format import source_label
-from cortex_training.tui.resource import RANGES
 
-# Rich's grey62, by value: Textual's markup and styles (the preview's Content)
-# don't know that name and would draw the default color instead.
-ENDED_STYLE = "#9e9e9e"
 STATUS_STYLE = {
     "running": "bold green",
     "initializing": "yellow",
@@ -95,10 +82,6 @@ _WAITING = {
 def status_text(status) -> Text:
     word = v.status_word(status)
     return Text(word.upper(), style=STATUS_STYLE.get(word, ""))
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 _SUBJOB_COLUMNS = ("Sub-job", "Type", "Status", "Model", "GPUs", "Config")
@@ -145,40 +128,6 @@ def fit_columns(labels, rows: list, width: int, pad: int = 2) -> tuple:
     cut = len(keep) < len(labels) or any(widths[i] < natural[i] for i in keep)
     fitted = [(key, [_fit_text(cells[i], widths[i]) for i in keep]) for key, cells in rows]
     return [labels[i] for i in keep], fitted, cut, over > 0
-
-
-_SEPARATOR = "  ·  "
-
-
-def fit_line(segments: list, width: int) -> Content:
-    """``(text, style, least)`` segments joined by `` · `` to fit ``width`` cells.
-
-    When cutting the segments that have a ``least`` (the first ones first, down
-    to that many cells, with ``…``) puts the line on one row, they are cut just
-    enough; the others stay whole. Otherwise nothing is cut and the line wraps
-    between segments, so no row ends with a separator. The texts are shown
-    literally, never as markup.
-    """
-    texts = [text for text, _style, _least in segments]
-    sep = v.cell_width(_SEPARATOR)
-    over = sum(v.cell_width(text) for text in texts) + sep * (len(texts) - 1) - width
-    spares = [max(0, v.cell_width(text) - least) if least is not None else 0 for text, _style, least in segments]
-    if 0 < over <= sum(spares):  # cutting gets it onto one row
-        for i, spare in enumerate(spares):
-            if over <= 0:
-                break
-            if spare:
-                cut = min(spare, over)
-                texts[i] = v.fit_cells(texts[i], v.cell_width(texts[i]) - cut)
-                over -= cut
-    rows: list = []
-    for text, (_text, style, _least) in zip(texts, segments):
-        piece = Content.styled(text, style)
-        if rows and rows[-1].cell_length + sep + piece.cell_length <= width:
-            rows[-1] = rows[-1] + Content(_SEPARATOR) + piece
-        else:
-            rows.append(piece)
-    return Content("\n").join(rows)
 
 
 def _fit_text(text: Text, width: int) -> Text:
@@ -249,7 +198,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
     def on_mount(self) -> None:
         table = self.query_one("#subjobs", DataTable)
         self._refresh_view()
-        self._load()
+        self._start_fetch()
         # Focus without scrolling: on a short terminal scrolling to the table would put the
         # preview's top above the screen, out of reach of the keys, which all go to the table.
         self.set_focus(table, scroll_visible=False)
@@ -259,7 +208,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
     def _refresh_tick(self) -> None:
         # Keep a live job's status and times current while the preview is showing.
         if self.app.screen is self and v.is_live(self._job):
-            self._load()
+            self._start_fetch()
 
     def on_screen_resume(self) -> None:
         self._refresh_view()
@@ -321,7 +270,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
         job = self._job
         if self.app.screen is self:  # a late load must not retitle the details on top
             self.app.sub_title = f"job preview  ·  {v.job_id_of(job)}"
-        now = _now()
+        now = datetime.now(timezone.utc)
         rows = []
         # Values (ids, models, owners) are user or server text: pass them as
         # $variables so they are shown literally, never parsed as markup.
@@ -519,9 +468,6 @@ class JobSummaryScreen(FollowsPointer, Screen):
         # A status this client doesn't know: the service's reason, if it sent one.
         return Content.from_markup("  " + why.lstrip(), reason=reason, details=details) if why else Content("")
 
-    def _load(self) -> None:
-        self._start_fetch()
-
     def _start_fetch(self) -> None:
         if not self._loading:
             self._loading = True
@@ -537,10 +483,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
             job, error = None, v.collapse(v.describe_error(exc))
         if not (isinstance(job, dict) and job):
             job, error = None, error or "the service sent an empty answer"
-        self._post(self._apply_job, job, error)
-
-    def _post(self, fn, *args) -> None:
-        call_on_screen(self, fn, *args)
+        call_on_screen(self, self._apply_job, job, error)
 
     def _apply_job(self, job: dict | None, error: str | None = None) -> None:
         self._loading = False
@@ -555,8 +498,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
             self._fetch_error = error or "the service sent an empty answer"
         self._refresh_view()
 
-    # A read in flight longer than this shows how long it has taken (the client
-    # retries a failing answer for about a minute).
+    # A read in flight longer than this shows how long it has taken.
     _FETCH_SLOW_SECONDS = 5
 
     def _fetch_tick(self) -> None:
@@ -603,7 +545,7 @@ class JobSummaryScreen(FollowsPointer, Screen):
             # The read is in flight (a thread can't be cancelled): say so, not nothing.
             self.notify("Still reading this job; r asks again once it answers.")
             return
-        self._load()
+        self._start_fetch()
 
     def _highlighted_scope(self):
         table = self.query_one("#subjobs", DataTable)
@@ -643,240 +585,6 @@ class JobSummaryScreen(FollowsPointer, Screen):
     def _open_detail(self, sub_job_id, tab: str) -> None:
         self._reread_on_resume = True
         self.app.push_screen(
-            JobDetailScreen(self._client, self._job_id, job=self._job, sub_job_id=sub_job_id, initial_tab=tab,
-                            poll_interval=self._poll_interval)
+            LogScreen(self._client, self._job_id, job=self._job, sub_job_id=sub_job_id, initial_tab=tab,
+                      poll_interval=self._poll_interval)
         )
-
-
-# ─── job detail (tabs) ───────────────────────────────────────────────────────
-
-# Copying (ctrl+c) works on every tab, what the mouse highlighted or else everything the tab holds: not here.
-_LOG_ONLY = {"save_log", "cycle_level", "toggle_pause", "shrink_sources", "grow_sources", "filter"}
-# Pane ids match LogScreen's ("logs", "resource"), so its tab logic applies as-is.
-_TAB_IDS = ("logs", "resource")
-_TAB_FOCUS = {"logs": "#sources", "resource": "#resource-list"}
-
-
-class JobDetailScreen(LogScreen):
-    """Logs | Resources for a job, optionally scoped to one sub-job.
-
-    Extends :class:`LogScreen`, so the Logs tab keeps its live tail, cache,
-    saved-console fallback, filter, level, pause, save, and copy behavior, and
-    the Resources tab is LogScreen's view of one sub-job's GPUs or nodes at a
-    time: the one selected in Logs until ``<`` or ``>`` picks another.
-
-    Textual runs a handler such as ``on_mount`` for every class in the MRO, so
-    the handlers here never call ``super()`` for them.
-    """
-
-    # The preview's letters open the same tabs here;
-    # on Logs, l cycles the level instead (LogScreen's binding comes first, and
-    # check_action turns it off on the other tabs).
-    # w takes LogScreen's place for it, ahead of the Resources tab's sub-job keys.
-    BINDINGS = [
-        # On Logs, l cycles the level (check_action turns it off elsewhere, where l opens Logs).
-        Binding("l", "cycle_level", "Level"),
-        Binding("l", "show_tab('logs')", "Logs", show=False),
-        Binding("g", "show_tab('resource')", "Resources", show=False),
-        Binding("w", "cycle_window", "Window"),
-    ]
-    _DATA_REFRESH_SECONDS = 30
-    _STATUS_REFRESH_SECONDS = 60
-    _SUBTITLE_REASON = False  # the summary line shows reason and reason_details
-
-    def __init__(self, client, job_id, *, job: dict | None = None, sub_job_id=None, initial_tab: str = "logs",
-                 poll_interval=1.0, job_status=None) -> None:
-        super().__init__(client, job_id, sub_job_id=sub_job_id, poll_interval=poll_interval,
-                         job_status=job_status or (job or {}).get("status"))
-        self._job = job or {"job_id": job_id}
-        self._scope = sub_job_id
-        self._initial_tab = initial_tab if initial_tab in _TAB_IDS else "logs"
-        self._active_tab = self._initial_tab
-
-    # ── layout ──
-    def compose(self) -> ComposeResult:
-        yield Header()
-        yield Static("", id="summary")
-        with JobTabs(initial=self._initial_tab, id="job-tabs"):
-            with TabPane("Logs", id="logs"):
-                yield from self._compose_logs()
-            with TabPane("Resources", id="resource"):
-                yield from self._compose_resource()
-        yield FittedFooter(id="footer")
-
-    def on_mount(self) -> None:
-        self._render_summary_line()
-        self.set_interval(self._DATA_REFRESH_SECONDS, self._auto_refresh_data)
-        self.set_interval(self._STATUS_REFRESH_SECONDS, self._refresh_status)
-
-    def on_screen_resume(self) -> None:
-        self._update_subtitle()  # a screen pushed over this one may have replaced it
-
-    # The fewest cells the models are cut to so the summary line fits on one row.
-    _SUMMARY_LEAST = 12
-
-    def _render_summary_line(self) -> None:
-        job = self._job
-        job_id = v.job_id_of(job) or self._job_id
-        # A sub-job's id starts with its job's (JOB_ID:TYPE:INDEX): name it once.
-        if not self._scope:
-            ids = [job_id, "all sub-jobs"]
-        elif str(self._scope).startswith(f"{job_id}:"):
-            ids = [f"sub-job {self._scope}"]
-        else:
-            ids = [job_id, f"sub-job {self._scope}"]
-        # Why the job is where it is, in the service's words: reason and reason_details,
-        # or the sentence it sends when the job's status is unavailable.
-        why = v.status_unavailable_text(job) if v.is_unknown(job) else v.reason_text(job)
-        word = v.status_word(job.get("status"))
-        style = "red" if word == "failed" else "yellow" if v.is_live(job) else ENDED_STYLE
-        # Where the job is (its calls go there), when the account-wide list says it is
-        # somewhere other than the configured location.
-        elsewhere = getattr(self.app, "job_elsewhere", None)
-        location = v.location_label(job) if not callable(elsewhere) or elsewhere(job) else ""
-        least = self._SUMMARY_LEAST
-        # The models are cut to keep the line on one row; the ids,
-        # the location and the reason stay whole.
-        segments = [*((text, "", None) for text in ids),
-                    (v.job_type_label(job), "", None), (", ".join(v.job_models(job)) or "—", "", least),
-                    *([(location, "", None)] if location else []), *([(why, style, None)] if why else [])]
-        self._set_summary(fit_line(segments, self._summary_width()))
-
-    def _summary_width(self) -> int:
-        """The cells the summary line has: the screen's, less its padding, before the first layout."""
-        try:
-            width = self.query_one("#summary", Static).size.width
-        except Exception:  # noqa: BLE001 - not mounted, or already removed
-            width = 0
-        return width or max(40, self.app.size.width - 2)
-
-    def _on_job_loaded(self, job: dict) -> None:
-        # The service's fields come only from the fresh answer, so a reason (or
-        # reason_details) it stopped sending disappears from this line and the subtitle.
-        self._job = v.refresh_job(self._job, job)
-        if job.get("status"):
-            self._job_reason = job.get("reason")
-            self._update_subtitle()
-        self._render_summary_line()
-
-    def _live(self) -> bool:
-        # LogScreen keeps _job_status current (get_job, and the tail seeing the job end).
-        return v.is_live({"status": self._job_status or self._job.get("status")})
-
-    def _refresh_status(self) -> None:
-        # The tail pauses off the Logs tab, so it can't be what notices the job ending.
-        if self.app.screen is self and self._live():
-            self._fetch_status()
-
-    @work(thread=True, exclusive=True, group="status")
-    def _fetch_status(self) -> None:
-        # Numbered as it is sent: a read that answers after a later one is dropped (see _take_job).
-        # One the next tick's read replaced (exclusive) still counts: with a slow service every
-        # read can take longer than a tick, and dropping those would drop them all.
-        seq = self._next_job_read()
-        try:
-            job = self._client.get_job(self._job_id)
-        except Exception:  # noqa: BLE001 - keep the current view; the next tick retries
-            return
-        if isinstance(job, dict) and job.get("status") and self._screen_open:
-            self._post(self._apply_status, job, seq)
-
-    def _apply_status(self, job: dict, seq: int) -> None:
-        if not self._screen_open:
-            return
-        ended = is_active_status(self._job_status) and not is_active_status(job.get("status"))
-        # Status, reason and sub-job statuses come from this job as they are now:
-        # a reason the service stopped sending (a job that left pending) is gone.
-        # (_take_job also redraws the summary line from it.) An older answer than
-        # the one on screen changes nothing.
-        if not self._take_job(job, seq):
-            return
-        if ended and self._current_source:
-            # Show the saved console now, as the tail would after its next error.
-            self._start_tail(self._current_source, user=False)
-            return
-        # A Logs tab waiting for the job (or its sub-job) to start tails it once it can.
-        self._resume_waiting_tail()
-
-    # ── tabs & bindings ──
-    def action_show_tab(self, tab: str) -> None:
-        if tab in _TAB_IDS:
-            self.query_one("#job-tabs", TabbedContent).active = tab
-
-    def action_cycle_tab(self) -> None:
-        i = _TAB_IDS.index(self._active_tab) if self._active_tab in _TAB_IDS else 0
-        self.action_show_tab(_TAB_IDS[(i + 1) % len(_TAB_IDS)])
-
-    def _sync_footer(self) -> None:
-        # The footer stays on every tab; check_action scopes its keys to the tab.
-        self.refresh_bindings()
-
-    def _focus_active_tab(self) -> None:
-        try:
-            self.set_focus(self.query_one(_TAB_FOCUS.get(self._active_tab, "#sources")))
-        except Exception:  # noqa: BLE001 - not mounted yet
-            pass
-
-    def check_action(self, action: str, parameters):
-        tab = self._active_tab
-        if action == "filter" and isinstance(self.focused, Input):
-            return False  # / is a priority key (see LogScreen): in a text box it is typed
-        if action in _LOG_ONLY:
-            return tab == "logs"
-        if action == "resource_range":
-            return False  # digits do nothing here; w cycles the Resources window
-        if action == "cycle_window":
-            return tab == "resource"
-        if action == "resource_sub_job":
-            # < and >: on Resources, with another sub-job to switch to.
-            return tab == "resource" and len(self._resource_sub_job_ids()) > 1
-        return True
-
-    def _line_prefixes(self) -> tuple[str, str]:
-        # Tag every log line with the sub-job being tailed, and line its later
-        # rows (wrapped, or a traceback's lines) up under its text; the TUI's
-        # own status lines stay as they are (LogScreen._prefixes).
-        if not self._current_source:
-            return "", ""
-        tag = one_line(safe_text(source_label(self._current_source).replace(" #", ":")))
-        return f"{tag} │ ", f"{' ' * v.cell_width(tag)} │ "
-
-    def _ended_job(self) -> dict:
-        """This view's copy of the job with the newest status and reason (the tail
-        can see the job end before the next get_job refreshes the copy)."""
-        job = {**self._job, "status": self._job_status or self._job.get("status")}
-        if self._job_reason is not None:
-            job["reason"] = self._job_reason
-        return job
-
-    def _never_started(self) -> bool:
-        return v.never_started(self._ended_job())
-
-    def _no_log_output(self) -> str:
-        # A job that never got GPUs (placement_timeout and the like) wrote no logs: say why.
-        if self._never_started():
-            return f"No log output: {v.never_started_text(self._ended_job())}."
-        return super()._no_log_output()
-
-    def _auto_refresh_data(self) -> None:
-        # Only the visible tab polls, and only while the job is live. Resources waits
-        # until the status check sees the shown sub-job running: before that it has no samples.
-        if self.app.screen is not self or not self._live():
-            return
-        if self._resource_active() and self._resource_polls():
-            self._start_resource_refresh(force=True)
-
-    # ── windows ──
-    def _resource_job(self) -> dict:
-        return self._job  # the Resources header's GPU type and requested GPUs
-
-    def action_cycle_window(self) -> None:
-        if self._resource_active():
-            names = list(RANGES)
-            i = names.index(self._resource_range) if self._resource_range in names else -1
-            self.action_resource_range(names[(i + 1) % len(names)])
-
-    def on_resize(self, event) -> None:
-        # LogScreen.on_resize also runs (log re-wrap, Resources); refit the summary
-        # line here.
-        self.call_after_refresh(self._render_summary_line)

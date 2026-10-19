@@ -140,9 +140,7 @@ cortex-training --job JOB_ID load CHECKPOINT_ID --no-poll
 
 ```bash
 cortex-training tui                          # Open job list (a: all schemas)
-cortex-training tui --schema-only            # Job list of the configured schema only, no a
-cortex-training tui JOB_ID                   # Open job logs
-cortex-training tui --debug                  # Synthetic jobs, no connection
+cortex-training tui JOB_ID                   # Open the job dashboard
 cortex-training download-log JOB_ID --output-dir ./logs
 cortex-training download-log JOB_ID --log-type stdout --output-dir ./logs
 cortex-training download-metrics JOB_ID --output-dir ./metrics
@@ -711,9 +709,8 @@ download of the same directory is refused as for stdout.
 `MONITOR` on the account can list a job's checkpoints. The
 checkpoint files are stored on the job's Experiment too, but the service reads
 them there for you. Saved logs and GPU metrics are read with SQL on the job's
-Experiment instead (`download-log`, `download-metrics`, and the TUI's saved
-console and Resources tab), so they need privileges on that Experiment, and a
-`MONITOR`-only role can't read them.
+Experiment instead (`download-log`, `download-metrics`), so they need
+privileges on that Experiment, and a `MONITOR`-only role can't read them.
 
 When the service can't resolve the job's Experiment for your role, it answers
 500, in one of two wordings. The experiment-run lookup that `download-log` and
@@ -735,42 +732,28 @@ privileges to operate on experiment '...'`. `download-log` and
 status 1; `checkpoints` still works. See
 [REST API reference section 2.5](rest-api.md#25-roles-and-access).
 
-The TUI explains a refused read in one line on the view that needed it,
-instead of showing the raw error, and words the same refusal the same way on
-every view: the Logs tab's saved console and execution log, and the Resources tab
-(`GPU metrics unavailable: ...`). The service's answer above says the role
-can't read the job's Experiment; the experiment-run lookup's wording,
-`Linked experiment is not found for job ...`, adds that the Experiment may no
-longer exist. When Snowflake refuses the SQL on the Experiment (`Insufficient
-privileges to operate on experiment ...`, `Experiment ... does not exist or
-not authorized`), as it does for a `MONITOR`-only role, the line says that
-saved logs and GPU metrics live there and that `checkpoints` still works (the
-service lists them). A refusal about another object, a warehouse or a schema,
-keeps its own text. An HTTP 403 whose message names a privilege says the role
-isn't allowed to read that view's data. A 403 with no such message (a proxy
-or network gate can send an empty one) keeps the standard error text.
+The TUI explains a refused read in one line on the view that needed it, worded
+the same on every view: the Logs tab's saved console and execution log, and the
+Resources tab (`GPU metrics unavailable: ...`). For the service's answer above,
+the line says the role can't read the job's Experiment, and, for `Linked
+experiment is not found for job ...`, that it may no longer exist. When
+Snowflake refuses the SQL on the Experiment, as it does for a `MONITOR`-only
+role, the line says that saved logs and GPU metrics live there and that
+`checkpoints` still works. A refusal about another object (a warehouse, a
+schema) keeps its own text. A 403 whose message names a privilege says the role
+isn't allowed to read that view's data; one with no such message keeps the
+standard error text.
 
 ### Job TUI
 
-`cortex-training tui` is a read-only terminal UI for finding a job and
-inspecting its logs and GPU usage. It uses the same
-connection handling and fallback order as the CLI, including named and
-configured-default Snowflake profiles. Like `checkpoints`
-and `list --all`, it never creates the configured database or schema, which
-the other commands do when the service answers that they are not found: the
-TUI shows that error instead, as it does when this role can't use them.
-
-Every request the TUI sends is retried at most twice, with a 10-second connect
-and a 45-second read timeout, where the other commands use the SDK's defaults
-(ten retries, 30 and 600 seconds; [REST API reference section
-3.5](rest-api.md#35-retries)). So a job id that isn't found (404), or a
-service that keeps failing, shows its error within a few seconds rather than
-after about a minute. Pressing `r` while a refresh is still reading says so.
+`cortex-training tui` is a read-only terminal dashboard for job logs and GPU
+resources. It uses the same connection handling and fallback order as the CLI,
+including named and configured-default Snowflake profiles:
 
 ```bash
 cortex-training tui                 # opens the job list of the configured database and schema
 cortex-training tui --schema-only   # the same, without a to switch to every database and schema
-cortex-training tui JOB_ID          # opens that job's Logs tab directly
+cortex-training tui JOB_ID          # opens that job's dashboard directly
 cortex-training tui --debug         # synthetic jobs, no connection needed
 ```
 
@@ -794,37 +777,38 @@ cortex-training tui \
   --database CORTEX_TRAINING_DB --schema PUBLIC
 ```
 
+Like `checkpoints` and `list --all`, the TUI never creates the configured
+database or schema, which the other commands do when the service answers that
+they are not found: it shows that error instead, as it does when this role
+can't use them. Every request the TUI sends is retried at most twice, with a
+10-second connect and a 45-second read timeout, where the other commands use
+the SDK's defaults (ten retries, 30 and 600 seconds; [REST API reference
+section 3.5](rest-api.md#35-retries)). So a job id that isn't found (404), or
+a service that keeps failing, shows its error within a few seconds rather than
+after about a minute. Pressing `r` while a refresh is still reading says so.
+
 A config the TUI can't use, such as one with a value of the wrong type (a
 quoted number: `"poll_interval": "2"`), JSON that doesn't parse, an unknown
 key, or a path that isn't there, stops it before it starts, with one line on
-stderr and exit status 2:
-
-```text
-cortex-training tui: error: config poll_interval must be a number
-```
+stderr (`cortex-training tui: error: config poll_interval must be a number`)
+and exit status 2.
 
 Pass `--sub-job-id JOB_ID:training:0` to scope the job details to one matching
-sub-job; without `JOB_ID`, it opens that sub-job's job. An unmatched id is
-shown as an error, with the job's sub-job ids, rather than falling back to a
-different sub-job. `--debug` runs against generated jobs and telemetry, and
-keeps its caches in a temporary directory; the
-title says `(debug)`. Its jobs are in three locations: the configured
+sub-job. An unmatched id is shown as an error rather than falling back to a
+different sub-job.
+The error lists the job's sub-job ids; without `JOB_ID`, `--sub-job-id` opens
+that sub-job's job. `--debug` runs against generated jobs and telemetry, and
+keeps its caches in a temporary directory, removed when it ends; the title says
+`(debug)`. Its jobs are in three locations (the configured
 `CORTEX_TRAINING_DB.PUBLIC`, `TEAM_DB.EXPERIMENTS`, and a lowercase
-`"sandbox"."dev"`. It runs on the wall clock: live jobs keep logging (in the
-service's line format) and reporting GPU samples every 5 seconds, with four
-GPUs to a node and each node's CPU and memory beside them (one running
-job reports its GPUs only); the placing job starts up and runs within two minutes (its
-sampling sub-job waits until then, as one the service isn't routing to yet);
-the team's running job is cancelled five minutes in; and a debug run's tail
-gets stuck behind a 300 KiB line a minute in, and again every ten minutes,
-and restarts from the end. Among its other jobs are a job with a `log_prob`
-sub-job, jobs whose status is `SUCCEEDED`, `DONE` or `JOB_STATE_CANCELLED`, an
-`UNKNOWN` job its control plane no longer knows, a 25,000-line saved console,
-and two jobs whose Experiment this role
-can't read: one gone, and one that SQL refuses. Set
-`CORTEX_TRAINING_TUI_DEBUG_ACCOUNT_LIST` to `not_deployed`,
-`disabled`, `forbidden` or `rest_disabled` to preview `a` where the
-account-level list is unavailable, or to `unavailable` for a list that fails
+`"sandbox"."dev"`) and run on the wall clock: live jobs keep logging and
+reporting GPU and node samples (one reports its GPUs only), a placing job
+starts within two minutes, a
+running one is cancelled, a tail gets stuck behind a long line and restarts from
+the end, and others have ended, failed, are `UNKNOWN`, or sit on an Experiment
+this role can't read. Set `CORTEX_TRAINING_TUI_DEBUG_ACCOUNT_LIST` to
+`not_deployed`, `disabled`, `forbidden` or `rest_disabled` to preview `a` where
+the account-level list is unavailable, or to `unavailable` for a list that fails
 (503); `--debug --schema-only` works too.
 
 #### Job list
@@ -845,31 +829,26 @@ a refresh reads), then which list is shown:
 | `all schemas` | after `a`: the jobs in every database and schema the role can see, from the account-level list; `all schemas (all in DB.SCHEMA)` when every one of them is in the same location |
 | `newest 2,000 + every active job (more exist)` | the same, cut at the newest 2,000 because more exist, plus the active jobs created before those |
 | `first 20 pages: N jobs + every active job (more may exist)` | the same, cut after 20 pages (see below), plus the active jobs |
-| `Current schema only: DB.SCHEMA (reason)` | the jobs of the configured database and schema: with `--schema-only`, or in place of the account-level list where it turned unavailable while shown (see below) |
+| `Current schema only: DB.SCHEMA (reason)` | the jobs of the configured database and schema: with `--schema-only` (the reason reads `--schema-only`), or in place of the account-level list where it turned unavailable while shown (see below) |
 
-The configured schema's list is read with two retries and a 45-second read
-timeout. After `a`, each refresh reads the account-level list newest first,
-500 jobs a page with the same bounds per page. It stops after 2,000 jobs,
-or after 20 pages, because the service examines a bounded number of jobs per
-call, so a page can be short or empty and still have more after it: a refresh
-never walks the whole history. It asks for no status, so jobs whose status the
-service can't read (`unknown`) are listed too. When it stops with jobs left, it
-also reads the active jobs (`pending`, `placing`, `initializing` and `running`,
-through the same list with `status=active` and the same bounds) and adds those
-created before the newest ones, so a long-running job stays under live.
-An `unknown` job older than the newest 2,000 is not listed, as a
-status filter leaves those out, and if reading the active jobs fails or is cut
-short too, the header says `older active jobs may be missing`.
-A walk that stops at 20 pages with no job to show says that more may exist and
-how to list one schema, rather than that there are none.
+After `a`, each refresh reads the account-level list newest first, 500 jobs a
+page. It stops after 2,000 jobs, or after 20 pages, because the service examines
+a bounded number of jobs per call, so a page can be short or empty and still
+have more after it: a refresh never walks the whole history. It asks for no
+status, so jobs whose status the service can't read (`unknown`) are listed too.
+When it stops with jobs left, it also reads the active jobs (`pending`,
+`placing`, `initializing` and `running`) and adds those created before the
+newest ones, so a long-running job stays under live. An `unknown` job older than
+the newest 2,000 is not listed, as a status filter leaves those out, and if
+reading the active jobs fails or is cut short too, the header says `older active
+jobs may be missing`. A walk that stops at 20 pages with no job to show says
+that more may exist and how to list one schema, rather than that there are none.
 
 Search filters the jobs the list holds: when more exist, a search can't reach
 the older ones, and the message for a search without results says so. To
 search all of the configured schema's jobs, press `a` to go back to its list;
 for another schema, start the TUI with that schema's `--database` and
-`--schema` (and `--schema-only`). If the service can no longer open a page
-token partway (400 `Invalid page_token`), the walk starts again from the first
-page, once.
+`--schema` (and `--schema-only`).
 
 If the account-level list is unavailable when `a` asks for it, the list stays
 on the configured schema (the footer offers `a All schemas` again) and a notice
@@ -882,27 +861,22 @@ policy or a proxy in front of the account-level route alone can send one), or
 the error itself: the service's refusal where Cortex Training or its REST API
 is off for the account (403, or 405), or a failed load (a timeout, a 503).
 After a 404, or a 403 without the service's message, `a` within a minute
-answers the same without asking the service again. A later `a` asks again,
-and the notice gives what the service answers then, also when that differs
-from the last answer (a 503 after a 404, say).
+answers the same without asking the service again.
 
 Once every location is shown, a refresh whose account-level list answers 404
 (not there, or not enabled) shows the configured database and schema in its
 place, with the reason in the header: `Current schema only:
 CORTEX_TRAINING_DB.PUBLIC (no account-wide list yet)` or `(account-wide list
-not enabled)`. It reads that schema's list with the same bounds. It asks the
-account-level list again at most every 10 minutes, or when you press `r` once a
-minute has passed since it last asked, and lists every location once it
-answers. If asking again is answered 403 or 405, the configured schema's list
-stays, and the header says `(account-wide list: HTTP 403)`. A refresh the
-service refuses (403 with its own message, or 405) is a failed refresh (below);
-where no job was listed, the error is shown in place of the list and adds that
-`a` lists the configured database and schema. After a 403 without the service's
-own message, the list asks the configured schema once, and where that answers,
-shows its jobs with `(account-wide list: HTTP 403)` in the header and asks the
-account-level list again every 10 minutes. `--schema-only` lists only the
-configured database and schema and never asks the account-level list: the
-header says `Current schema only: DB.SCHEMA (--schema-only)`.
+not enabled)`. It asks the account-level list again at most every 10 minutes, or
+when you press `r` once a minute has passed since it last asked, and lists every
+location once it answers. If asking again is answered 403 or 405, the configured
+schema's list stays, and the header says `(account-wide list: HTTP 403)`. A
+refresh the service refuses (403 with its own message, or 405) is a failed
+refresh (below); where no job was listed, the error is shown in place of the
+list and adds that `a` lists the configured database and schema. After a 403
+without the service's own message, the list asks the configured schema once, and
+where that answers, shows its jobs with `(account-wide list: HTTP 403)` in the
+header and asks the account-level list again every 10 minutes.
 
 If a refresh fails, the list on screen stays, and a red line above it says
 when it failed, why, and since when the list is from, for example `refresh
@@ -920,9 +894,7 @@ seconds old, and a status the preview read in the meantime shows straight away.
 When the list holds jobs from more than one database and schema, a
 **Location** column after GPUs shows each job's `DB.SCHEMA`, each name
 double-quoted when it is not a plain uppercase identifier, as SQL needs it
-(`TEAM_DB.EXPERIMENTS`, `"ml"."dev"`). It comes after the columns that fill a
-136-column terminal: on one narrower than about 168 columns, scroll right to see
-it. The job preview shows
+(`TEAM_DB.EXPERIMENTS`, `"ml"."dev"`). The job preview shows
 the location too, and the job's details line names it, after the models, when
 it isn't the configured location. The column is hidden while every job shares
 one location, as the configured schema's own list does. Opening a job reads
@@ -935,50 +907,36 @@ The commands it shows name them too: the Logs tab's `download-log` hints, for ex
 from the configured database and schema; when it isn't there (404), the Logs
 tab says where it looked and to pass the job's `--database` and `--schema`.
 
-The TUI asks the account-level list only for jobs created in the last six
-months. The configured schema's list has them all, so the list hides those
-itself. Live jobs (`pending`,
-`queued`, `placing`, `initializing`, `creating` and `running`, with a green `●`;
-and `unknown`, with a yellow `?`, which means the service could not read the
-job's live state, so it may still be running) are grouped first. Finished jobs
-(`failed`, `cancelled`, `terminated`, `done`, and any other status) follow under
-history with `○`, and so does an `unknown` job the service says the control
-plane has no record of (`the job was not found in the Control Plane`). Sorted
-by status with ended jobs first (`status ↑`), history comes first.
-The `LIVE` and `HISTORY` rows give their count and what they hold; where the Job ID
-column is too narrow for that, it goes on in the columns after it, so it is
-never cut. Each row shows job id, status, type, created
-time and owner, then model, requested GPUs, location (when the list spans more
-than one) and updated time. Sorted by updated on a terminal too narrow for the
-Updated column to be in view, the two times swap places, so the sorted time
-shows beside the type. The owner is
-the submitting user; a job that records none shows its owning role, dimmed, as
-`role ROLE`. Every column has its full width when they all fit; otherwise the
-dates drop the year (`10-15 14:05`: the list spans six months), and the Job ID
-column narrows, to 16 cells at least, until job id, status, type, the time
-after it and owner fit (100 columns is enough). The rest scroll into view with
-`→`/`←` (on a row with sub-jobs to unfold or fold, those come first), the
-marker and the job id staying in place. The Job ID column fits a whole job id;
-narrowed, an id ends in `…`. The GPUs column is what the job requested (see the job preview
-below): `shared` for a job whose sub-jobs all run on another job's GPUs and
-on a sub-job row multiplexed onto another job's sub-job (it requests none of
-its own, whatever its config's `n_gpus` says, as the preview's GPUs line and
-the Resources tab count it too), and `0` for a `log_probability` sub-job. The
-list and the preview
-call such a sub-job `log_prob #N`, as its sub-job id spells it, and a job with
+Live jobs (`pending`, `queued`, `placing`, `initializing`, `creating` and
+`running`, with a green `●`; and `unknown`, with a yellow `?`, which means the
+service could not read the job's live state, so it may still be running) are
+grouped first. Finished jobs (`failed`, `cancelled`, `terminated`, `done`, and
+any other status) follow under history with `○`, and so does an `unknown` job
+the service says the control plane has no record of (`the job was not found in
+the Control Plane`). The `LIVE` and `HISTORY` rows give their count and what
+they hold. Each row shows job id, status, type, created time and owner, then
+model, requested GPUs, location (when the list spans more than one) and updated
+time. Sorted by updated on a terminal too narrow for the Updated column to be
+in view, the two times swap places, so the sorted time shows beside the type.
+The owner is the submitting user; a job that records none shows its owning
+role, dimmed, as `role ROLE`. On a narrow terminal the dates drop the year
+(`10-15 14:05`: the list spans six months) and the Job ID column narrows (an id
+then ends in `…`); the columns that don't fit scroll into view with `→`/`←`, the
+marker and the job id staying in place. The GPUs column is what the job
+requested (see the job preview below): `shared` for a job whose sub-jobs all run
+on another job's GPUs and on a sub-job row multiplexed onto another job's
+sub-job, and `0` for a `log_probability` sub-job. The list and the preview call
+such a sub-job `log_prob #N`, as its sub-job id spells it, and a job with
 training and log_prob sub-jobs `train+logprob` (`train+sample` for training and
-sampling). A job with sub-jobs shows `▸` before its job id while folded and
-`▾` while its sub-job rows show under it. Live jobs start unfolded. A click on
-the `▸`/`▾` unfolds or folds the job (a click anywhere else on a row
-highlights it, and a second click opens it); so do `→` and `←` on its row, and
-`←` on a sub-job row folds its job and moves to it. `e` unfolds or folds every
-job. When the list is empty it says so: "No jobs created in the last 6 months that
-this role can see, in any database and schema", or, for the configured
-schema's list, for example "No jobs created in the last 6 months in
-CORTEX_TRAINING_DB.PUBLIC that this role can see", followed, where `a`
-switches to every location, by "a lists every database and schema". A walk
-cut short with no job to show says "The account-wide list returned no jobs to
-show in its first 20 pages; more may exist" instead.
+sampling). A job with sub-jobs shows `▸` before its job id while folded and `▾`
+while its sub-job rows show under it. Live jobs start unfolded. A click on the
+`▸`/`▾` unfolds or folds the job (a click anywhere else on a row highlights it,
+and a second click opens it). When the list is empty it says so: "No jobs
+created in the last 6 months that this role can see, in any database and
+schema", or, for the configured schema's list, for example "No jobs created in
+the last 6 months in CORTEX_TRAINING_DB.PUBLIC that this role can see",
+followed, where `a` switches to every location, by "a lists every database and
+schema".
 
 A job whose status is `unknown` has no live state: the service could not reach
 the control plane. Its row shows no times (the account-level list keeps its
@@ -993,9 +951,7 @@ ID` on such a job tries that sub-job even when it can't be listed.
 Search with `/`. Plain words match job id (partial), sub-job id, status, owner, GPU type,
 job type (as the Type column shows it, `train+sample`, and as the API spells
 it, `log_probability`) and model, and all words must match. Matching ignores
-case and Unicode spelling: an accented letter typed either way (`é` as one
-character or as `e` plus an accent) and fullwidth letters (`ｗｉｄｅ`) find the
-same jobs. Words also
+case and Unicode spelling (`é` typed either way, fullwidth `ｗｉｄｅ`). Words also
 match the start of a job's database or schema name in the account-wide list
 (`team`, `experiments`, `team_db.exp`, `ml.dev`, or `"ml"."dev"` as the
 Location column shows it), but not the middle of one, so `training` doesn't
@@ -1033,8 +989,7 @@ db:team_db status:running
 ```
 
 A search with no results says how many jobs were searched and how the words
-and filters are applied, and, when more jobs exist than the list holds, what
-the list holds and that the search covers only those. On one schema's list it
+and filters are applied. On one schema's list it
 names that schema, and on the configured schema's (the default) it adds that
 `a` searches every database and schema, for example `No jobs match “sweep”
 among 171 job(s) in CORTEX_TRAINING_DB.PUBLIC in the last 6 months.` and then
@@ -1047,9 +1002,7 @@ When jobs older than six months, which the list hides, match the
 search, it says how many and the `cortex-training tui JOB_ID` that opens the
 newest. A message taller than the room a short terminal leaves scrolls (the
 mouse wheel, or `Tab` to it and the arrow keys). The line under the header
-gives the number of matches, then the search; it wraps rather than cutting
-either. On a terminal shorter than 30 rows the
-field help under the search box shows only while the box has focus.
+gives the number of matches, then the search.
 
 | Key | Action |
 |-----|--------|
@@ -1061,16 +1014,15 @@ field help under the search box shows only while the box has focus.
 | click `▸` / `▾` | Unfold or fold that job, as `→` / `←` do |
 | `e` | Expand or collapse every job's sub-jobs |
 | `a` | All schemas / current schema: switch to the account-level list of every database and schema the role can see (the footer's `a All schemas`), or back to the configured one (`a Current schema`); hidden with `--schema-only` |
-| `ctrl+c` | Copy what is highlighted (text, or rows a drag picked, with their whole job ids), else every job in the list; the same in the preview |
+| `ctrl+c` | Copy what is highlighted (text, or rows a drag picked, with their whole job ids), else every job in the list; in the preview, the highlight, else the whole preview |
 | `r` | Refresh (the list also refreshes every 60 seconds while it is showing); while it shows the configured schema in place of the account-level list (`Current schema only: DB.SCHEMA (reason)`), `r` asks that list again once a minute has passed since the last ask |
 | `?` | Show or close the keys panel |
 | `q` | Quit |
 
-Every screen's footer starts with Back (`b`) and Quit (`q`), then
-`?`: a narrow terminal cuts the footer's end, and
-`?` opens a panel that lists every key that works where you are, including the
-ones the footer has no room for. `esc` closes that panel first, before it
-clears a search or goes back.
+Every footer starts with Back (`b`, except on the job list) and Quit (`q`), then
+`?`: a narrow terminal cuts the footer's end, and `?` opens a panel that lists
+every key that works where you are, including the ones the footer has no room
+for. `esc` closes that panel first, before it clears a search or goes back.
 
 #### Job preview
 
@@ -1089,11 +1041,9 @@ cut, when it has the room.
   config) adds none, because it runs on that sub-job's GPUs. The job record
   does not carry the allocation, which can round up to whole nodes.
 - **Elapsed** runs from creation, so it includes time spent queued and placing.
-  An `unknown` row of the configured schema's list carries no creation time,
-  so a job that was already `unknown` when that list loaded shows `—` for both
-  Created and Elapsed; the account-level list keeps the creation time. A job
-  that turns `unknown` after the list loaded keeps the creation time from the
-  list, and its Elapsed runs to now, since the job's end can't be read.
+  An `unknown` job's Elapsed runs to now, since its end can't be read; one
+  listed without a creation time (see the job list above) shows `—` for both
+  Created and Elapsed.
 - **Last update** is the job's `updated_at` and how long ago that was. A time
   up to 5 minutes ahead of this computer's clock reads `just now`, and one
   further ahead says how far ahead it is; a record without one shows `—`.
@@ -1107,31 +1057,22 @@ follow, the same way for every state (for example `reason: quota_filled — need
 disappear once the service stops sending them. An `unknown` job says "Job
 status unavailable" with the service's sentence, and that it may still be
 running unless the service says the job was not found.
-Long values (a GPU line that names another job, the reason)
-wrap under where they start. A character carrying more than four combining
-marks keeps the first four (so-called zalgo text would otherwise draw over the
-rows around it). Below
-that are the job's sub-jobs with their type, status, model, GPUs and key
-config. A multiplexed sub-job's config
-ends with the sub-job whose GPUs it runs on, for example `runs on
-0a1b2c3d…:training:0`. The sub-job table fits the screen. When its cells are
-wider, a model name over 36 cells and then the end of each config (down to 24
-cells) are cut with `…`. On a narrower screen, such as 80 columns, the Type
-column is left out (each sub-job's label already names its type, and the
-Type field above has the job's), and the model and the config are cut further,
-down to 10 and 12 cells. The line above the table then adds `e whole table`;
-with `e` the table has every column and cell whole and, when that is wider
-than the screen, scrolls sideways (`←` / `→`, `Home` / `End` for either edge)
-with `← → scroll` on that line. A screen too narrow even for the cut table
-scrolls it sideways the same way. A live job's preview refreshes every 60
+Long values (a GPU line that names another job, the reason) wrap under where
+they start. Below that are the job's sub-jobs with their type, status, model,
+GPUs and key config. A multiplexed sub-job's config ends with the sub-job whose
+GPUs it runs on, for example `runs on
+0a1b2c3d…:training:0`. The sub-job table fits the screen: long models and
+configs are cut with `…`, and a narrow screen leaves out the Type column; the
+line above the table then adds `e whole table`. A table wider than the screen
+scrolls sideways (`←` / `→`, `Home` / `End` for either edge), with `← → scroll`
+on that line. A live job's preview refreshes every 60
 seconds, and when you come back to it from the details; `r` refreshes it now.
 Just under the fields, a dim line says when the copy on screen was read from
-the service (`read from the service at 12:05:01`), that a read is in flight (with
-how long it has taken, once that is 5 seconds or more: the client retries a
-failing answer for about a minute), or, after a read fails, the error and which
-copy is still shown, for example `couldn't refresh: HTTP 500 Internal Server
-Error: ...; showing the copy read at 12:04:30` (or the job list's copy, when no
-read has succeeded yet).
+the service (`read from the service at 12:05:01`), that a read is in flight
+(with how long it has taken, once that is 5 seconds or more), or, after a read
+fails, the error and which copy is still shown, for example `couldn't refresh:
+HTTP 500 Internal Server Error: ...; showing the copy read at 12:04:30` (or the
+job list's copy, when no read has succeeded yet).
 A click on the highlighted row (the "entire job" row or a sub-job row), or
 `Enter`, opens the details for that scope, its telemetry dashboard, on the
 Logs tab, as the line above the table says (`Click a job to open its
@@ -1144,24 +1085,16 @@ directly, and do the same in the details.
 The line under the title names the job and its scope, and repeats the
 service's `reason` and `reason_details` (or the `unknown` sentence) while it
 sends them. A sub-job's details name it by its id once (`sub-job
-JOB_ID:training:0`). The line keeps to one row when cutting the
-models with `…` is enough for that, and otherwise wraps between its parts,
-with the reason whole. Switch tabs with `l` (Logs) and `g` (Resources), or `t`
+JOB_ID:training:0`). Switch tabs with `l` (Logs) and `g` (Resources), or `t`
 for the next tab.
 
 - **Logs** is the live and historical log view described below. Each line is
   tagged with the sub-job being tailed, for example `training:0 │ …`, and its
   wrapped rows line up under its text. Saved logs (`s`) and whole-log copies
   (a copy with nothing highlighted) stay untagged and uncoloured. In the pane,
-  the tag has its sub-job type's colour (training cyan, sampling violet,
-  log_prob amber), as has the dot before each sub-job in the list beside it
-  and its name in the Resources header; the time is muted; the level is
-  coloured by severity (`INFO` green, `WARNING` amber, `ERROR` red), and a
-  warning's or an error's message is tinted to match, on each row it wraps
-  to; the logger name is
-  blue, the keys of `key=value` pairs are muted, exception names and
-  tracebacks are red, the TUI's own notes (`— live —`) are in italics, and
-  what the filter matches is marked in amber.
+  the tag has its sub-job type's colour, the level its severity's (a
+  warning's or an error's message is tinted to match), tracebacks are red,
+  and what the filter matches is marked in amber.
 - **Resources** shows telemetry (`download_metrics`) for one sub-job at a
   time: the one selected on the Logs tab, until `Space` shows the next one
   (`<` and `>` go back and forth). The tab's header names it, and stays at the top while the
@@ -1184,13 +1117,9 @@ for the next tab.
     stat and chart for it alone. `↓` on `GPU Resources` goes to its `ALL` (`↑`
     from `ALL` reaches `System Resources`). `<` and `>` keep the view and go
     back to `ALL`; `w` keeps the GPU or node.
-    `PgUp`, `PgDn`, `Home` and `End` scroll the stats and charts, also while
-    the panel has the focus; so does the mouse wheel over them.
   - The header names the job's GPU type (`hardware`) and compares the GPUs the
-    sub-job requested with the GPUs reporting in the newest samples. Requested
-    follows the control plane's rule: `n_gpus` in the sub-job's config, but 0
-    for a `log_probability` sub-job, and 0 for a sub-job that sets
-    `multiplex_job_id`. A multiplexed sub-job runs on the GPUs of the sub-job it
+    sub-job requested (counted as the preview's **GPUs** line counts them) with
+    the GPUs reporting in the newest samples. A multiplexed sub-job runs on the GPUs of the sub-job it
     names, and only that sub-job reports GPU metrics, covering everything that
     runs on them, so the multiplexed sub-job's own tab says where they are.
     A GPU whose newest sample is more than two minutes (or three sampling
@@ -1215,35 +1144,14 @@ for the next tab.
     measured back from its own newest sample. Rows that can't be read are
     counted in the header (`3 rows skipped (malformed or unsupported)`):
     malformed JSON, a record version or sub-job this client doesn't read, or
-    an unusable GPU index, node number (`worker_num`) or timestamp. Rows of a
-    kind this client doesn't know are passed over. A row stamped more than 10
-    minutes ahead of this computer's clock is counted too, so one skewed
-    timestamp can't become the newest sample. A row without a usable
-    `sample_interval_s` (missing, or not above 0) counts for the time since
-    its GPU's (or node's) previous row, up to five minutes.
+    an unusable GPU index, node number (`worker_num`) or timestamp.
   - The header is always two lines, so the stats and charts under it never
-    move. On a terminal too narrow for all of it, each line drops detail
-    instead of wrapping. On the first, the sub-job's place goes short
-    (`1 of 2` becomes `1/2`), then the window to its key's name
-    (`10m`), then away, then the place, then the GPU type (in the System
-    view, the nodes' CPUs and memory). On the second, the why of the skipped
-    rows, the values-change note and the newest sample's time go first, and a
-    state's longer words: `cached · refresh failed: …` becomes `refresh
-    failed: …`.
-    Then the skipped rows and the scrape interval go. An error keeps room for
-    its first 40 characters where it can. The second line keeps room for
-    `cached · refreshing…` and for the age to grow, so a refresh starting, or
-    the age passing a minute, changes nothing else on it.
+    move: on a terminal too narrow for all of it, each line drops detail
+    instead of wrapping.
   - A numeric field is a metric when its name ends in a unit suffix: `_pct`,
-    `_bytes`, `_watts` or `_c`, a gauge in `%`, `GiB`, `W` or `°C`. Metrics
-    are charted without a list of names, so a gauge a newer service adds in
-    one of those units gets its chart and stats row with no change here. A
-    number without a unit is not charted, since its average over a window
-    means nothing: an id or a count (`global_gpu_index`, `worker_num`, `seq`,
-    a process id), a duration (`sample_interval_s`, an uptime) or a counter
-    that only grows (a `_total` field, ECC and XID error counts). Nor is a
-    field whose name has anything but lowercase letters, digits and `_`, nor
-    text, nor a field that is null in every row (the SM gauges today). Each
+    `_bytes`, `_watts` or `_c`, a gauge in `%`, `GiB`, `W` or `°C`. A number
+    without a unit is not charted, since its average over a window means
+    nothing; nor is text, or a field that is null in every row. Each
     view starts with its utilization and a derived memory use: **GPU util %**
     (`gpu_util_pct`, the share of time a kernel was running on the GPU, which
     says how busy it was, not how saturated) and **GPU memory used %**
@@ -1253,40 +1161,25 @@ for the next tab.
     `GPU memory free (GiB)`, `power (W)`, `GPU temp (°C)`, `tensor active %`
     and `DRAM active %`, or `memory used (GiB)`. A node's `cpu_count` and
     `mem_total_bytes` stay the same through a job, so the header names them
-    (above) and they get no chart or stats row. A name comes from its field:
-    the unit suffix becomes `%`, `GiB`, `W` or `°C`, and `gpu`, `cpu`, `sm`
-    and `dram` are capitalized.
+    (above) and they get no chart or stats row.
   - The stats block has a row per metric, in that order: the min, average,
     max and latest over the selected window and over the whole job, in the
     metric's unit, for the GPU or node shown or for the mean across them. The
-    titles say which (`mean of 8 GPUs`, `GPU 3`, `node 2`); on a terminal too
-    narrow for that layout, the metrics' short names (`GPU mem used %`,
-    `power`) come first, then a row per metric and scope (`10m`, `job`), and
-    the first line names what the values are.
+    titles say which (`mean of 8 GPUs`, `GPU 3`, `node 2`).
   - Under it, a chart per metric, in the same order: two to a row in a pane
     at least 90 cells wide, one per row otherwise. The charts grow with the
-    terminal: 12 rows of bars on a terminal of 48 rows or more, 10 from 40
-    rows, 8 from 34, 6 from 28 and 4 below that, always an even number, so
-    the middle label's row tops out at exactly half the scale; a dotted line
-    marks that row where the bars stay under it. A percentage is charted from
+    terminal; a dotted line marks half the scale where the bars stay under
+    it. A percentage is charted from
     0 to 100% (labeled `100%`, `50%` and `0%`); any other metric from 0 to the
     smallest 1, 2, 2.5 or 5 × 10^k at or above the sub-job's highest sample of
     it, on any GPU or node (`1000 W`, `500 W`, `0 W`), so its axis doesn't move
     with the window or the unit shown. Each title names the metric, the window
     and what the values are (`power (W) · last 10m · mean of 8 GPUs`), and
-    ends, at the chart's right edge, with the metric's latest value; on a
-    terminal too narrow for that, every title leaves out what the values are
-    (the stats name it), then the window, and a name that still doesn't fit
-    ends in `…`, so the charts of a row stay level. A metric with no samples
-    in the window says so in its chart's place.
-  - Each chart has its own colour, by its place in the order (the first, GPU
-    or CPU util %, is green; memory used % cyan; then blue, violet, amber,
-    rose and so on): its bars (lighter toward the top), its title and latest
-    value, and its name in the stats block. The frame, the axis labels and
-    the times are muted, and the stats' latest values are bold. In the panel,
-    each GPU's or node's value has a one-cell bar of it before it, in the
-    first chart's colour (the value itself stays plain, readable under the
-    highlight).
+    ends, at the chart's right edge, with the metric's latest value. A metric
+    with no samples in the window says so in its chart's place.
+  - Each chart has its own colour, shared by its title, latest value and name
+    in the stats block. In the panel, each GPU's or node's value has a one-cell
+    bar of it before it, in the first chart's colour.
   - For the mean across GPUs or nodes, min and max are the lowest and highest
     average across them at one sampling interval. Each worker scrapes and
     uploads its samples on its own schedule, so a GPU or node without a sample
@@ -1304,14 +1197,9 @@ for the next tab.
     that part (for GPU util %, it is the share of the GPUs' time a kernel was
     running). Latest is the newest capture. For one GPU or node, min and max
     are its own lowest and highest samples, also in the whole-job view, the
-    average is its own over the window, and latest its newest sample. A chart
-    spanning a day or more dates its axis labels, and one spanning less than
-    two minutes shows seconds, so no two labels read the same.
+    average is its own over the window, and latest its newest sample.
   - `w` cycles the window through 10 minutes (the default, for every job),
     30 minutes, 1 hour, 6 hours, and the whole job.
-  - The footer shows `space Sub-job` after `w Window`;
-    on a terminal too narrow for every key, the footer leaves out the keys
-    that don't fit whole, from the right (`?` lists every key).
   - Telemetry downloads when the tab is first shown; `r` refreshes it, and a
     live job's telemetry refreshes every 30 seconds while the tab is showing,
     once the selected sub-job runs. Before that (the job or the sub-job is
@@ -1329,28 +1217,21 @@ for the next tab.
     It is cached under `jobs/<job>/metrics/` in the TUI cache directory. The
     selected sub-job downloads first, and each sub-job shows as soon as its
     chunks are in; later opens download only the new chunks.
-    Each refresh reads only what the download appended, and the first read of
-    a long job's cache shows the selected sub-job's newest samples before the
-    rest of its history.
+    The first read of a long job's cache shows the selected sub-job's newest
+    samples before the rest of its history.
 
 #### Logs
 
-The Logs tab lists the job's sub-jobs, training first, in a panel as wide as
-their labels; select one to tail its logs (the zone-manager pod is the Ray
-head, so a sub-job's worker output is included). `r` reloads the list and
-stays on the selected sub-job. The tail
-polls only while the Logs tab is on screen: on another tab
-it stops and later resumes from where it left
-off, so no lines are lost. While a job runs, its status is also re-read every
-60 seconds, so the view switches to the saved console when the job ends. A read
-that answers after a later one (a slow one, with the client's retries) is
-ignored, and so is any answer that still has the job running once the view has
-seen it end.
-Logs are cached locally, so reopening a job replays instantly without
-re-fetching from the server: under `~/.cache/cortex-training/jobs/<job>/` (or
-`$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`. The same
-directory holds telemetry. `--debug` uses a temporary cache
-of its own, removed when it ends.
+The **Logs** tab's left panel lists the job's sub-jobs; select one to tail its
+logs (the zone-manager pod is the Ray head, so a sub-job's worker output is
+included).
+The tail polls only while the Logs tab is on screen: on another tab it stops
+and later resumes from where it left off, so no lines are lost. While a job
+runs, its status is also re-read every 60 seconds, so the view switches to the
+saved console when the job ends.
+Logs are cached locally so reopening a job replays instantly without
+re-fetching from the server — under `~/.cache/cortex-training/` (or
+`$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`.
 
 The pane draws each line as text only: escape sequences in a line (colours,
 cursor moves, clipboard or title writes) are removed and other control
@@ -1360,15 +1241,12 @@ A leading timestamp shows in local time, as `YYYY-MM-DD HH:MM:SS`, like every
 other time in the TUI. A JSON log record, after the timestamp and any Ray
 `(Actor pid=...)` prefix, shows as `time LEVEL logger: message`, with the
 message's line breaks kept and an error or exception chain on the lines under
-it; its other fields (host, ids) are left out. Rows are cut by terminal cells,
-so wide (CJK, emoji) text stays inside the pane. `s` saves the lines as they
-came.
+it; its other fields (host, ids) are left out. `s` saves the lines as they came.
 
 The header's subtitle starts with the job's status. On the Logs tab it adds
 `last line HH:MM:SS`, the newest live line's own timestamp in local time
 (`last line received` with the time it arrived, for a line without one), and
-any filter, level, or pause; the job's `reason` and `reason_details` are on
-the summary line under it.
+any filter, level, or pause.
 
 The line under the log pane is the Logs tab's status line. It appears when the
 job read is slow, when the tail is waiting, paused, or restarted, when the
@@ -1378,8 +1256,7 @@ seconds), or when the pane doesn't hold a sub-job's oldest lines:
 - **Reading the job.** The Logs tab reads the job first, for its sub-jobs and
   status. Until that read answers, the pane says `— reading job JOB_ID —`, and
   after two seconds the status line counts the wait, for example
-  `reading the job: no answer yet after 52 s (up to 3 tries of 45 s each)`: a
-  service that doesn't answer is asked again after each 45-second read timeout.
+  `reading the job: no answer yet after 52 s (up to 3 tries of 45 s each)`.
   `r` meanwhile says the job is still being read rather than asking again. If
   the read fails and the job can't be shown from the list's copy or the cache,
   the pane says why, for example `[error] couldn't read job JOB_ID: no answer
@@ -1389,38 +1266,29 @@ seconds), or when the pane doesn't hold a sub-job's oldest lines:
   `placing`, or `initializing`, the status line says it is waiting, with the
   service's `reason` and `reason_details` (for example `quota_filled` and the
   GPUs it needs), and that the status is checked every 60 seconds (`r` checks
-  now), instead of showing an error. A pending job isn't tailed at
-  all, since the service refuses `tail-logs` until the job is placed; nor is a
-  pending sub-job of a placed job, which waits for its own placement. A placing
-  or initializing sub-job is tailed, and its first lines end the wait. When the
-  60-second status check sees the job start (or, for that sub-job, run), the
-  tail starts by itself; so does a tail that failed while the job started up
-  when the TUI couldn't read the job to tell why. The service's answer counts
-  too: a 409 "is pending placement" waits for placement whatever the status
-  says (for example `UNKNOWN`, when the service couldn't read the job's state),
-  and the tail starts once the status changes. A sub-job the service isn't
-  routing to yet (a 400 "does not belong to session" while its job starts)
-  also waits; its tail is tried again when its status or the job's changes,
-  and, once both are running, at each status check while someone is using the
-  view. `r` tries it at once. An error once the job runs ends the wait and
-  stays on screen.
+  now), instead of showing an error. A pending job, or a pending sub-job of a
+  placed job, isn't tailed until it is placed; a placing or initializing
+  sub-job is tailed, and its first lines end the wait. When the 60-second
+  status check sees the job start (or, for that sub-job, run), the tail starts
+  by itself. The service's own answer that the job is pending placement (a
+  409), or that it isn't routing to the sub-job yet (a 400 "does not belong to
+  session"), also waits, and the tail is tried again when the status changes
+  or, once the job and the sub-job run, at each status check while someone is
+  using the view; `r` tries it at once. An error once the job runs ends the
+  wait and stays on screen.
 - **The job ends.** Once a job stops running, `tail-logs` answers 409, and 404
   once the job's session is gone. Neither is retried: the TUI reads the job once
   and, if it has ended, switches to the saved console at once.
 - **The tail stops on an error.** Any other error while the job is live stays
   in the pane, and the status line says `tail stopped: <the service's answer>
   (r retries; ...)`, in place of any waiting note. `r` tries again at once, and
-  so does each 60-second status check until the job ends: while the job is
-  placing or initializing, and otherwise (it runs, or its status is
-  unavailable) while someone has used the view in the last 15 minutes. While
-  one request (with the client's own retries) has had no answer for 20
-  seconds, the status line says so.
+  so does each 60-second status check until the job ends (once the job runs,
+  or its status is unavailable, only while someone has used the view in the
+  last 15 minutes). While one request has had no answer for 20 seconds, the
+  status line says so.
 - **Status unavailable.** While the job's status is `UNKNOWN` (the service
   couldn't read it), the status line says its log may not answer; the tail is
   tried all the same, and the note goes once lines arrive or the status is back.
-  If the tail stops on an error meanwhile, the status line says so instead
-  (`... so does each status check while the job's status is unavailable`), and
-  each status check tries the tail again, as above.
 - **A refused position.** The tail resumes from the position (cursor) it last
   saved. If the service refuses that cursor with a 400 (one saved under an
   older service version, say), the TUI drops it, reads the end of the log
@@ -1431,14 +1299,11 @@ seconds), or when the pane doesn't hold a sub-job's oldest lines:
   seconds or more behind, the status line says how old the newest line shown is.
 - **A stuck tail.** On some service versions a log line of 256 KiB or more is
   never delivered, and the tail stops moving while the job keeps logging. When
-  a running job's tail hasn't moved for 45 seconds, the TUI reads the end of
-  the log. If that has lines the tail hasn't shown while the tail still brings
-  nothing, the tail continues from the end, leaves out the lines already shown,
-  and marks where it restarted; lines between the two may be missing, and
-  `download-log --log-type stdout` has them once their chunks are uploaded. If
-  the tail does bring lines, the log was only quiet, and they show in order.
-  A read of the end that still reaches back to the stuck line brings nothing
-  new, so getting past it can take a few of these reads (a minute or two).
+  a running job's tail has brought nothing for 45 seconds and the end of the log
+  has lines it hasn't shown, the tail continues from the end, leaves out the
+  lines already shown, and marks where it restarted; lines between the two may
+  be missing, and `download-log --log-type stdout` has them once their chunks
+  are uploaded. Getting past the stuck line can take a minute or two.
 - **No input for 15 minutes.** A `tail-logs` call on a running job currently
   counts as activity on the job, so a Logs tab left open would keep an idle job
   alive, and billing, past its idle timeout. After 15 minutes with no key
@@ -1448,12 +1313,10 @@ seconds), or when the pane doesn't hold a sub-job's oldest lines:
   while the job runs: reads while it is placed or starts up don't count as
   activity. Once the job ends, the saved console replaces the paused tail.
 - **Scrollback.** The pane keeps a sub-job's newest 20,000 lines (fewer when
-  long lines wrap to many rows: it holds at most 200,000 rows). A line that
-  would take more than 20 rows shows its first and last rows, around one that
-  says how many are left out (`s` saves the whole line); in a narrow pane that
-  row is shortened to fit, keeping the count. Opening a running
-  job reads only its log's last 2,000 lines (a shorter log is read whole, from
-  its first line, however fast it writes), and a cached tail is replayed up
+  long lines wrap to many rows). A line that would take more than 20 rows
+  shows its first and last rows, around one that says how many are left out
+  (`s` saves the whole line). Opening a running job reads only its log's last
+  2,000 lines, and a cached tail is replayed up
   to its newest 2,000 lines. Whenever the pane doesn't hold the log's first
   lines, for one of these reasons or because it dropped older ones, the status
   line says how many log lines it holds, for example
@@ -1480,46 +1343,36 @@ it, under `— N newer lines from the live tail, not in the saved console yet �
 so the end of the job doesn't take away lines you saw. A sub-job with no
 console yet says instead that its saved logs may not all be uploaded yet; `r`
 checks again for its console and its execution log.
-A job that never got GPUs has no logs at all: one that failed with reason
-`placement_timeout`, `placement_too_large`, `placement_failed` (any
-`placement_*` reason), `hardware_unavailable` or `pending_timeout`, or one that
-ended while every sub-job was still waiting to be placed (`pending`, `queued`,
-`creating` or `placing`). Its pane says so
-with the reason, for example "No log output: the job never got GPUs (reason:
-placement_timeout), so no sub-job started or wrote logs.", and its preview says
-the same instead of pointing to Logs.
+A job that never got GPUs has no logs at all: one that failed with a
+`placement_*` reason (such as `placement_timeout`), `hardware_unavailable` or
+`pending_timeout`, or one that ended while every sub-job was still waiting to
+be placed. Its pane says so with the reason, for example "No log output: the
+job never got GPUs (reason: placement_timeout), so no sub-job started or wrote
+logs.", and its preview says the same instead of pointing to Logs.
 Jobs that fail while they are created or start up may have no saved console.
 For a failed job's sub-job without one, the pane shows the error records from
 that sub-job's execution log (`_logs/<sub_job_id>/execution.jsonl` on the job's
 Experiment) under a header, each with its error message and exception chain;
-when the log has no error records, its last 20 records. If the role can't read
-the job's Experiment, where saved consoles, execution logs, and GPU metrics
-live, the pane says so in one line instead of showing a download error. When
-the service can't find the Experiment for the role at all (`Linked experiment
-is not found for job ...`), the line adds that it may no longer exist.
+when the log has no error records, its last 20 records.
 
 The filter (`/`) and the level key apply to the lines the view already has:
 changing either repaints the pane and never restarts the tail or sends a
-request. A saved console is searched whole, and a live tail's lines are
-filtered again, off the screen's thread, so keys keep working while a long log
-repaints. The same goes for wrapping the pane's lines again when its width
-changes; during a resize, that waits until the size has held for a moment.
-The level key hides lines below the
-chosen level, reading the level from a structured entry or from the line
-itself (a JSON `level` field, or a word such as `INFO` or `ERROR`); lines with
-no recognizable level always stay, and a record that carries an error or an
-exception counts as `ERROR` whatever its level says. Both apply to live
+request. A saved console is searched whole. The level key keeps lines
+at or above the chosen level, judged from a JSON line's `level` field or a
+level word such as `WARNING` in its first 512 characters; lines with no level
+always stay, and a record that carries an error or an exception counts as
+`ERROR` whatever its level says. Both apply to live
 lines, saved consoles, and the execution-log records shown for a failed job
 without a console, the latter a whole record at a time (a match in its
 exception chain keeps the record); their header stays.
 
 The TUI also writes two files into your home directory: saved logs from the `s`
-key (`~/cortex-training-<job8>-<type>-<index>.log`, such as
-`~/cortex-training-<job8>-training-0.log`, where `<job8>` is the first eight
+key (`~/cortex-training-<job8>-<source>.log`, where `<job8>` is the first eight
 characters of the job id) and its own error log
-(`~/.cortex-training-errors.log`). `s` saves the sub-job's saved console, else
-the lines its tail cached, else the execution log the pane shows; with nothing
-to save it says so and writes no file.
+(`~/.cortex-training-errors.log`).
+`<source>` is the sub-job's type and index, such as `training-0`. `s` saves the
+sub-job's saved console, else the lines its tail cached, else the execution log
+the pane shows; with nothing to save it says so and writes no file.
 
 Copying works on every screen and tab. Drag the mouse over any text to
 highlight it, then press `ctrl+c` (or Cmd-C, where the terminal passes it on) to put it on the clipboard, so Cmd-V (or
@@ -1536,28 +1389,20 @@ job, pick a list entry or run a footer key), and a footer key runs when it is
 clicked, not as it is pressed. Changing what a view shows (another tab,
 sub-job, GPU, node or window) drops its highlight.
 
-`ctrl+c` copies what is highlighted
-(without clearing it), else everything the view holds, including what
-is scrolled out of view: on Logs the whole log (its newest lines up to 1 MiB);
-on Resources the panel (each GPU's or node's value), the header, every stats
-row and every chart; on the job list every job; in the preview all of it.
-
 The TUI takes the mouse, so the terminal's own selection and its copy key
 (Cmd-C) see nothing; instead, a copy goes to this computer's clipboard
 (`pbcopy` on macOS; `wl-copy`, `xclip` or `xsel` on Linux) and to the
 terminal's (OSC 52, which reaches your own computer's clipboard over SSH,
 where some terminals ignore it). Escape sequences and control characters are
-removed. The screen never waits for that tool (`xclip` can take seconds to
-give up on a display that is gone): once it is done, a one-line note at the
-right end of the title row says what was copied (`copied 12 lines`), for three
-seconds; when only the terminal's clipboard could take it, the note says so,
-with a tip, for eight. To select
+removed. Once it is done, a one-line note at the right end of the title row
+says what was copied (`copied 12 lines`); when only the terminal's clipboard
+could take it, the note says so, with a tip. To select
 with the terminal itself instead, hold a key while dragging: Option in iTerm2,
 Fn in macOS Terminal, Option in VS Code's terminal once
 `terminal.integrated.macOptionClickForcesSelection` is on. With the keys
 panel open, a copy takes its list of keys too.
 
-Keys in the job details view:
+Keys in the job details view (`/`, `p`, `s`, `[` and `]` work on Logs):
 
 | Key | Action |
 |-----|--------|
@@ -1566,26 +1411,24 @@ Keys in the job details view:
 | `w` | Cycle the window (Resources) |
 | `Space` | Next sub-job, round to the first after the last, when the job has two or more; the view stays, back to `ALL`. `<` / `>` go back / forward (Resources) |
 | `↑` `↓` | Pick GPU Resources or System Resources, `ALL` or one GPU or node in the panel; the charts follow the highlight (Resources) |
-| `/` | Filter the current source (Logs) |
+| `/` | Filter the current source |
 | `l` | Cycle minimum log level (INFO / WARNING / ERROR) (Logs; `L` works too); elsewhere the Logs tab |
-| `p` | Pause / resume auto-scroll; scroll back freely while paused. Resumes a tail paused for no input (Logs) |
-| `s` | Save the current source to `~/cortex-training-<job8>-<type>-<index>.log` (Logs) |
+| `p` | Pause / resume auto-scroll |
+| `s` | Save the current source to `~/cortex-training-<job8>-<source>.log` |
 | `ctrl+c` | Copy what is highlighted, else everything the tab holds: the log (its newest lines, up to 1 MiB) on Logs; the panel, header, stats and every chart on Resources (any tab) |
-| `[` / `]` | Narrow / widen the sources panel, which is otherwise sized to its labels; the log keeps at least 40 columns (Logs) |
+| `[` / `]` | Narrow / widen the sources panel |
 | `PgUp` `PgDn` `Home` `End` | Scroll the log, also while the sources panel has the focus (Logs); scroll the stats and charts, also while the panel has the focus (Resources) |
 | `r` | Refresh the visible tab (on Logs, the sub-job list and its tail) |
 | `b` / `esc` | Back, or to the job list for a job opened directly (`esc` closes the keys panel first, and on Logs clears an active filter first) |
 | `?` | Show or close the keys panel |
 | `q` | Quit |
 
-The `--poll-interval` flag is the minimum interval between log polls per
-source, biasing toward server reliability over freshness (except while the
-tail catches up with full pages, above). Without the flag it
-is the config file's `poll_interval` when the config sets one, else `1.0s`. The
-same config value is the CLI's result-polling interval, so the example
-config's `0.5` makes the TUI poll a live log twice a second, and each
-`tail-logs` call on a running job counts as activity on it; pass
-`--poll-interval 1` to keep the TUI at one poll a second.
+The `--poll-interval` flag is the minimum interval between log
+polls per source, biasing toward server reliability over freshness.
+(A tail catching up with full pages polls faster, above.) Without the flag it
+is the config file's `poll_interval` when the config sets one (the CLI's
+result-polling interval: the example config's `0.5` polls a live log twice a
+second), else `1.0s`; pass `--poll-interval 1` for one poll a second.
 
 ### JSON Output And Help
 
@@ -1638,13 +1481,6 @@ stays a DSSST1 frame either way.
 `CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES` is the per-request JSON body
 ceiling for byte `forward()` `/operation` posts (integer bytes, default 16 MiB,
 minimum 16 KiB). Frames larger than that are split into request chunks.
-
-`CORTEX_TRAINING_TUI_DEBUG_ACCOUNT_LIST` (`not_deployed`, `disabled`,
-`forbidden` or `rest_disabled`; `ok` or unset is the default) makes the
-account-level list of `cortex-training tui --debug` answer as an unavailable one
-does, to preview what the job list's `a` (all schemas) says then; `unavailable`
-makes it fail (503).
-See [Job TUI](#job-tui).
 
 ### Troubleshooting
 

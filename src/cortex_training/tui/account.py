@@ -15,35 +15,12 @@
 
 """Where the TUI's job list comes from, and which client each job's calls use.
 
-The job list shows the configured schema's jobs (``list_jobs``) until ``a``
-asks for the account-level list (``GET /api/v2/cortex-training``): the jobs
-this role can see in every database and schema (:attr:`JobLister.account_wide`;
-``a`` again goes back). Where the service doesn't have that route yet, or
-hasn't enabled it for the account, a load of it lists the configured schema
-instead (:data:`FALLBACK`); the list screen then goes back to the configured
-schema and says why when ``a`` had just asked (the answer to that ask: an
-earlier one counts only until the list is asked again). A list already showing
-every location keeps the configured schema in its place and asks the
-account-level list again at most every :data:`ACCOUNT_REPROBE_SECONDS` (``r``
-or ``a`` asks once the last ask is :data:`ACCOUNT_MANUAL_REPROBE_SECONDS` old).
-``--schema-only`` keeps to the configured schema and never asks.
-
-One refresh reads the newest jobs, at most :data:`ACCOUNT_LIST_CAP` of them or
-:data:`ACCOUNT_LIST_MAX_PAGES` pages. When more exist, it also reads the active
-jobs, so a job still running that was created before the newest ones is listed.
-
-A row of the account-level list names its database and schema. Every call
-about that job (``get_job``, logs, GPU metrics) goes through a
-client bound to that location (:class:`JobClients`); a job without one (the
-configured schema's own list, or a job opened by id) uses the TUI's client.
-
 Nothing here imports ``textual``: the job list runs :meth:`JobLister.load` in a
 thread worker, and every rule is unit-testable on its own.
 """
 
 from __future__ import annotations
 
-import inspect
 import logging
 import threading
 import time
@@ -107,7 +84,6 @@ _FALLBACK_WHY = {
     AccountJobListUnavailable.FORBIDDEN: "account-wide list: HTTP 403",
     AccountJobListUnavailable.REST_DISABLED: "account-wide list: HTTP 405",
 }
-_NO_ACCOUNT_LIST = "no account-wide list"  # a client without one
 _FAILURE_LIMIT = 300  # cells of a failure's one-line text
 _ACCOUNT_ROUTE, _SCHEMA_ROUTE = "the account-wide job list", "list_jobs"
 
@@ -152,10 +128,6 @@ class Listing:
     scope: ListScope
 
 
-def _jobs(count: int) -> str:
-    return f"{count:,} job" + ("" if count == 1 else "s")
-
-
 def _more(scope: ListScope) -> str:
     more = "more exist" if scope.stopped == CAPPED else "more may exist"
     return more + ("; older active jobs may be missing" if scope.active_missing else "")
@@ -175,7 +147,7 @@ def scope_text(scope: ListScope, *, location: str, only: str = "") -> str:
         if scope.stopped is None:
             return f"all schemas (all in {only})" if only else "all schemas"
         held = f"newest {scope.walked:,}" if scope.stopped == CAPPED else (
-            f"first {scope.pages} pages: {_jobs(scope.walked)}")
+            f"first {scope.pages} pages: {scope.walked:,} job{'' if scope.walked == 1 else 's'}")
         return held + ("" if scope.active_missing else " + every active job") + f" ({_more(scope)})"
     if scope.kind == SCHEMA:
         return f"Current schema: {location}"
@@ -184,11 +156,8 @@ def scope_text(scope: ListScope, *, location: str, only: str = "") -> str:
 
 
 def unavailable_text(scope: ListScope) -> str:
-    """Why a listing of the account-level list holds the configured schema's jobs instead (a
-    :data:`FALLBACK` scope), in a few words: "no account-wide list yet", "account-wide list not
-    enabled", "account-wide list: HTTP 403" or "HTTP 405", or "no account-wide list" (a client
-    without one)."""
-    return _FALLBACK_WHY.get(scope.reason or "", _NO_ACCOUNT_LIST)
+    """Why a :data:`FALLBACK` listing holds the configured schema's jobs, in a few words."""
+    return _FALLBACK_WHY.get(scope.reason or "", "")
 
 
 def loaded_text(scope: Optional[ListScope]) -> str:
@@ -252,16 +221,6 @@ def _service_explained(exc: BaseException) -> bool:
     return _has_message(body)
 
 
-def _takes_bounds(method: Any) -> bool:
-    """Whether ``list_jobs`` takes ``max_retries`` and ``request_timeout`` (this package's client
-    does; an older or a custom one may not)."""
-    try:
-        parameters = inspect.signature(method).parameters
-    except (TypeError, ValueError):
-        return False
-    return "max_retries" in parameters and "request_timeout" in parameters
-
-
 class JobLister:
     """Reads the job list for each refresh of the job list screen.
 
@@ -282,11 +241,6 @@ class JobLister:
         self._clock = clock
         self._fallback: Optional[str] = None  # why the account-level list is unavailable, while it is
         self._asked_at = 0.0  # in fallback: when the account-level list last answered (or failed)
-
-    @property
-    def fallback_reason(self) -> Optional[str]:
-        """The ``AccountJobListUnavailable`` reason while the list shows the configured schema instead."""
-        return self._fallback
 
     def load(self, now: datetime, *, is_cancelled: Callable[[], bool] = lambda: False,
              manual: bool = False, account: Optional[bool] = None, asked: bool = False) -> Optional[Listing]:
@@ -309,9 +263,6 @@ class JobLister:
             return self._schema(ListScope(SCHEMA_ONLY))
         if not (self.account_wide if account is None else account):
             return self._schema(ListScope(SCHEMA))
-        if not callable(getattr(self._client, "list_jobs_page", None)):
-            # A client without the account-level list (an older or a custom one).
-            return self._schema(ListScope(FALLBACK))
         if self._fallback is not None and not self._ask_again(manual):
             return self._schema(ListScope(FALLBACK, reason=self._fallback))
         if asked:
@@ -364,12 +315,8 @@ class JobLister:
         return listing
 
     def _schema(self, scope: ListScope) -> Listing:
-        method = self._client.list_jobs
         try:
-            if _takes_bounds(method):
-                jobs = method(max_retries=REFRESH_MAX_RETRIES, request_timeout=REFRESH_TIMEOUT)
-            else:
-                jobs = method()
+            jobs = self._client.list_jobs(max_retries=REFRESH_MAX_RETRIES, request_timeout=REFRESH_TIMEOUT)
         except Exception as exc:
             raise JobListError(_failure_text(_SCHEMA_ROUTE, exc)) from exc
         return Listing([job for job in (jobs or []) if isinstance(job, dict)], scope)
@@ -408,8 +355,6 @@ class JobLister:
         try:
             return self._read_pages(created_after, status, is_cancelled)
         except InvalidPageToken:
-            # The service could no longer open its token (it rotated the key that
-            # seals them, say): read again from the first page, once.
             logger.info("job list: the service could not open its page token; reading again from the first page")
             return self._read_pages(created_after, status, is_cancelled)
 
@@ -475,13 +420,10 @@ class JobClients:
         send the job's calls to the configured location, which isn't the job's.
         """
         location = views.location_names(job)
-        make = getattr(self.base, "for_job", None)
-        if location is None or not callable(make):
-            # No location (the configured schema's own list, a job opened by id), or
-            # an older or a custom client without per-location clients: the TUI's own.
+        if location is None:  # the configured schema's own list, or a job opened by id
             return self.base
         with self._lock:
             child = self._children.get(location)
             if child is None:
-                child = self._children[location] = make(job)
+                child = self._children[location] = self.base.for_job(job)
             return child

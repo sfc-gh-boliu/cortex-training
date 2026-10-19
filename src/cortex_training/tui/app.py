@@ -13,17 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Read-only Textual TUI for Cortex Training jobs.
+"""Read-only Textual TUI for Cortex Training job logs and GPU resources.
 
-Flow: open → every job from the last six months in the configured database and
-schema, or (``a``) in every database and schema this role can see when the
-service allows it (live first, then history, with sub-job rows; searchable by
-id, location, or training config) → a job preview
-→ tabbed details (Logs | Resources) for the job or one
-sub-job. Pass a job_id on the command line to jump straight to its Logs tab.
+Flow: open → a list of jobs with their status (via the SDK's list_jobs) →
+pick one → its preview, then its Logs and Resources dashboard. Pass a job_id on the command line
+to jump straight to that dashboard and skip the picker.
 
-Imports ``textual`` at module load. The interface never mutates job state; the
-only writes are local (log and telemetry caches).
+Imports ``textual`` at module load. The interface is strictly read-only and
+never mutates job state.
 """
 
 from __future__ import annotations
@@ -92,10 +89,9 @@ from textual.widgets._toast import ToastRack
 from textual.widgets.data_table import RowKey
 from textual.worker import get_current_worker
 
-from cortex_training import DownloadCancelled
-from cortex_training import NoChunksError
+from cortex_training.client import DownloadCancelled
+from cortex_training.client import NoChunksError
 from cortex_training.tui import format as log_format
-from cortex_training.tui import log_cache
 from cortex_training.tui import views
 from cortex_training.tui.account import ACCOUNT
 from cortex_training.tui.account import SCHEMA
@@ -112,7 +108,6 @@ from cortex_training.tui.format import display_line
 from cortex_training.tui.format import entry_at_level
 from cortex_training.tui.format import entry_matches
 from cortex_training.tui.format import format_created_at
-from cortex_training.tui.format import format_job_config
 from cortex_training.tui.format import format_log_entry
 from cortex_training.tui.format import is_active_status
 from cortex_training.tui.format import one_line
@@ -122,6 +117,7 @@ from cortex_training.tui.clipboard import copy_local
 from cortex_training.tui.clipboard import screen_dump
 from cortex_training.tui.clipboard import selected_text
 from cortex_training.tui.format import safe_text
+from cortex_training.tui.format import source_label
 from cortex_training.tui.format import wrap_log_line
 from cortex_training.tui.log_cache import LogCache
 from cortex_training.tui.log_cache import cached_log_pages
@@ -163,7 +159,10 @@ from cortex_training.tui.resource import window_complete
 from cortex_training.tui.resource import window_label
 from cortex_training.tui.untrusted import printable_client
 
-_ERROR_LOG = log_cache.ERROR_LOG_NAME  # how messages name it; the file is log_cache.error_log_path()
+_ERROR_LOG = "~/.cortex-training-errors.log"
+# Rich's grey62, by value: Textual's markup and styles (the preview's Content)
+# don't know that name and would draw the default color instead.
+ENDED_STYLE = "#9e9e9e"
 _RESOURCE_LOCKS: dict[str, threading.Lock] = {}
 _RESOURCE_LOCKS_GUARD = threading.Lock()
 
@@ -189,15 +188,11 @@ def _same_telemetry(a: ResourceData, b: ResourceData) -> bool:
 
 
 class _DaemonThreadExecutor(ThreadPoolExecutor):
-    """The TUI loop's default executor: each call runs on its own daemon thread.
-
-    Textual runs thread workers (log tails, telemetry downloads, job
-    listings) in the loop's default executor, and asyncio joins that
-    executor's threads when the app exits. A request still retrying a 5xx then
-    held quit for up to a minute. Daemon threads are abandoned at exit instead;
-    what they write is cache that tolerates a torn write (the log cache skips a
-    torn last line, telemetry downloads commit through a manifest).
-    """
+    """The TUI loop's default executor, where Textual runs thread workers: each call runs on its own
+    daemon thread. asyncio joins the default executor's threads at exit, and a request still retrying
+    a 5xx held quit for up to a minute; daemon threads are abandoned instead, and what they write is
+    cache that tolerates a torn write (the log cache skips a torn last line, telemetry downloads commit
+    through a manifest)."""
 
     def submit(self, fn, /, *args, **kwargs) -> Future:
         future: Future = Future()
@@ -220,20 +215,11 @@ class _DaemonThreadExecutor(ThreadPoolExecutor):
         threading.Thread(target=run, name="cortex-tui-worker", daemon=True).start()
         return future
 
-    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
-        # No pool to join: in-flight calls end with the process.
-        return None
-
 
 def on_stack(screen: Screen) -> bool:
-    """Whether ``screen`` is still on the app's screen stack: pushed, and not popped or switched away.
-
-    A popped screen goes on running its handlers and deferred callbacks for a
-    moment while Textual removes its widgets, and a query then raises
-    NoMatches, which stops the app. Textual takes a screen off the stack at
-    once, so this is false from the moment it is popped. Safe from a worker
-    thread; false once the app is gone.
-    """
+    """Whether ``screen`` is still on the app's screen stack (safe from a worker thread; false once
+    the app is gone). A popped screen goes on running handlers and callbacks while Textual removes its
+    widgets, and a query then raises NoMatches, which stops the app; it leaves the stack at once."""
     try:
         return screen in screen.app.screen_stack
     except Exception:  # noqa: BLE001 - no app: it is shutting down
@@ -241,14 +227,10 @@ def on_stack(screen: Screen) -> bool:
 
 
 def is_shown(screen: Screen) -> bool:
-    """UI thread. Whether ``screen`` is the screen on top, and fully put up.
-
-    The keys and selections that open or close a screen act only then. Two
-    quick Enters deliver both selections after the first has pushed a screen,
-    and a dismiss or pop from a screen no longer on top would close the one
-    under it. A back key that arrives while a screen is still mounting would
-    remove it half built, which Textual's Header doesn't survive.
-    """
+    """UI thread. Whether ``screen`` is on top and fully put up: the keys and selections that open or
+    close a screen act only then. Two quick Enters deliver both selections after the first pushed a
+    screen, a pop from a screen no longer on top would close the one under it, and a back key while a
+    screen mounts would remove it half built, which Textual's Header doesn't survive."""
     try:
         return screen.app.screen is screen and screen.is_mounted
     except Exception:  # noqa: BLE001 - no app: it is shutting down
@@ -261,10 +243,7 @@ KEYS_BINDING = Binding("question_mark", "app.toggle_keys", "Keys", key_display="
 
 
 def close_keys_panel(screen: Screen) -> bool:
-    """UI thread. Close the keys panel (``?``, or ``^p`` → Keys) when it is open; whether it was.
-
-    Esc closes it first, before it clears a search or goes back.
-    """
+    """UI thread. Close the keys panel (``?``, or ``^p`` → Keys) when it is open; whether it was."""
     panels = screen.query("HelpPanel")
     if not panels:
         return False
@@ -273,12 +252,8 @@ def close_keys_panel(screen: Screen) -> bool:
 
 
 def after_refresh(screen: Screen, fn, *args, **kwargs) -> None:
-    """``screen.call_after_refresh(fn, ...)``, dropped if ``screen`` leaves the stack before it runs.
-
-    A tab switch, resize or re-layout schedules its redraw for after the next
-    refresh; a back key pressed in between pops the screen, and the redraw
-    would then query widgets that are being removed (see :func:`on_stack`).
-    """
+    """``screen.call_after_refresh(fn, ...)``, dropped if ``screen`` leaves the stack before it runs: a
+    back key pressed before a redraw's refresh pops the screen (see :func:`on_stack`)."""
 
     def run():
         return fn(*args, **kwargs) if on_stack(screen) else None
@@ -287,43 +262,26 @@ def after_refresh(screen: Screen, fn, *args, **kwargs) -> None:
 
 
 class JobTabs(TabbedContent):
-    """A job's tabs, which tell their screen when their size changes.
-
-    That can happen without a terminal resize, which is the only change a
-    screen hears of: the keys panel (``?``) narrows the tabs while it is open.
-    The screen then wraps or draws again what it fitted to a width (the log
-    pane's lines, the charts), as on a resize; otherwise log lines are cut at
-    the panel and charts break across rows.
-    """
+    """A job's tabs, which tell their screen when their size changes: the keys panel
+    (``?``) narrows them without a terminal resize, the only change a screen hears of,
+    and the log lines and charts must be fitted to the new width."""
 
     def on_resize(self, event: events.Resize) -> None:
-        relayout = getattr(self.screen, "_tabs_resized", None)
-        if callable(relayout):
-            relayout()
+        self.screen._tabs_resized()
 
 
 def _freeze_heap() -> None:
-    """Leave every object that exists now out of later garbage collections.
-
-    A full collection visits every object that can hold references. With a few
-    thousand jobs listed (their records, cells and table rows, besides what the
-    imports made) one took 100 ms or more, and the screen froze for as long
-    every few seconds of use. Nearly all of those objects live as long as the
-    app; frozen, they are not visited again (``gc.freeze``). Garbage is collected
-    first, so none is kept, and a frozen object is still freed when its last
-    reference goes; only one that ends up in a reference cycle stays.
-    """
+    """Leave every object that exists now out of later garbage collections (``gc.freeze``): with a few
+    thousand jobs listed, a full collection took 100 ms or more, and the screen froze as long, every few
+    seconds; nearly all of those objects live as long as the app. Garbage is collected first, and a
+    frozen object is still freed when its last reference goes; only one that ends up in a reference cycle stays."""
     gc.collect()
     gc.freeze()
 
 
 def call_on_screen(screen: Screen, fn, *args, **kwargs) -> bool:
-    """Worker thread: run ``fn`` on the UI thread for ``screen``.
-
-    Returns ``False`` once the app is gone. A result that lands after ``screen``
-    was popped is dropped: its widgets are already removed, and the NoMatches
-    from querying them would stop the app.
-    """
+    """Worker thread: run ``fn`` on the UI thread for ``screen``; ``False`` once the app is gone. A
+    NoMatches from a ``screen`` popped meanwhile (its widgets are removed) is dropped: it would stop the app."""
 
     # Run even after a pop: some callbacks clean up then (a finished download's temp dir).
     async def guarded():
@@ -376,17 +334,20 @@ class _SourceList(ListView):
     scroll a page or to either end move the log beside it: scrolling back
     works on opening Logs, without moving the focus there first."""
 
+    _PANE = "#logview"
     BINDINGS = [
-        Binding("pageup", "log('page_up')", show=False),
-        Binding("pagedown", "log('page_down')", show=False),
-        Binding("home", "log('scroll_home')", show=False),
-        Binding("end", "log('scroll_end')", show=False),
+        Binding("pageup", "pane('page_up')", show=False),
+        Binding("pagedown", "pane('page_down')", show=False),
+        Binding("home", "pane('scroll_home')", show=False),
+        Binding("end", "pane('scroll_end')", show=False),
     ]
 
-    def action_log(self, action: str) -> None:
-        log = getattr(self.screen, "_logview", None)
-        if log is not None:
-            getattr(log, f"action_{action}")()
+    def action_pane(self, action: str) -> None:
+        try:
+            pane = self.screen.query_one(self._PANE)
+        except NoMatches:
+            return
+        getattr(pane, f"action_{action}")()
 
 
 class _TimedTail:
@@ -412,11 +373,7 @@ def spans_content(spans) -> Content:
 
 def hanging(content: Content, width: int, indent: int) -> Content:
     """``content`` (one line) wrapped to ``width`` cells, with its continuation
-    lines indented by ``indent`` cells so they stay clear of the line's lead-in.
-
-    It wraps with Textual's own word wrapping (styles kept); the text is
-    returned as it is when it fits, or where that wrapping is unavailable.
-    """
+    lines indented by ``indent`` cells so they stay clear of the line's lead-in."""
     wrap = getattr(content, "wrap", None)
     if wrap is None or content.cell_length <= width or width - indent < 10:
         return content
@@ -448,19 +405,11 @@ def wrapped_parts(parts: list, width: int, indent: int, separator: Content) -> C
 
 
 class _FixedCell:
-    """A job-list cell: one line of plain text (never markup) and its styles, cut
-    with ``…`` where its column ends. ``str()`` is its plain text.
-
-    It holds only strings and tuples, so it is one object for the garbage
-    collector to visit where a Text is three (with its text and spans lists). A
-    list of thousands of jobs keeps a cell per column for each, and a full
-    collection that visited them all paused the screen for 100 ms and more. The
-    Text is made when the cell is drawn, and only the rows in view are.
-
-    DataTable measures every cell of every row it adds, to size auto-width
-    columns. The job list's columns all have fixed widths, which never use that
-    measure: a renderable without ``__rich_measure__`` is not measured.
-    """
+    """A job-list cell: one line of plain text (never markup) and its styles, cut with ``…`` where its
+    column ends; ``str()`` is its plain text. Strings and tuples only, one object for the garbage
+    collector where a Text is three (thousands of jobs keep a cell per column; a full collection that
+    visited them all paused the screen 100 ms and more); the Text is made only for the rows drawn.
+    No ``__rich_measure__``: DataTable doesn't measure it (the job list's columns have fixed widths)."""
 
     __slots__ = ("plain", "style", "spans")
 
@@ -493,12 +442,8 @@ class _FixedCell:
 
 
 def _cell(text: str, style: str = "") -> _FixedCell:
-    """A one-line job-list cell, never markup: printable, each line break a space, and cut with
-    ``…`` where its column ends.
-
-    Spaces stay as they are: the leading ones indent a sub-row's tree under its
-    job, and a quoted database or schema name may hold two in a row.
-    """
+    """A one-line, printable job-list cell, never markup. Spaces stay as they are: the leading
+    ones indent a sub-row's tree, and a quoted database or schema name may hold two in a row."""
     return _FixedCell(views.printable(text).replace("\n", " "), style)
 
 
@@ -540,14 +485,12 @@ class _JobRows:
     """One job's table rows as last built, and what they were built from."""
 
     # Slots: one of these per listed job, kept between renders.
-    __slots__ = ("job", "compact", "cells", "names", "sub_cells", "sub_keys", "layout", "expanded", "row",
-                 "subs")
+    __slots__ = ("job", "compact", "cells", "sub_cells", "sub_keys", "layout", "expanded", "row", "subs")
 
     def __init__(self, job: dict, compact: bool, cells: dict) -> None:
         self.job = job  # the record (compared by identity: a refresh keeps an unchanged record)
         self.compact = compact  # built with MM-DD HH:MM times
         self.cells = cells  # column label -> cell: the job's row, but for its Job ID
-        self.names: dict = {}  # unfolded (True/False) -> the Job ID cell, with that ▾/▸ marker
         self.sub_cells: tuple | None = None  # ((row key suffix, {label: cell}), ...): its sub-job rows (and note)
         self.sub_keys: tuple = ()  # ((job id, sub-job id) or None for the note, ...) beside sub_cells
         self.layout = None  # the layout row and subs are in
@@ -856,15 +799,9 @@ class PickableTable(DataTable):
             self._picked = frozenset()
             self._restyle()
 
-    def picked_keys(self) -> list:
-        """The rows a drag picked that the table still has, in its order."""
-        if not self._picked:
-            return []
-        return [row.key for row in self.ordered_rows if row.key in self._picked]
-
     def picked_text(self) -> tuple[str, str] | None:
-        """``(text, what)`` for the rows a drag picked; None when there are none."""
-        keys = self.picked_keys()
+        """``(text, what)`` for the rows a drag picked that the table still has; None when there are none."""
+        keys = [row.key for row in self.ordered_rows if row.key in self._picked] if self._picked else []
         if not keys:
             return None
         ids = " with whole ids" if callable(getattr(self.screen, "whole_id", None)) else ""
@@ -873,10 +810,9 @@ class PickableTable(DataTable):
     def _restyle(self) -> None:
         # The table keeps each line it drew, by what it drew it from, which doesn't
         # include the picks: drop those, so the rows are drawn again.
-        for name in ("_line_cache",):
-            cache = getattr(self, name, None)
-            if cache is not None:
-                cache.clear()
+        cache = getattr(self, "_line_cache", None)
+        if cache is not None:
+            cache.clear()
         self.refresh()
 
     def _render_line_in_row(self, row_key, line_no, base_style, cursor_location, hover_location):
@@ -905,12 +841,9 @@ class PickableTable(DataTable):
 
 
 class _JobTable(PickableTable):
-    """The job list's table. Home and End go to the first and the last job. → unfolds
-    the highlighted job's sub-jobs and ← folds them (on a sub-job row, its job's);
-    where there is nothing to unfold or fold they scroll sideways, the marker and
-    the job id staying in place. A click on a job's ▸/▾ marker unfolds or folds it.
-    The screen does the unfolding (see :meth:`JobListScreen.unfold_highlighted`).
-    A drag over rows picks them (see :class:`PickableTable`)."""
+    """The job list's table: Home and End go to the first and last job, and →/← (or a click on
+    a job's ▸/▾ marker) unfold or fold it, else scroll sideways; the screen does the
+    unfolding (see :meth:`JobListScreen.unfold_highlighted`)."""
 
     BINDINGS = [
         Binding("home", "first_job", "First job", show=False),
@@ -931,25 +864,19 @@ class _JobTable(PickableTable):
         self.move_cursor(row=self.row_count - 1, animate=False)
 
     def action_cursor_right(self) -> None:
-        unfold = getattr(self.screen, "unfold_highlighted", None)
-        if not (callable(unfold) and unfold()):
+        if not self.screen.unfold_highlighted():
             super().action_cursor_right()  # a row cursor: the table scrolls right
 
     def action_cursor_left(self) -> None:
-        fold = getattr(self.screen, "fold_highlighted", None)
-        if not (callable(fold) and fold()):
+        if not self.screen.fold_highlighted():
             super().action_cursor_left()
 
     def on_click(self, event: events.Click) -> None:
-        """A click on a job's ▸/▾ marker unfolds or folds that job, and puts the
-        cursor on it; any other click is the table's own (it highlights the row,
-        and a click on the highlighted cell opens it). The click Textual sends at
-        the end of a drag that picked rows is none of these."""
+        """A click on a job's ▸/▾ marker unfolds or folds it; any other click is the table's own, unless swallowed."""
         if self.swallowed(event):
             return
         key = self._marker_at(event)
-        toggle = getattr(self.screen, "toggle_job_at", None)
-        if key is not None and callable(toggle) and toggle(key):
+        if key is not None and self.screen.toggle_job_at(key):
             event.prevent_default()  # the table's own handler would open the job on a second click
             event.stop()
 
@@ -973,15 +900,10 @@ class _JobTable(PickableTable):
         return self.ordered_rows[row].key.value
 
     def replace_rows(self, rows: list) -> None:
-        """Show ``rows`` (``(key, cells)`` pairs, in order) in place of the table's rows.
-
-        The same as ``clear()`` and then ``add_row(*cells, key=key)`` for each, but
-        without add_row's work per row, nor the idle pass's measure of each new row
-        (the larger part of the time a few thousand rows took to fill): every
-        column has a fixed width and every row one line, so there is nothing to
-        measure, and that pass only sets the table's size. Where that shortcut
-        isn't safe (see :meth:`_fills_fast`) it does exactly that instead.
-        """
+        """Show ``rows`` (``(key, cells)`` pairs, in order) in place of the table's rows: ``clear()``
+        and ``add_row`` for each, but without add_row's work per row nor the idle pass's measure of
+        each new row (most of the time a few thousand rows took to fill): every column has a fixed
+        width and every row one line, so there is nothing to measure."""
         if not self._fills_fast():
             self.clear()
             for key, cells in rows:
@@ -1011,12 +933,9 @@ class _JobTable(PickableTable):
         self.check_idle()
 
     def _fills_fast(self) -> bool:
-        """Whether :meth:`replace_rows` may set the rows directly: the installed
-        Textual is the release it was written and tested against (``TEXTUAL_FLOOR``,
-        the floor pyproject.toml sets), whose DataTable keeps them as it expects, and
-        no column sizes itself to its cells. Any other release, a later 8.x too, gets
-        the rows through DataTable's own methods: were its internals to change, the
-        shortcut would corrupt the table rather than fail."""
+        """Whether :meth:`replace_rows` may set the rows directly: only on ``TEXTUAL_FLOOR``, the
+        release it was tested against (other internals would corrupt the table, not fail), and
+        with no auto-width column."""
         from cortex_training.tui.__main__ import textual_is_floor
 
         return (_Row is not None and textual_is_floor() and all(hasattr(self, name) for name in self._FAST_FILL)
@@ -1028,22 +947,9 @@ class _JobTable(PickableTable):
 class JobListScreen(FollowsPointer, Screen):
     """Every job in the retention window: live first, then history, with sub-job rows.
 
-    The jobs are the configured schema's; ``a`` switches to the account-wide list
-    (every database and schema this role can see) where the service has it, and
-    back. When the account-wide list is unavailable as ``a`` asks for it, the
-    list stays on the configured schema and a notice says why; see
-    :class:`cortex_training.tui.account.JobLister`. ``--schema-only`` hides
-    ``a``. The header says which list is shown, and a Location column shows
-    each job's ``DB.SCHEMA`` when they differ. Opening a job hands its screens a
-    client bound to its location (:class:`cortex_training.tui.account.JobClients`).
-
-    A job with sub-jobs shows ▸ (folded) or ▾ before its job id: a click on that
-    marker, or →/← on its row, unfolds or folds it, and ``e`` unfolds or folds
-    every job. Live jobs start unfolded.
-
-    Search matches partial ids and
-    locations (case-insensitive) and takes ``field<op>value`` filters over the
-    training configuration; see :func:`cortex_training.tui.views.parse_query`.
+    ``a`` switches between the configured schema's jobs and the account-wide list
+    (see :class:`cortex_training.tui.account.JobLister`); search takes ids, locations
+    and ``field<op>value`` filters (see :func:`cortex_training.tui.views.parse_query`).
     """
 
     # Quit and the keys panel first: a narrow terminal cuts the footer's end, and
@@ -1051,13 +957,10 @@ class JobListScreen(FollowsPointer, Screen):
     BINDINGS = [
         ("q", "quit", "Quit"),
         KEYS_BINDING,
-        # Priority: the app runs these as each key arrives, so the keys typed right
-        # after /, Esc or Enter go where that key sends the focus, in the order
-        # typed. A plain binding runs only once the key has passed through the
-        # focused widget and the screen, and keys typed meanwhile still went to
-        # the old focus, which dropped them (most of all while the list
-        # re-renders). check_action leaves / to the search box while it has focus,
-        # so a query can contain one, and Enter to the list while the box hasn't.
+        # Priority: the app runs these as each key arrives, so the keys typed right after /, Esc or
+        # Enter go where that key sends the focus (a plain binding ran once the key had passed the
+        # focused widget, and keys typed meanwhile went to the old focus, which dropped them).
+        # check_action leaves / to the search box while it has focus, and Enter to the list while it hasn't.
         Binding("/", "filter", "Search", priority=True),
         # Esc: the search box says it clears the search.
         Binding("escape", "clear_filter", "Clear search", show=False, priority=True),
@@ -1097,18 +1000,16 @@ class JobListScreen(FollowsPointer, Screen):
     # After GPUs: the columns before it fill a 136-column terminal, and Location
     # is wide (a quoted DB.SCHEMA), so it scrolls into view rather than pushing
     # Model and GPUs off.
-    _LOCATION_AFTER = "GPUs"
-    _LOCATION_AT = [label for label, _width in _COLUMNS].index(_LOCATION_AFTER) + 1
+    _LOCATION_AT = [label for label, _width in _COLUMNS].index("GPUs") + 1
     _LOCATION_WIDTHS = (10, 32)
 
-    def __init__(self, client, *, poll_interval=1.0, now=None, clients=None, lister=None,
-                 schema_only=False):
+    def __init__(self, client, *, poll_interval=1.0, now=None, clients=None, lister=None):
         """``clients`` and ``lister`` are the app's (shared with a list opened again
         later); without them the screen makes its own for ``client``."""
         super().__init__()
         self._client = client
         self._clients = clients if clients is not None else JobClients(client)
-        self._lister = lister if lister is not None else JobLister(client, schema_only=schema_only)
+        self._lister = lister if lister is not None else JobLister(client)
         self._poll_interval = poll_interval
         self._now = now  # fixed clock for tests/screenshots; None = wall clock
         self._job_by_item: dict[str, str] = {}
@@ -1121,14 +1022,12 @@ class JobListScreen(FollowsPointer, Screen):
         self._expanded: set = set()
         self._collapsed: set = set()  # live jobs the user folded
         self._last_refreshed = None
-        self._listed_at: str | None = None  # HH:MM of the list on screen, quoted while a refresh fails
         self._loaded_at: float | None = None  # monotonic time of the last good load
         self._failed_at: str | None = None  # HH:MM:SS of the last failed load, while it stands
         self._refreshing = False
         self._refresh_started: float | None = None  # monotonic time the refresh in flight began
         self._list_error: str | None = None  # last failed load, on one line; cleared by a good one
         self._list_refused = False  # that failure was the account-wide list refusing this caller (403/405)
-        self._loaded = False  # a list has arrived at least once
         self._scope: ListScope | None = None  # what the list on screen covers
         # The account-wide list is asked for (a) and hasn't been shown yet: if its
         # load doesn't bring it, the list stays on the configured schema and says why.
@@ -1177,11 +1076,10 @@ class JobListScreen(FollowsPointer, Screen):
         self.set_interval(self._REFRESH_SECONDS, self._refresh_tick)
 
     def on_screen_resume(self) -> None:
-        # Detail screens own the same app-level subtitle while they are active.
-        # Restore the list status (and a status the preview
-        # read) on return; a list that is as it was isn't drawn again.
+        # Detail screens own the same app-level subtitle while they are active. Restore
+        # the picker status when the user returns from a job.
         self._update_subtitle()
-        self._render_jobs()
+        self._render_jobs()  # with a status the preview read; a list as it was isn't drawn again
         # Away for longer than a refresh interval (the list doesn't poll under a
         # job's screens): read it again now rather than at the next tick.
         if self._loaded_at is not None and time.monotonic() - self._loaded_at >= self._REFRESH_SECONDS:
@@ -1202,15 +1100,10 @@ class JobListScreen(FollowsPointer, Screen):
     def on_descendant_focus(self, event) -> None:
         self._paint_help()
 
-    def on_descendant_blur(self, event) -> None:
-        self._paint_help()
+    on_descendant_blur = on_descendant_focus
 
     def _paint_help(self) -> None:
-        """The search help under the box, each line wrapped under its own start.
-
-        On a short terminal it shows only while the box has focus: there its
-        rows are better spent on jobs.
-        """
+        """The search help under the box, each line wrapped under its own start."""
         try:
             widget = self.query_one("#searchhelp", Static)
         except NoMatches:  # not composed yet
@@ -1233,14 +1126,10 @@ class JobListScreen(FollowsPointer, Screen):
         widget.update(Content("\n").join([hanging(fields, width, 8), ops_lines]))
 
     def _layout_for(self, location_width: int) -> _ListLayout:
-        """The columns for this terminal's width, the sort, and the Location column (0: hidden).
-
-        Every column has its full width when they all fit beside a 38-cell job id.
-        Otherwise the dates drop the year, and
-        the job id narrows (down to 16 cells) until the first columns fit; and while
-        the list is sorted by Updated, that column moves to Created's place if it
-        would be out of view, so the sorted time always shows.
-        """
+        """The columns for this terminal's width, the sort, and the Location column (0: hidden). Where
+        not all fit beside a 38-cell job id, the dates drop the year and the job id narrows (to 16 cells)
+        until the first columns fit; sorted by Updated, that column takes Created's place if out of view,
+        so the sorted time always shows."""
         table = self.query_one("#jobs", DataTable)
         pad = 2 * table.cell_padding
         # The table spans the screen; leave room for its vertical scrollbar whether or not it shows.
@@ -1303,13 +1192,13 @@ class JobListScreen(FollowsPointer, Screen):
             refresh_status = "refreshing…"
             if self._last_refreshed:
                 refresh_status += f" (last refreshed {self._last_refreshed})"
-        elif self._list_error and self._failed_at and not self._loaded:
+        elif self._list_error and self._failed_at and self._loaded_at is None:
             refresh_status = f"load failed {self._failed_at}"  # no list yet: the error is in its place
         elif self._list_error and self._failed_at:
             # First, where a narrow terminal still shows it: the list on screen is stale.
             refresh_status = f"refresh failed {self._failed_at}"
-            if self._listed_at:
-                refresh_status += f" (list from {self._listed_at})"
+            if self._last_refreshed:
+                refresh_status += f" (list from {self._last_refreshed[:5]})"
         else:
             refresh_status = f"last refreshed {self._last_refreshed or '—'}"
         # The status first, as it is short, then the scope: a narrow terminal cuts
@@ -1389,16 +1278,10 @@ class JobListScreen(FollowsPointer, Screen):
         self.set_focus(self.query_one("#jobfilter", Input))
 
     async def _typed_ahead(self, box: Input) -> None:
-        """Wait until ``box`` has handled the keys already sent to it.
-
-        Enter and Esc run as they arrive (priority bindings), and the keys typed
-        just before them may still be on their way to the box, most of all when
-        keys come in a burst (fast typing, or typing while the list redraws).
-        Acting on the box's text before it has them would search for, or clear,
-        only part of what was typed, and the next Enter would open a job the
-        search didn't pick. The app handles no other key meanwhile, so one typed
-        after goes where this one sends the focus.
-        """
+        """Wait until ``box`` has handled the keys already sent to it. Enter and Esc run as they arrive
+        (priority bindings), maybe before the keys typed just before them reach the box (a burst, or
+        typing while the list redraws): acting then would search for, or clear, part of what was typed.
+        The app handles no other key meanwhile, so one typed after goes where this one sends the focus."""
         done = asyncio.get_running_loop().create_future()
 
         def handled() -> None:
@@ -1485,14 +1368,9 @@ class JobListScreen(FollowsPointer, Screen):
         return bool(views.sub_jobs(job)) or views.is_unknown(job)
 
     def _unfold(self, jid: str, unfolded: bool) -> None:
-        """Show ``jid``'s sub-job rows (``unfolded``) or hide them, with the cursor on its row.
-
-        The columns stay where they were scrolled to (→ and ← scroll them too):
-        refilled, the table would be back at its first column. So does the job's
-        row on screen: refilled, the table would be back at its top, and the
-        cursor's move would bring the row in only as far as the bottom line, its
-        new sub-job rows under it out of view.
-        """
+        """Show ``jid``'s sub-job rows (``unfolded``) or hide them, with the cursor on its row. The columns
+        stay scrolled where they were, and the job's row where it was on screen: refilled, the table would
+        be back at its first column and its top, the job's new sub-job rows out of view."""
         if unfolded:
             self._collapsed.discard(jid)
             self._expanded.add(jid)
@@ -1538,30 +1416,22 @@ class JobListScreen(FollowsPointer, Screen):
         table.scroll_to(y=top, animate=False, immediate=True)
 
     def unfold_highlighted(self) -> bool:
-        """→: unfold the highlighted job when it is folded and has rows to show; whether it did
-        (where it didn't, → scrolls the table)."""
+        """→ on a job's own row: unfold it; whether it did (where it didn't, → scrolls the table)."""
         key, jid = self._highlighted()
-        job = self._jobs_by_id.get(jid or "") if key in self._job_by_item else None  # a job's own row
-        if job is None or not self._expandable(job) or self._is_expanded(job):
-            return False
-        self._unfold(jid, True)
-        return True
+        return key in self._job_by_item and self._toggle(jid, True)
 
     def fold_highlighted(self) -> bool:
-        """←: fold the highlighted job, or the job of the highlighted sub-job row, and put the
-        cursor on the job's row; whether it did (where it didn't, ← scrolls the table)."""
-        _key, jid = self._highlighted()
-        job = self._jobs_by_id.get(jid or "")
-        if job is None or not self._expandable(job) or not self._is_expanded(job):
-            return False
-        self._unfold(jid, False)
-        return True
+        """← on a job's row or a sub-job row: fold the job; whether it did (else ← scrolls the table)."""
+        return self._toggle(self._highlighted()[1], False)
 
     def toggle_job_at(self, key) -> bool:
         """A click on the ▸/▾ marker of the job row ``key``: unfold or fold it; whether it did."""
-        jid = self._job_by_item.get(key)
+        return self._toggle(self._job_by_item.get(key), None)
+
+    def _toggle(self, jid, unfold: bool | None) -> bool:
+        """Unfold (True) or fold (False) the job ``jid``, or (None) switch it; whether it did."""
         job = self._jobs_by_id.get(jid or "")
-        if job is None or not self._expandable(job):
+        if job is None or not self._expandable(job) or self._is_expanded(job) == unfold:
             return False
         self._unfold(jid, not self._is_expanded(job))
         return True
@@ -1640,30 +1510,21 @@ class JobListScreen(FollowsPointer, Screen):
         self._list_error = None
         self._list_refused = False
         self._failed_at = None
-        self._loaded = True
         self._loaded_at = time.monotonic()
         self._scope = listing.scope
         self._all_jobs = self._merged(listing.jobs)
         self._jobs_by_id = {views.job_id_of(j): j for j in self._all_jobs}
-        # What was built for jobs no longer listed goes.
         self._rows = {jid: rows for jid, rows in self._rows.items() if jid in self._jobs_by_id}
         self._hay = {jid: hay for jid, hay in self._hay.items() if jid in self._jobs_by_id}
         self._last_refreshed = time.strftime("%H:%M:%S")
-        self._listed_at = time.strftime("%H:%M")
         self._update_subtitle()
         self._render_jobs()
-        drawn = getattr(self.app, "job_list_drawn", None)
-        if callable(drawn):
-            drawn(self)
+        self.app.job_list_drawn(self)
 
     def _stay_on_schema(self, listing: Listing | None, error: JobListError | None) -> Listing | None:
-        """The account-wide list that a asked for is unavailable (``error``, or the
-        lister listed the configured schema in its place): say why, and go back to
-        the configured schema's list.
-
-        Returns that list to show when the lister read it; None when the list on
-        screen stays as it is (it is the configured schema's).
-        """
+        """The account-wide list that a asked for is unavailable (``error``, or the lister listed the
+        configured schema in its place): say why, and go back to the configured schema's list. Returns
+        that list when the lister read it; None when the list on screen (the configured schema's) stays."""
         self._lister.account_wide = False
         self.refresh_bindings()  # the footer's a offers all schemas again
         why = (str(error) or "the account-wide job list failed") if error is not None else unavailable_text(
@@ -1673,19 +1534,14 @@ class JobListScreen(FollowsPointer, Screen):
         if error is None:
             return Listing(listing.jobs, ListScope(SCHEMA))
         self._update_subtitle()
-        if not self._loaded:
+        if self._loaded_at is None:
             self._refresh_jobs()  # nothing listed yet (a came first): read the configured schema's list
         return None
 
     def _merged(self, rows: list) -> list:
-        """A new listing's records, keeping the one on screen for each job that hasn't changed.
-
-        A kept record keeps its built rows and search text, so a refresh redraws
-        only the jobs that changed (and the table not at all when none did). A job
-        whose new record has no creation time (an UNKNOWN row of the configured
-        schema's list leaves the times out) keeps the one it was listed with: it
-        never changes.
-        """
+        """A new listing's records, keeping the one on screen (its built rows and search text) for each
+        job that hasn't changed, so a refresh redraws only what changed. A record with no creation time
+        (an UNKNOWN row of the configured schema's list) keeps the one it was listed with."""
         merged = []
         for job in rows:
             if not (isinstance(job, dict) and views.job_id_of(job)):
@@ -1700,12 +1556,8 @@ class JobListScreen(FollowsPointer, Screen):
         return merged
 
     def job_fetched(self, job: dict) -> None:
-        """A screen above the list read a job afresh (``get_job``): the list shows that from now on.
-
-        Its status, reason, times and sub-jobs replace the list's copy, as
-        :func:`cortex_training.tui.views.refresh_job` merges them; the list
-        redraws on its return.
-        """
+        """A screen above the list read a job afresh (``get_job``): the list shows that from now
+        on, as :func:`cortex_training.tui.views.refresh_job` merges it, once it is back on top."""
         if not isinstance(job, dict):
             return
         jid = views.job_id_of(job)
@@ -1728,7 +1580,6 @@ class JobListScreen(FollowsPointer, Screen):
         parts = [(views.job_id_of(job), "grey50")]
         if unfolded is not None:
             parts.insert(0, ("▾ " if unfolded else "▸ ", "grey50"))
-        # The column cuts a long id: it ends in "…" there.
         return _FixedCell.assemble(*parts)
 
     @staticmethod
@@ -1801,11 +1652,6 @@ class JobListScreen(FollowsPointer, Screen):
             "GPUs": _cell(views.sub_job_gpu_text(sj), "grey70"),
         }
 
-    @staticmethod
-    def _note_cells(*, last: bool) -> dict:
-        """An UNKNOWN job's one-line sub-row."""
-        return {"Job ID": _cell(f"   {'└─' if last else '├─'} ? status unavailable", "yellow")}
-
     def _sub_rows(self, job: dict) -> tuple:
         """``job``'s rows under it while unfolded, and their keys: an UNKNOWN job's
         note, then a row per sub-job."""
@@ -1813,8 +1659,7 @@ class JobListScreen(FollowsPointer, Screen):
         entries = views.sub_jobs(job)
         subs, keys = [], []
         if views.is_unknown(job):
-            # In place of live sub-job state.
-            subs.append(("note", self._note_cells(last=not entries)))
+            subs.append(("note", {"Job ID": _cell(f"   {'├─' if entries else '└─'} ? status unavailable", "yellow")}))
             keys.append(None)
         for si, sj in enumerate(entries):
             last = si == len(entries) - 1
@@ -1822,11 +1667,13 @@ class JobListScreen(FollowsPointer, Screen):
             keys.append((jid, sj.get("sub_job_id")))
         return tuple(subs), tuple(keys)
 
-    @staticmethod
-    def _header_cells(group: str, count: int, label: str, layout: _ListLayout) -> tuple:
-        """A LIVE/HISTORY row. Its title is in the Job ID column; where that is too
-        narrow for all of it, what the group holds goes on in the columns after
-        Job ID, as many whole words to a column as fit, so the title is never cut."""
+    def _header(self, group: str, count: int, label: str, layout: _ListLayout) -> tuple:
+        """A LIVE/HISTORY row, kept while it reads the same. Its title is in the Job ID column; where
+        that is too narrow for all of it, what the group holds goes on in the columns after Job ID,
+        as many whole words to a column as fit, so the title is never cut."""
+        kept = self._headers.get(group)
+        if kept is not None and kept[0] == (count, label, layout):
+            return kept[1]
         style = "bold green" if group == "LIVE" else "bold grey62"
         head = f"{group} ({count})"
         labels = layout.labels
@@ -1843,7 +1690,9 @@ class JobListScreen(FollowsPointer, Screen):
                 while words and views.cell_width(f"{text} {words[0]}") <= widths[column]:
                     text += " " + words.pop(0)
                 cells[column] = _cell(text, "dim")
-        return tuple(cells.get(column, _BLANK) for column in labels)
+        cells = tuple(cells.get(column, _BLANK) for column in labels)
+        self._headers[group] = ((count, label, layout), cells)
+        return cells
 
     def _job_rows(self, job: dict, layout: _ListLayout) -> _JobRows:
         """``job``'s rows in ``layout``. Its cells are built again only when its
@@ -1858,12 +1707,10 @@ class JobListScreen(FollowsPointer, Screen):
             self._rows[jid] = rows
         expanded = self._is_expanded(job)
         if rows.layout != layout or rows.expanded != expanded:
-            name = rows.names.get(expanded)
-            if name is None:
-                unfolded = expanded if self._expandable(job) else None
-                # A row that can't be drawn is named by its job id (see _row_or_note).
-                name = rows.names[expanded] = rows.cells.get("Job ID") or self._row_or_note(
-                    job, lambda: {"Job ID": self._name_cell(job, unfolded)})["Job ID"]
+            unfolded = expanded if self._expandable(job) else None
+            # A row that can't be drawn is named by its job id (see _row_or_note).
+            name = rows.cells.get("Job ID") or self._row_or_note(
+                job, lambda: {"Job ID": self._name_cell(job, unfolded)})["Job ID"]
             labels = layout.labels
             cells = rows.cells
             rows.row = tuple(name if label == "Job ID" else cells.get(label, _BLANK) for label in labels)
@@ -1912,14 +1759,13 @@ class JobListScreen(FollowsPointer, Screen):
         # Three spaces: in line with #listinfo's text, which has a column of padding.
         self._notice = Content.from_markup("   [red]refresh failed $failed: $error; showing the list from $at[/red]",
                                            failed=self._failed_at or "", error=self._list_error or "",
-                                           at=self._listed_at or "—")
+                                           at=(self._last_refreshed or "—")[:5])
         self._paint_notice()
 
     def _paint_notice(self) -> None:
         if self._notice is None:
             return
         widget = self.query_one("#listnotice", Static)
-        # Wrapped lines continue under the message, not at the edge.
         widget.update(hanging(self._notice, widget.size.width or self.size.width or self.app.size.width, 3))
 
     def _paint_info(self) -> None:
@@ -1971,13 +1817,9 @@ class JobListScreen(FollowsPointer, Screen):
         """Ids of the jobs older than six months (hidden) that ``query`` matches, newest first."""
         now = self._clock()
         home = self._clients.home
-        found = []
-        for job in self._all_jobs:
-            if views.within_retention(job, now):
-                continue
-            # Each keystroke searches them again: their search text is kept, as the shown jobs' is.
-            if views.job_matches_query(job, query, home=home, hay=self._haystack(job)):
-                found.append(job)
+        # Each keystroke searches them again: their search text is kept, as the shown jobs' is.
+        found = [job for job in self._all_jobs if not views.within_retention(job, now)
+                 and views.job_matches_query(job, query, home=home, hay=self._haystack(job))]
         return [views.job_id_of(j) for j in views.sort_job_list(found, "created", True)]
 
     # ─── the table ───────────────────────────────────────────────────────────
@@ -1995,7 +1837,7 @@ class JobListScreen(FollowsPointer, Screen):
         layout = self._layout_for(self._location_column_width(recent))
         self._show_notice()
         info_line.set_class(False, "error")
-        if not self._loaded and not self._list_error:
+        if self._loaded_at is None and not self._list_error:
             self._info = Content.from_markup("  [dim]loading jobs…[/dim]")
             self._paint_info()
             self._hide_table(table, layout, "Loading jobs…")
@@ -2018,10 +1860,7 @@ class JobListScreen(FollowsPointer, Screen):
         if query.empty and not query.errors:
             visible = recent
         else:
-            visible = []
-            for job in recent:
-                if views.job_matches_query(job, query, home=home, hay=self._haystack(job)):
-                    visible.append(job)
+            visible = [job for job in recent if views.job_matches_query(job, query, home=home, hay=self._haystack(job))]
         ordered = views.sort_job_list(visible, self._sort, self._descending)
         live = [j for j in ordered if views.is_live(j)]
         history = [j for j in ordered if not views.is_live(j)]
@@ -2066,13 +1905,12 @@ class JobListScreen(FollowsPointer, Screen):
         was_hidden = not table.display
         table.display = True
 
-        # The rows to show, from what each job had built, unless it changed.
         plan: list = []
         job_by_item: dict = {}
         sub_by_item: dict = {}
         target_row = None
         groups = (("LIVE", live), ("HISTORY", history))
-        if not views.live_first(self._sort, self._descending):
+        if self._sort == "status" and not self._descending:
             groups = groups[::-1]  # status ↑ ended first: the ended jobs are what comes first
         for group, jobs in groups:
             if not jobs:
@@ -2142,16 +1980,6 @@ class JobListScreen(FollowsPointer, Screen):
             key = self._keys[jid] = f"job-{len(self._keys)}"
         return key
 
-    def _header(self, group: str, count: int, label: str, layout: _ListLayout) -> tuple:
-        """A LIVE/HISTORY header row's cells, kept while they read the same."""
-        key = (count, label, layout)
-        kept = self._headers.get(group)
-        if kept is not None and kept[0] == key:
-            return kept[1]
-        cells = self._header_cells(group, count, label, layout)
-        self._headers[group] = (key, cells)
-        return cells
-
     def _hide_table(self, table: DataTable, layout: _ListLayout, message: str, *, brief: str | None = None) -> None:
         """The table off, with ``message`` in its place (``brief`` while the search help shows, when given)."""
         self._set_columns(table, layout)
@@ -2177,7 +2005,6 @@ class JobListScreen(FollowsPointer, Screen):
             table.scroll_home(animate=False)  # keep the group header above the first job
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        from cortex_training.tui.screens import JobDetailScreen
         from cortex_training.tui.screens import JobSummaryScreen
 
         if not is_shown(self):
@@ -2198,15 +2025,11 @@ class JobListScreen(FollowsPointer, Screen):
             job = self._jobs_by_id.get(jid)
             client = self._job_client(job)
             if client is not None:
-                self.app.push_screen(JobDetailScreen(client, jid, job=job, sub_job_id=sid, initial_tab="logs",
-                                                     poll_interval=self._poll_interval))
+                self.app.push_screen(LogScreen(client, jid, job=job, sub_job_id=sid, poll_interval=self._poll_interval))
 
     def _job_client(self, job: dict | None):
-        """The client for the calls about ``job``, or None (and a notice) when it can't be made.
-
-        Opening the job anyway would send its calls to the configured location,
-        which isn't the job's, and every one would fail as "not found".
-        """
+        """The client for the calls about ``job``, or None (and a notice) when it can't be made: opened
+        anyway, its calls would go to the configured location and fail as "not found"."""
         try:
             return self._clients.for_job(job)
         except Exception as exc:  # noqa: BLE001 - shown, with the traceback in the error log
@@ -2217,6 +2040,37 @@ class JobListScreen(FollowsPointer, Screen):
 
 
 _SEPARATOR = "  ·  "
+
+
+def fit_line(segments: list, width: int) -> Content:
+    """``(text, style, least)`` segments joined by `` · `` to fit ``width`` cells.
+
+    When cutting the segments that have a ``least`` (the first ones first, down
+    to that many cells, with ``…``) puts the line on one row, they are cut just
+    enough; the others stay whole. Otherwise nothing is cut and the line wraps
+    between segments, so no row ends with a separator. The texts are shown
+    literally, never as markup.
+    """
+    texts = [text for text, _style, _least in segments]
+    sep = views.cell_width(_SEPARATOR)
+    over = sum(views.cell_width(text) for text in texts) + sep * (len(texts) - 1) - width
+    spares = [max(0, views.cell_width(text) - least) if least is not None else 0 for text, _style, least in segments]
+    if 0 < over <= sum(spares):  # cutting gets it onto one row
+        for i, spare in enumerate(spares):
+            if over <= 0:
+                break
+            if spare:
+                cut = min(spare, over)
+                texts[i] = views.fit_cells(texts[i], views.cell_width(texts[i]) - cut)
+                over -= cut
+    rows: list = []
+    for text, (_text, style, _least) in zip(texts, segments):
+        piece = Content.styled(text, style)
+        if rows and rows[-1].cell_length + sep + piece.cell_length <= width:
+            rows[-1] = rows[-1] + Content(_SEPARATOR) + piece
+        else:
+            rows.append(piece)
+    return Content("\n").join(rows)
 
 
 def _fit_line(parts: list[list[tuple[str, int]]], order: list[int], width: int, variables: dict,
@@ -2288,67 +2142,34 @@ class FittedFooter(Footer):
     def on_resize(self, event: events.Resize) -> None:
         self._fit()
 
-    def _units(self) -> tuple[list[list[Widget]], Widget | None]:
-        """The keys left to right, each key as one unit; and the palette key."""
-        units: list[list[Widget]] = []
-        palette = None
-        for child in self.children:
-            if child.has_class("-command-palette"):
-                palette = child
-            else:
-                units.append([child])
-        return units, palette
-
     def _fit(self) -> None:
-        units, palette = self._units()
-        if not units or self.region.width <= 0:
+        keys = [child for child in self.children if not child.has_class("-command-palette")]
+        palette = next((child for child in self.children if child.has_class("-command-palette")), None)
+        if not keys or self.region.width <= 0:
             return
-        if self._edges is None or len(self._edges) != len(units):
-            if any(not widget.display for unit in units for widget in unit):
+        if self._edges is None or len(self._edges) != len(keys):
+            if any(not key.display for key in keys):
                 return  # measured only with every key shown (after a recompose)
-            self._edges = [max(widget.region.right for widget in unit) - self.region.x for unit in units]
+            self._edges = [key.region.right - self.region.x for key in keys]
         room = self.region.width
         if palette is not None and palette.display and palette.region.width:
             room = palette.region.x - self.region.x
-        for unit, edge in zip(units, self._edges):
-            shown = edge <= room
-            for widget in unit:
-                if widget.display != shown:
-                    widget.display = shown
+        for key, edge in zip(keys, self._edges):
+            if key.display != (edge <= room):
+                key.display = edge <= room
 
 
-class _ResourceList(ListView):
+class _ResourceList(_SourceList):
     """The Resources tab's left panel: GPU Resources and System Resources, then the units of the one shown.
+    As on the Logs tab's sub-job list, page and Home/End keys scroll the pane beside it. Each move of the
+    highlight shows that entry at once (``LogScreen._resource_list_moved``), so a redraw never puts the
+    cursor back a key. System Resources switches the view once highlighted, so ``↓`` on GPU Resources goes
+    on to its units (ALL first), else out of the keys' reach; ``↑`` from ALL reaches System Resources."""
 
-    As on the Logs tab's sub-job list, the keys that scroll a page or to either
-    end move the pane beside it (here the charts), so they work while the panel
-    has the focus. Moving the highlight shows that entry at once: the screen
-    hears of every move as it happens (see ``LogScreen._resource_list_moved``),
-    so a redraw never puts the cursor back where it was a key earlier.
-
-    System Resources, just under GPU Resources, switches the view as soon as it
-    is highlighted. So ``↓`` on GPU Resources goes on to its units (ALL first),
-    which would otherwise be out of reach of the keys; ``↑`` from ALL reaches
-    System Resources.
-    """
-
-    BINDINGS = [
-        Binding("pageup", "pane('page_up')", show=False),
-        Binding("pagedown", "pane('page_down')", show=False),
-        Binding("home", "pane('scroll_home')", show=False),
-        Binding("end", "pane('scroll_end')", show=False),
-    ]
-
-    def action_pane(self, action: str) -> None:
-        try:
-            pane = self.screen.query_one("#resource-pane")
-        except NoMatches:
-            return
-        getattr(pane, f"action_{action}")()
+    _PANE = "#resource-pane"
 
     def action_cursor_down(self) -> None:
-        jump = getattr(self.screen, "_resource_down_from", None)
-        target = jump(self.index) if callable(jump) else None
+        target = self.screen._resource_down_from(self.index)
         if target is not None:
             self.index = target
             return
@@ -2356,42 +2177,33 @@ class _ResourceList(ListView):
 
     def watch_index(self, old_index: int | None, new_index: int | None) -> None:
         super().watch_index(old_index, new_index)
-        moved = getattr(self.screen, "_resource_list_moved", None)
-        if callable(moved):
-            moved(new_index)
+        self.screen._resource_list_moved(new_index)
 
 
 class LogScreen(FollowsPointer, Screen):
     """Read-only Logs and Resource dashboard for one job."""
 
-    CSS = """
-    #log-status { height: auto; padding: 0 1; color: $warning; }
-    """
-
-    # Back and quit first, then the digits
-    # and the keys panel: a narrow terminal cuts the footer's end, and "?" lists
-    # every key, the ones hidden here too.
+    # Back and quit first, then the keys panel: a narrow terminal cuts the
+    # footer's end, and "?" lists every key, the ones hidden here too.
     BINDINGS = [
         ("b", "back", "Back"),
         Binding("escape", "dismiss_or_back", "Back/clear", show=False),  # the filter box says Esc clears it
         ("q", "quit", "Quit"),
-        *(Binding(str(key), f"resource_range('{name}')", name, show=False) for key, name in enumerate(RANGES, 1)),
         KEYS_BINDING,
         Binding("t", "cycle_tab", "Tab", show=False),
         # Priority, as on the job list: the keys typed right after / reach the
         # filter box in order (check_action leaves / to a focused text box).
         Binding("/", "filter", "Filter", priority=True),
-        # l on Logs; elsewhere in the job details l opens Logs (check_action turns this off there).
+        # l on Logs; elsewhere l opens Logs (check_action turns cycle_level off there).
         ("l", "cycle_level", "Level"),
+        Binding("l", "show_tab('logs')", "Logs", show=False),
         Binding("L", "cycle_level", "Level", show=False),  # the key it had before
         ("p", "toggle_pause", "Pause"),
         ("s", "save_log", "Save"),
         ("r", "refresh_sources", "Refresh"),
         Binding("[", "shrink_sources", "Narrower", show=False),
         Binding("]", "grow_sources", "Wider", show=False),
-        # Resources: the next window. Declared here, ahead of the sub-job keys, so the
-        # footer keeps it there: a subclass's binding for a key takes this one's place.
-        Binding("w", "cycle_window", "Window"),
+        Binding("w", "cycle_window", "Window"),  # Resources: the next window
         # Resources: Space shows the next sub-job (round to the first after the last), no Shift
         # needed; shown there with two or more sub-jobs (see check_action). < and > (and , and .)
         # still go back and forth.
@@ -2400,6 +2212,7 @@ class LogScreen(FollowsPointer, Screen):
         Binding("greater_than_sign", "resource_sub_job(1)", "Next sub-job", key_display=">", show=False),
         Binding("comma", "resource_sub_job(-1)", "Prev sub-job", show=False),
         Binding("full_stop", "resource_sub_job(1)", "Next sub-job", show=False),
+        Binding("g", "show_tab('resource')", "Resources", show=False),
     ]
 
     # The sources panel is sized to its labels ("training #0"), at least
@@ -2414,6 +2227,10 @@ class LogScreen(FollowsPointer, Screen):
     # A job's last console chunks upload shortly after it ends, so a saved console
     # is kept (and replayed on the next open) only once the job has been over this long.
     _KEEP_CONSOLE_AFTER_SECONDS = 600
+    _DATA_REFRESH_SECONDS = 30
+    _STATUS_REFRESH_SECONDS = 60
+    # Copying (ctrl+c) works on every tab, what the mouse highlighted or else everything the tab holds: not here.
+    _LOG_ONLY = {"save_log", "cycle_level", "toggle_pause", "shrink_sources", "grow_sources", "filter"}
 
     class _Note(str):
         """One of the TUI's own lines in the log pane (a wait, a restart, where the live
@@ -2427,13 +2244,15 @@ class LogScreen(FollowsPointer, Screen):
         """A callback a worker ran on the UI thread (see _post) raised: a bug in this view, not
         a failure of the request the worker made. The callback's exception is its ``__cause__``."""
 
-    def __init__(self, client, job_id, *, sub_job_id=None, poll_interval=1.0, job_status=None):
+    def __init__(self, client, job_id, *, job: dict | None = None, sub_job_id=None, initial_tab: str = "logs",
+                 poll_interval=1.0):
         super().__init__()
         self._client = client
         self._job_id = job_id
         self._sub_job_id = sub_job_id
         self._poll_interval = poll_interval
-        self._job_status = job_status
+        self._job = job or {"job_id": job_id}
+        self._job_status = self._job.get("status")
         self._job_reason = None  # failure/cancel reason, when terminal
         self._sources_width = self._SOURCES_AUTO_MIN
         self._sources_auto = True  # sized to its labels until [ or ]
@@ -2467,7 +2286,7 @@ class LogScreen(FollowsPointer, Screen):
         self._stdout_failed = False
         self._held: tuple[list[str], bool] | None = None
         self._init_log_state()
-        self._active_tab = "logs"
+        self._active_tab = initial_tab if initial_tab in ("logs", "resource") else "logs"
         self._log_focus_id = "sources"
         self._metrics_root = job_cache_dir(job_id) / "metrics"
         self._resource_data = ResourceData({})
@@ -2507,45 +2326,35 @@ class LogScreen(FollowsPointer, Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("", id="summary")
-        with JobTabs(initial="logs", id="job-tabs"):
+        with JobTabs(initial=self._active_tab, id="job-tabs"):
             with TabPane("Logs", id="logs"):
-                yield from self._compose_logs()
-            with TabPane("Resource", id="resource"):
-                yield from self._compose_resource()
+                with Horizontal(id="logs-body"):
+                    yield _SourceList(id="sources")
+                    # Log supports native selection but not soft-wrap, so lines
+                    # are wrapped to the current pane width before writing.
+                    # Its max_lines counts those wrapped rows; _write_lines keeps
+                    # it in step with the _MAX_LINES lines the pane holds.
+                    yield _LogPane(id="logview", highlight=False, max_lines=self._MAX_ROWS)
+                # The Logs tab's own status line (waiting, paused, restarted, scrollback):
+                # the header's subtitle is too narrow for these next to a job id. Hidden
+                # until it has something to say.
+                status = Static("", id="log-status")
+                status.display = False
+                yield status
+                yield Input(placeholder="filter logs…  (/ focus · Esc clear)", id="logfilter")
+            with TabPane("Resources", id="resource"):
+                with Horizontal(id="resource-body"):
+                    yield _ResourceList(id="resource-list")
+                    with VerticalScroll(id="resource-pane"):
+                        yield Static("Select Resource to load GPU metrics.", id="resource-status")
+                        yield Static("", id="resource-stats")
+                        yield Static("", id="resource-charts")
         yield FittedFooter(id="footer")
 
-    def _compose_logs(self) -> ComposeResult:
-        """Body of the Logs tab (subclasses with more tabs reuse it)."""
-        with Horizontal(id="logs-body"):
-            yield _SourceList(id="sources")
-            # Log supports native selection but not soft-wrap, so lines are
-            # wrapped to the current pane width before writing. Its max_lines
-            # counts those wrapped rows; _write_lines keeps it in step with the
-            # _MAX_LINES lines the pane holds.
-            yield _LogPane(id="logview", highlight=False, max_lines=self._MAX_ROWS)
-        # The Logs tab's own status line (waiting, paused, restarted, scrollback):
-        # the header's subtitle is too narrow for these next to a job id. Hidden
-        # until it has something to say.
-        status = Static("", id="log-status")
-        status.display = False
-        yield status
-        yield Input(placeholder="filter logs…  (/ focus · Esc clear)", id="logfilter")
-
-    def _compose_resource(self) -> ComposeResult:
-        """Body of the Resource tab (subclasses with more tabs reuse it).
-
-        The panel on the left lists the views and the shown view's units; the
-        pane beside it scrolls through the stats and every chart under its header,
-        which stays on top (it names the sub-job, wherever the pane is scrolled).
-        """
-        with Horizontal(id="resource-body"):
-            yield _ResourceList(id="resource-list")
-            with VerticalScroll(id="resource-pane"):
-                yield Static("Select Resource to load GPU metrics.", id="resource-status")
-                yield Static("", id="resource-stats")
-                yield Static("", id="resource-charts")
-
     def on_mount(self) -> None:
+        self._render_summary_line()
+        self.set_interval(self._DATA_REFRESH_SECONDS, self._auto_refresh_data)
+        self.set_interval(self._STATUS_REFRESH_SECONDS, self._refresh_status)
         self._logview = self.query_one("#logview", Log)
         # We drive scrolling ourselves (scroll to the tail on every write unless
         # paused), so disable the widget's blanket auto-scroll.
@@ -2560,10 +2369,13 @@ class LogScreen(FollowsPointer, Screen):
         after_refresh(self, self._focus_active_tab)
         self.set_interval(self._IDLE_CHECK_SECONDS, self._check_idle)
 
+    def on_screen_resume(self) -> None:
+        self._update_subtitle()  # a screen pushed over this one may have replaced it
+
     def _focus_active_tab(self) -> None:
         try:
-            self.set_focus(self.query_one("#sources", ListView))
-        except NoMatches:  # removed before this callback ran
+            self.set_focus(self.query_one("#resource-list" if self._resource_active() else "#sources"))
+        except Exception:  # noqa: BLE001 - not mounted yet
             pass
 
     def on_unmount(self) -> None:
@@ -2594,9 +2406,12 @@ class LogScreen(FollowsPointer, Screen):
     def _resource_active(self) -> bool:
         return self._active_tab == "resource"
 
+    def action_show_tab(self, tab: str) -> None:
+        self.query_one("#job-tabs", TabbedContent).active = tab
+
     def action_cycle_tab(self) -> None:
         tabs = self.query_one("#job-tabs", TabbedContent)
-        tabs.active = "resource" if tabs.active == "logs" else "logs"
+        tabs.active = "resource" if self._active_tab == "logs" else "logs"
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         # Two quick tab keys queue two activations. Acting on the stale one moves
@@ -2606,17 +2421,14 @@ class LogScreen(FollowsPointer, Screen):
             return  # (or a tab key just before a back key: the screen is being removed)
         self._active_tab = event.pane.id or "logs"
         self.clear_selection()  # what was highlighted is on the tab left behind
-        self._sync_footer()
-        self.refresh_bindings()  # < and > show on Resources only
+        self.refresh_bindings()  # check_action scopes the footer's keys to the tab
         self._update_subtitle()  # the Logs tab's state shows only on Logs
-        if not self._logs_active():
-            # Remember where focus was in Logs so returning restores it.
+        if self._resource_active():
             focused = self.focused
             if focused is not None and focused.id in {"sources", "logview", "logfilter"}:
                 self._log_focus_id = focused.id
-        if self._resource_active():
             self.set_focus(self.query_one("#resource-list", ListView))  # its arrows pick a view or unit
-            after_refresh(self, self._render_resource)
+            self.call_after_refresh(self._render_resource)
             self._start_resource_refresh(force=False)
             return
         try:
@@ -2625,11 +2437,7 @@ class LogScreen(FollowsPointer, Screen):
             target = self.query_one("#sources", ListView)
         self.set_focus(target)
         # Re-wraps only if rows were written at another width while Logs was hidden.
-        after_refresh(self, self._rewrap)
-
-    def _sync_footer(self) -> None:
-        # The footer carries the log keys; it is hidden on the Resource tab (? lists every key).
-        self.query_one("#footer", Footer).display = self._logs_active()
+        self.call_after_refresh(self._rewrap)
 
     def _sources_cap(self) -> int:
         """The widest the sources panel may be: the log keeps _LOG_MIN_WIDTH cells."""
@@ -2659,7 +2467,7 @@ class LogScreen(FollowsPointer, Screen):
         self._sources_auto = False
         self._sources_width = min(self._sources_cap(), self._sources_width + self._SOURCES_STEP)
         self._apply_sources_width()
-        after_refresh(self, self._rewrap)  # log pane width changed
+        self.call_after_refresh(self._rewrap)  # log pane width changed
 
     def action_shrink_sources(self) -> None:
         if not self._logs_active():
@@ -2667,15 +2475,15 @@ class LogScreen(FollowsPointer, Screen):
         self._sources_auto = False
         self._sources_width = max(self._SOURCES_MIN, self._sources_width - self._SOURCES_STEP)
         self._apply_sources_width()
-        after_refresh(self, self._rewrap)  # log pane width changed
+        self.call_after_refresh(self._rewrap)  # log pane width changed
 
     def on_resize(self, event) -> None:
-        # Reflow only the in-memory views; resize never performs I/O. The log is
-        # wrapped again once the size settles (see _schedule_rewrap).
+        self.call_after_refresh(self._render_summary_line)
+        # Reflow only the in-memory views; resize never performs I/O.
         self._apply_sources_width()  # fitted again, and never wider than the screen allows
         self._schedule_rewrap()
         if self._resource_active():
-            after_refresh(self, self._render_resource)
+            self.call_after_refresh(self._render_resource)
 
     def _tabs_resized(self) -> None:
         """The tabs changed size, with or without the terminal (see :class:`JobTabs`):
@@ -2716,10 +2524,6 @@ class LogScreen(FollowsPointer, Screen):
             self._exec_failed.clear()
         self._load_sources()
 
-    # Whether the subtitle carries the job's reason (JobDetailScreen's summary
-    # line already shows reason and reason_details).
-    _SUBTITLE_REASON = True
-
     def _update_subtitle(self) -> None:
         # Dynamic status line: everything that changes over the session lives
         # here, leaving the #summary line for static config only. The status
@@ -2731,9 +2535,6 @@ class LogScreen(FollowsPointer, Screen):
         if st:
             bits.append(st.removeprefix("JOB_STATE_"))
         bits.append(str(self._job_id))
-        if self._SUBTITLE_REASON and self._job_reason:
-            why = " — ".join(x for x in (self._job_reason, self._job_reason_details) if x and str(x).strip())
-            bits.append(f"reason: {why}")
         if self._logs_active():  # the Logs tab's own state
             if self._last_line_at:
                 bits.append(self._last_line_at)
@@ -2747,10 +2548,46 @@ class LogScreen(FollowsPointer, Screen):
         # still carry an escape sequence or a line break.
         self.app.sub_title = "  ·  ".join(" ".join(safe_text(bit).split()) for bit in bits)
 
-    def _set_summary(self, text: str | Content) -> None:
+    # The fewest cells the models are cut to so the summary line fits on one row.
+    _SUMMARY_LEAST = 12
+
+    def _render_summary_line(self) -> None:
+        job = self._job
+        job_id = views.job_id_of(job) or self._job_id
+        # A sub-job's id starts with its job's (JOB_ID:TYPE:INDEX): name it once.
+        if not self._sub_job_id:
+            ids = [job_id, "all sub-jobs"]
+        elif str(self._sub_job_id).startswith(f"{job_id}:"):
+            ids = [f"sub-job {self._sub_job_id}"]
+        else:
+            ids = [job_id, f"sub-job {self._sub_job_id}"]
+        # Why the job is where it is, in the service's words: reason and reason_details,
+        # or the sentence it sends when the job's status is unavailable.
+        why = views.status_unavailable_text(job) if views.is_unknown(job) else views.reason_text(job)
+        word = views.status_word(job.get("status"))
+        style = "red" if word == "failed" else "yellow" if views.is_live(job) else ENDED_STYLE
+        # Where the job is (its calls go there), when the account-wide list says it is
+        # somewhere other than the configured location.
+        location = views.location_label(job) if self.app.job_elsewhere(job) else ""
+        least = self._SUMMARY_LEAST
+        # The models are cut to keep the line on one row; the ids,
+        # the location and the reason stay whole.
+        segments = [*((text, "", None) for text in ids),
+                    (views.job_type_label(job), "", None), (", ".join(views.job_models(job)) or "—", "", least),
+                    *([(location, "", None)] if location else []), *([(why, style, None)] if why else [])]
+        self._set_summary(fit_line(segments, self._summary_width()))
+
+    def _summary_width(self) -> int:
+        """The cells the summary line has: the screen's, less its padding, before the first layout."""
         try:
-            # A str here is job config text from the service: show it literally.
-            self.query_one("#summary", Static).update(Content(text) if isinstance(text, str) else text)
+            width = self.query_one("#summary", Static).size.width
+        except Exception:  # noqa: BLE001 - not mounted, or already removed
+            width = 0
+        return width or max(40, self.app.size.width - 2)
+
+    def _set_summary(self, text: Content) -> None:
+        try:
+            self.query_one("#summary", Static).update(text)
         except Exception:  # noqa: BLE001 - not mounted yet
             pass
 
@@ -2772,10 +2609,6 @@ class LogScreen(FollowsPointer, Screen):
     _RESOURCE_WHAT = {GPU: "GPU metrics", SYSTEM: "system metrics"}
     _RESOURCE_SAMPLES = {GPU: "GPU samples", SYSTEM: "system samples"}
 
-    def _resource_job(self) -> dict:
-        """Hook: the job document behind the Resources header (GPU type, requested GPUs)."""
-        return {}
-
     def action_resource_range(self, name: str) -> None:
         if not self._resource_active() or name not in RANGES:
             return
@@ -2783,9 +2616,6 @@ class LogScreen(FollowsPointer, Screen):
         self._render_resource()
 
     def action_cycle_window(self) -> None:
-        """w: the next window, on Resources."""
-        if not self._resource_active():
-            return
         names = list(RANGES)
         index = names.index(self._resource_range) if self._resource_range in names else -1
         self.action_resource_range(names[(index + 1) % len(names)])
@@ -2946,12 +2776,9 @@ class LogScreen(FollowsPointer, Screen):
         """< and >: show the previous or next sub-job here; the Logs tab keeps its own selection.
 
         The view stays and the unit goes back to the mean (see :meth:`_follow_resource_source`).
+        check_action enables it only on Resources, with two or more sub-jobs.
         """
-        if not self._resource_active():
-            return
         ids = self._resource_sub_job_ids()
-        if len(ids) < 2:
-            return
         current = self._resource_source()
         index = ids.index(current) if current in ids else 0
         self._resource_pick = ids[(index + step) % len(ids)]
@@ -3027,20 +2854,13 @@ class LogScreen(FollowsPointer, Screen):
         return entries.index(view) if view in entries else None
 
     def _resource_list_rows(self, source: str | None, now: datetime) -> list[tuple[tuple, Content, bool]]:
-        """The panel's entries, top to bottom, as (entry, label, disabled).
-
-        First the two views, the one shown marked ``●``; one the sub-job has no rows
-        of reads ``(none)``, dimmed, once that is known. Then a rule and the shown
-        view's units: ALL (the mean across them) and each GPU or node, with its newest
-        headline value (GPU util %, CPU util %) at the right. A unit that stopped
-        reporting (or every unit, when a running sub-job's samples stopped) is
-        dimmed and marked stale.
-        """
+        """The panel's entries, top to bottom, as (entry, label, disabled): the two views, a rule,
+        and the shown view's units (see the Resources section of docs/reference/cli.md)."""
         kinds = self._resource_data.kinds.get(source or "", {})
         # A kind missing now has no rows: once the sub-job has some, or once a download
         # found none for a sub-job that isn't still to send its first samples.
         known = bool(kinds) or (self._resource_downloaded and self._resource_waiting() is None
-                                and not self._resource_first_samples_due(gpu_allocation(self._resource_job(), source)))
+                                and not self._resource_first_samples_due(gpu_allocation(self._job, source)))
         heads = []
         for kind, name in self._RESOURCE_VIEWS.items():
             none = known and kind not in kinds
@@ -3177,15 +2997,11 @@ class LogScreen(FollowsPointer, Screen):
         word = self._tail_status(source) if source else ""
         return word if word in self._PRE_PLACEMENT | self._STARTING else None
 
-    def _resource_polls(self) -> bool:
-        """Whether a live job's Resources tab polls the stage: not before the shown sub-job runs."""
-        return self._resource_waiting() is None
-
     def _resource_first_samples_due(self, allocation) -> bool:
         """Whether the shown sub-job runs, has sent no samples yet, and will.
 
         Samples arrive about a minute after a sub-job starts running, and the tab
-        keeps polling meanwhile (it isn't waiting, see :meth:`_resource_polls`). A
+        keeps polling meanwhile (it isn't waiting, see :meth:`_resource_waiting`). A
         log_prob or multiplexed sub-job never sends any of its own.
         """
         source = self._resource_source()
@@ -3220,29 +3036,18 @@ class LogScreen(FollowsPointer, Screen):
     def _resource_status(self, resource: KindResource | None, width: int = 0) -> Content:
         """The two header lines: what is shown, then sampling, freshness and refresh state.
 
-        While the tab shows telemetry, neither line wraps: a header that changed
-        height would move the stats and charts a row whenever its text changed
-        length (a refresh starting, the age ticking past a minute). Each line drops
-        detail until it fits ``width``, in a fixed order (see :func:`_fit_line`).
-        On the first, the sub-job's place among the job's sub-jobs goes short
-        (``1 of 2`` to ``1/2``), then the window to its key's name and
-        then away (the stats name it), then the place, then the GPU type (or, in
-        the System view, the nodes' CPUs and memory). The first line names the GPUs (requested and
-        reporting) in the GPU view, the nodes in the System view. On the second,
-        the skipped rows' why, the values-change note,
-        the newest sample's time and "cached · " go, then the skipped rows and the
-        scrape interval. A line that still doesn't fit is cut. The second line
-        keeps room for "cached · refreshing…" and for the age to grow, so neither
-        a refresh nor the clock changes what else it shows. A failed refresh's
-        error is cut to the room that is left; the error log has it in full.
-        Without telemetry for the view (a message instead of the charts) the
-        message wraps, and a refresh's state follows it.
+        While the tab shows telemetry, neither line wraps (the stats and charts would move): each drops detail
+        until it fits ``width`` (see :func:`_fit_line`). The first shortens the place (``1 of 2`` to ``1/2``) and
+        the window to its key, then drops the window, the place and the GPU type (the nodes' sizes); the second
+        drops the skipped rows' why, the values-change note, the sample's time and a state's longer words, then
+        the skipped rows and the scrape interval. A failed refresh's error gets the room left (the error log has
+        it whole). Without telemetry for the view the message wraps, and a refresh's state follows it.
         """
         kind = self._resource_kind
         source = self._resource_source() or ""
         ignored = self._resource_data.ignored_rows_by_sub_job.get(source, 0)
         states = self._resource_state(resource)
-        allocation = gpu_allocation(self._resource_job(), source)
+        allocation = gpu_allocation(self._job, source)
         now = datetime.now(timezone.utc)
         stale = self._resource_stale(resource, now)
         values: dict = {"problem": views.collapse(self._resource_error or "")}
@@ -3326,31 +3131,19 @@ class LogScreen(FollowsPointer, Screen):
             status = self.query_one("#resource-status", Static)
             status.update(self._resource_status(resource, status.content_size.width))
 
-    def _resource_bar_rows(self) -> int:
-        """Rows of bars in each chart: 12 on a terminal of 48 rows or more, down to 4
-        under 28 (see _RESOURCE_BAR_ROWS_BY_HEIGHT)."""
-        height = getattr(getattr(self.app, "size", None), "height", 0) or 0
-        return next(bars for rows, bars in self._RESOURCE_BAR_ROWS_BY_HEIGHT if height >= rows)
-
     def _resource_charts(self, resource: KindResource, view: KindView, width: int, complete: bool,
                          missing: str | None) -> Content:
-        """Every metric's chart, in the metrics' order: two to a row in a pane at least 90 cells wide.
-
-        Each title names the sub-job, the metric, the window and what the values
-        are (``mean of 8 GPUs``, ``GPU 3``). Every title takes the same form, the
-        fullest that fits each chart's width: without what the values are (the stats
-        name it), then cut with ``…``; none wraps, so the charts of a row stay level.
-        A window whose older samples aren't read yet says so after each title, or
-        on a line of its own under each. Every chart is as tall as the others: a
-        metric without samples in the window says so in a chart's room.
-        """
+        """Every metric's chart, in the metrics' order: two to a row in a pane at least 90 cells wide, titled as
+        docs/reference/cli.md says; where one doesn't fit, every title leaves out what the values are, then the
+        window, and a name that still doesn't fit ends in ``…`` (so the charts of a row stay level). A window
+        whose older samples aren't read yet says so after each title, or on a line of its own under each."""
         metrics = list(resource.metrics)
         if not metrics:
             return Content("")
         per_row = 2 if width >= self._RESOURCE_SIDE_BY_SIDE else 1
         gap = self._RESOURCE_CHART_GAP
         column = max(1, (width - gap * (per_row - 1)) // per_row)
-        bars = self._resource_bar_rows()
+        bars = next(n for rows, n in self._RESOURCE_BAR_ROWS_BY_HEIGHT if self.app.size.height >= rows)
         hues = [chart_hue(index) for index in range(len(metrics))]
         # Each title ends with the metric's latest value, at the chart's right edge; the
         # rest of the title gets the room before it.
@@ -3435,7 +3228,7 @@ class LogScreen(FollowsPointer, Screen):
         pane_width = stats.content_size.width
         if pane_width <= 0:
             if retry_layout:
-                after_refresh(self, self._render_resource, retry_layout=False)
+                self.call_after_refresh(self._render_resource, retry_layout=False)
             return
         if resource is None:
             status.update(self._resource_status(None, pane_width) if source else self._resource_no_source_text())
@@ -3467,20 +3260,22 @@ class LogScreen(FollowsPointer, Screen):
             return "loading log sources…"
         if self._source_by_item:
             return "select a log source first"
-        job = self._resource_job()
+        job = self._job
         if views.is_unknown(job):
             # The service can't say which sub-jobs the job has while its status is unavailable.
             return Content.from_markup("$why; no GPU metrics are cached on this machine",
                                        why=views.status_unavailable_text(job))
         if self._no_sources and self._no_sources != self._NO_SUB_JOBS:
             # The job couldn't be read, or the service answered nothing: the reason the Logs pane gives.
-            return self._no_sources_status()
+            return Content(safe_text(f"no sub-jobs to show GPU metrics for: {self._no_sources}"))
         return "this job has no sub-jobs, and no GPU metrics are cached on this machine"
 
     # ─── filter / level / pause ──────────────────────────────────────────
     def check_action(self, action: str, parameters: tuple) -> bool | None:
-        if action == "filter":
-            return not isinstance(self.focused, Input)  # in a text box, / is typed
+        if action == "filter" and isinstance(self.focused, Input):
+            return False  # in a text box, / is typed
+        if action in self._LOG_ONLY:
+            return self._logs_active()
         if action == "resource_sub_job":
             # Only where it does something: on Resources, with another sub-job to switch to.
             return self._resource_active() and len(self._resource_sub_job_ids()) > 1
@@ -3502,9 +3297,7 @@ class LogScreen(FollowsPointer, Screen):
             self.app.pop_screen()
         else:
             # The app's list (its own client, not this job's, and its account-list state).
-            make = getattr(self.app, "job_list_screen", None)
-            self.app.switch_screen(make() if callable(make) else
-                                   JobListScreen(self._client, poll_interval=self._poll_interval))
+            self.app.switch_screen(self.app.job_list_screen())
 
     def action_dismiss_or_back(self) -> None:
         if not is_shown(self) or close_keys_panel(self):
@@ -3754,7 +3547,7 @@ class LogScreen(FollowsPointer, Screen):
     def _load_sources(self) -> None:
         """UI thread. Read the job, then show its sub-jobs (see _read_sources)."""
         # The row this screen was opened with (the list's or the preview's copy), as it is now.
-        self._read_sources(dict(getattr(self, "_job", None) or {}))
+        self._read_sources(dict(self._job))
 
     @work(thread=True, exclusive=True, group="sources")
     def _read_sources(self, row: dict) -> None:
@@ -3777,9 +3570,7 @@ class LogScreen(FollowsPointer, Screen):
         answered = bool(job.get("status") or job.get("sub_jobs"))
         if answered:
             # Status, reason and times are the UI thread's to take, in the order the reads
-            # were sent (see _take_job). The summary line (static config; status and reason
-            # go on the subtitle) is the screen's to draw: JobDetailScreen draws its own,
-            # without a flash of this one.
+            # were sent (see _take_job).
             self._post(self._take_job, job, seq)
         # get_job failed or answered nothing: the row this screen was opened with still
         # names the sub-jobs, or says the status is unavailable.
@@ -3883,10 +3674,6 @@ class LogScreen(FollowsPointer, Screen):
             note += f" (up to {tries} tries of {read:g} s each)" if tries > 1 else f" (up to {read:g} s)"
         return note
 
-    def _no_sources_status(self) -> Content:
-        """Resources' status line while the job has no sub-jobs to show: the reason the Logs pane gives."""
-        return Content(safe_text(f"no sub-jobs to show GPU metrics for: {self._no_sources}"))
-
     async def _populate_sources(self, sources, why: tuple[str, str] | None = None) -> None:
         """UI thread. ``why``: the pane line's tag and the reason there are no sources
         (the job couldn't be read, say); see :meth:`_no_sources_text`."""
@@ -3901,7 +3688,9 @@ class LogScreen(FollowsPointer, Screen):
             # No get_job answer taken yet: the row the view was opened with says how the
             # sub-jobs are. Once one is, _take_job keeps them as the newest answer says.
             self._sub_job_status = {s["sub_job_id"]: s["status"] for s in items if s.get("status")}
-        self._forget_failed_execution_logs()  # r retries an execution log that couldn't be read
+        for source in self._exec_failed:  # r retries an execution log that couldn't be read
+            self._exec_logs.pop(source, None)
+        self._exec_failed.clear()
         if why is not None:
             self._clear_pane()
             self._write_line(" ".join(why))
@@ -3943,11 +3732,6 @@ class LogScreen(FollowsPointer, Screen):
             self._render_resource()
             self._start_resource_refresh(force=False)
 
-    def _on_job_loaded(self, job: dict) -> None:
-        """UI thread. A fresh copy of the job: its static config on the summary line
-        (subclasses that render more of the job draw their own)."""
-        self._set_summary(format_job_config(job))
-
     def _display(self, line: str) -> str:
         """How a buffered line is shown: a log line's display text (see
         ``format.display_line``), the TUI's own notes only made safe to draw.
@@ -3960,8 +3744,13 @@ class LogScreen(FollowsPointer, Screen):
         return text
 
     def _line_prefixes(self) -> tuple[str, str]:
-        """Hook: what starts the first row of a log line of the current source, and each row after it."""
-        return "", ""
+        # Tag every log line with the sub-job being tailed, and line its later
+        # rows (wrapped, or a traceback's lines) up under its text; the TUI's
+        # own status lines stay as they are (_prefixes).
+        if not self._current_source:
+            return "", ""
+        tag = one_line(safe_text(source_label(self._current_source).replace(" #", ":")))
+        return f"{tag} │ ", f"{' ' * views.cell_width(tag)} │ "
 
     def _prefixes(self, line: str) -> tuple[str, str]:
         """The row prefixes of ``line``: none for the TUI's own notes."""
@@ -4269,15 +4058,19 @@ class LogScreen(FollowsPointer, Screen):
         self._post(self._apply_saved, gen, source, console, chunks, displays, cut, width,
                    matched, total, len(lines), newer, gap)
 
-    _NO_LOG_OUTPUT = "No log output is available."
+    def _ended_job(self) -> dict:
+        """This view's copy of the job with the newest status and reason (the tail
+        can see the job end before the next get_job refreshes the copy)."""
+        job = {**self._job, "status": self._job_status or self._job.get("status")}
+        if self._job_reason is not None:
+            job["reason"] = self._job_reason
+        return job
 
     def _no_log_output(self) -> str:
-        """The pane's line for a sub-job with no log output (a subclass may say why)."""
-        return self._NO_LOG_OUTPUT
-
-    def _never_started(self) -> bool:
-        """Whether the job never got GPUs, so it wrote no logs (a subclass that keeps the job decides)."""
-        return False
+        # A job that never got GPUs (placement_timeout and the like) wrote no logs: say why.
+        if views.never_started(self._ended_job()):
+            return f"No log output: {views.never_started_text(self._ended_job())}."
+        return "No log output is available."
 
     @staticmethod
     def _span(seconds: float) -> str:
@@ -4327,7 +4120,7 @@ class LogScreen(FollowsPointer, Screen):
         # The TUI's own lines (shown untagged), after the console's.
         # A job that never got GPUs has no saved logs still to come.
         notes = ([self._Note(self._recent_console_note(console=console, newer=len(newer)))]
-                 if self._stdout_recent and not self._never_started() else [])
+                 if self._stdout_recent and not views.never_started(self._ended_job()) else [])
         empty = False
         if console:
             self._saved_dropped = matched - kept
@@ -4415,17 +4208,58 @@ class LogScreen(FollowsPointer, Screen):
                     statuses[sid] = sj["status"]
         return statuses
 
+    def _live(self) -> bool:
+        # _job_status is kept current (get_job, and the tail seeing the job end).
+        return views.is_live({"status": self._job_status or self._job.get("status")})
+
+    def _refresh_status(self) -> None:
+        # The tail pauses off the Logs tab, so it can't be what notices the job ending.
+        if self.app.screen is self and self._live():
+            self._fetch_status()
+
+    @work(thread=True, exclusive=True, group="status")
+    def _fetch_status(self) -> None:
+        # Numbered as it is sent: a read that answers after a later one is dropped (see _take_job).
+        # One the next tick's read replaced (exclusive) still counts: with a slow service every
+        # read can take longer than a tick, and dropping those would drop them all.
+        seq = self._next_job_read()
+        try:
+            job = self._client.get_job(self._job_id)
+        except Exception:  # noqa: BLE001 - keep the current view; the next tick retries
+            return
+        if isinstance(job, dict) and job.get("status") and self._screen_open:
+            self._post(self._apply_status, job, seq)
+
+    def _apply_status(self, job: dict, seq: int) -> None:
+        if not self._screen_open:
+            return
+        ended = is_active_status(self._job_status) and not is_active_status(job.get("status"))
+        # Status, reason and sub-job statuses come from this job as they are now:
+        # a reason the service stopped sending (a job that left pending) is gone.
+        # (_take_job also redraws the summary line from it.) An older answer than
+        # the one on screen changes nothing.
+        if not self._take_job(job, seq):
+            return
+        if ended and self._current_source:
+            # Show the saved console now, as the tail would after its next error.
+            self._start_tail(self._current_source, user=False)
+            return
+        # A Logs tab waiting for the job (or its sub-job) to start tails it once it can.
+        self._resume_waiting_tail()
+
+    def _auto_refresh_data(self) -> None:
+        # Only the visible tab polls, and only while the job is live. Resources waits
+        # until the status check sees the shown sub-job running: before that it has no samples.
+        if self.app.screen is not self or not self._live():
+            return
+        if self._resource_active() and self._resource_waiting() is None:
+            self._start_resource_refresh(force=True)
+
     def _next_job_read(self) -> int:
         """Any thread. The number of a get_job about to be sent: a read sent later has a larger one."""
         with self._job_reads_lock:
             self._job_reads += 1
             return self._job_reads
-
-    def _take_job_details(self, job: dict) -> None:
-        """UI thread. What a fresh get_job says besides status and reason."""
-        self._job_reason_details = job.get("reason_details") or None
-        if job.get("status") and is_active_status(job["status"]):
-            self._active_seen_at = time.monotonic()  # it hadn't ended yet
 
     def _take_job(self, job: dict, seq: int | None = None) -> bool:
         """UI thread. A fresh get_job replaces this view's status, reason, times and sub-job statuses.
@@ -4444,7 +4278,9 @@ class LogScreen(FollowsPointer, Screen):
         if seq is not None:
             self._job_seq = seq
         self._sub_job_status = self._sub_statuses(job)
-        self._take_job_details(job)
+        self._job_reason_details = job.get("reason_details") or None
+        if job.get("status") and is_active_status(job["status"]):
+            self._active_seen_at = time.monotonic()  # it hadn't ended yet
         # A job that ended while the view was open has a new state_changed_at,
         # which decides whether its console is kept (_keep_console).
         self._state_changed_at = job.get("state_changed_at")
@@ -4453,34 +4289,33 @@ class LogScreen(FollowsPointer, Screen):
         reason = job.get("reason") or ""  # omitted: the job has no reason now
         if status != self._job_status or reason != (self._job_reason or ""):
             self._apply_terminal_status(status, reason)
-        else:
-            self._update_subtitle()  # its reason_details may have changed
-        # The rest of the view (the summary line's reason and reason_details) as
-        # the job is now: the tail can see the job end before the status check does.
-        self._on_job_loaded(job)
+        # The rest of the view (the summary line's reason and reason_details) as the job is now:
+        # the tail can see the job end before the status check does. The service's fields come
+        # only from the fresh answer, so a reason it stopped sending disappears from the line.
+        self._job = views.refresh_job(self._job, job)
+        if job.get("status"):
+            self._job_reason = job.get("reason")
+        self._render_summary_line()
         return True
 
-    @classmethod
-    def _effective_status(cls, job_status, sub_job_status) -> str:
+    def _tail_status(self, sub_job_id: str | None) -> str:
         """The status word that decides how a sub-job's tail runs.
 
         A placed job's sub-jobs start on their own schedule, so the sub-job's
         own status counts once the job is past placement; before that, and
         once the job has ended, the job's does.
         """
-        job = views.status_word(job_status)
-        if not sub_job_status or job in cls._PRE_PLACEMENT or not is_active_status(job_status):
+        job = views.status_word(self._job_status)
+        sub_job_status = self._sub_job_status.get(sub_job_id or "")
+        if not sub_job_status or job in self._PRE_PLACEMENT or not is_active_status(self._job_status):
             return job
         return views.status_word(sub_job_status)
-
-    def _tail_status(self, sub_job_id: str | None) -> str:
-        return self._effective_status(self._job_status, self._sub_job_status.get(sub_job_id or ""))
 
     def _pending_note(self, sub_job_id: str) -> str:
         """The wait for placement: the job's (with its reason), or one sub-job's once the job is placed."""
         word = self._tail_status(sub_job_id)
         job_word = views.status_word(self._job_status)
-        hint = self._check_hint()
+        hint = f"(status checked every {self._STATUS_REFRESH_SECONDS} s · r checks now)"
         if job_word in self._PRE_PLACEMENT:
             # As the summary line puts them: "reason — reason_details".
             why = " — ".join(one_line(x).strip() for x in (self._job_reason, self._job_reason_details)
@@ -4494,11 +4329,6 @@ class LogScreen(FollowsPointer, Screen):
         # says otherwise (UNKNOWN when the service couldn't read the job's state).
         return (f"waiting: the service says the job is pending placement (its status reads "
                 f"{job_word.upper()}); the log tail starts by itself when the job starts {hint}")
-
-    def _check_hint(self) -> str:
-        """How the wait ends without a key: the job view's status check, or r."""
-        every = getattr(self, "_STATUS_REFRESH_SECONDS", None)
-        return f"(status checked every {int(every)} s · r checks now)" if every else "(r checks now)"
 
     def _waiting_for(self, sub_job_id: str) -> tuple[str, str] | None:
         """The wait, if any, before ``sub_job_id`` can have logs: (kind, note)."""
@@ -4567,20 +4397,14 @@ class LogScreen(FollowsPointer, Screen):
         if self._waiting == "stopped" and word != "running":
             return  # the tail starts again once the sub-job runs
         words = self._status_words(source)
-        if self._wait_words == words and not self._retry_while_running(words):
+        # While the job and sub-job run, no status change is coming to try again on: each check
+        # (once a minute) does, but only while someone is watching (see _watched).
+        if self._wait_words == words and not (words == ("running", "running") and self._watched()):
             return  # still the statuses the service answered for: r tries now
         self._start_tail(source, user=False)
 
     def _status_words(self, sub_job_id: str) -> tuple[str, str]:
         return views.status_word(self._job_status), self._tail_status(sub_job_id)
-
-    def _retry_while_running(self, words: tuple[str, str]) -> bool:
-        """Whether a status check asks again for a tail the service refused while the job and sub-job run.
-
-        No status change is coming to try again on, so each check (once a
-        minute) does, but only while someone is watching (see _watched).
-        """
-        return words == ("running", "running") and self._watched()
 
     def _watched(self) -> bool:
         """Whether someone used the view in the last _IDLE_PAUSE_SECONDS. Only then do the
@@ -4927,7 +4751,7 @@ class LogScreen(FollowsPointer, Screen):
     def _log_traceback(label: str) -> None:
         """Worker thread, inside an ``except``: append the traceback to the error log."""
         try:
-            with open(log_cache.error_log_path(), "a", encoding="utf-8") as handle:
+            with open(os.path.expanduser(_ERROR_LOG), "a", encoding="utf-8") as handle:
                 handle.write(f"{label}:\n{traceback.format_exc()}\n")
         except Exception:  # noqa: BLE001
             pass
@@ -5249,12 +5073,12 @@ class LogScreen(FollowsPointer, Screen):
         profile it connects as the TUI does (``--config FILE``, ``--host HOST`` or
         ``--base-url URL``; see ``views.sign_in_options``)."""
         where = self._configured_location()
-        names = views.location_names(getattr(self, "_job", None))  # the row's own location wins
+        names = views.location_names(self._job)  # the row's own location wins
         if names is not None:
             where["database"], where["schema"] = views.sql_identifier(names[0]), views.sql_identifier(names[1])
         if not where.get("connection"):
             where.update(views.sign_in_options(getattr(self.app, "sign_in", None)))
-        return views.cli_command(arguments, **where)
+        return " ".join(["cortex-training", *views.cli_options(**where), arguments])
 
     def _execution_log_lines(self, source: str) -> list[str]:
         """UI thread. What a failed job's execution log adds for a sub-job without a saved console.
@@ -5331,11 +5155,6 @@ class LogScreen(FollowsPointer, Screen):
             self._exec_failed.add(source)
         if source == self._current_source and self._saved_shown(source):
             self._paint_saved()
-
-    def _forget_failed_execution_logs(self) -> None:
-        for source in self._exec_failed:
-            self._exec_logs.pop(source, None)
-        self._exec_failed.clear()
 
     def _content_width(self) -> int:
         """Usable text columns of the log pane (accounts for padding/scrollbar)."""
@@ -5666,13 +5485,12 @@ class LogScreen(FollowsPointer, Screen):
 
 
 class CortexTrainingLogTUI(App):
-    """Entry app: show the job list, or jump straight to a job's Logs tab when a
+    """Entry app: show the job picker, or jump straight to a job dashboard when a
     job_id is supplied."""
 
     CSS = """
     #jobs { height: 1fr; }
     #listinfo { padding: 0 1; height: auto; }
-    #listnotice { height: auto; }
     /* In the table's place (never shown with it), so the search box stays at the bottom. */
     #nomatch-box { height: 1fr; scrollbar-gutter: stable; }
     #nomatch { padding: 1 2; color: $warning; height: auto; }
@@ -5683,8 +5501,8 @@ class CortexTrainingLogTUI(App):
     #job-tabs, #job-tabs ContentSwitcher, #logs, #resource, #logs-body {
         height: 1fr;
     }
-    TabPane { padding: 0; }
     #logview { height: 1fr; padding: 0 1; }
+    #log-status { height: auto; padding: 0 1; color: $warning; }
     #summary { color: $text-muted; padding: 0 1; }
     #logfilter { border: tall $panel; }
     #jobfilter { border: tall $panel; }
@@ -5703,11 +5521,10 @@ class CortexTrainingLogTUI(App):
     /* The scrollbar's room is kept while the preview fits, so its text never changes
        width (and re-wraps at the edge) when a refresh makes it scroll. */
     #summary-body { padding: 1 1; scrollbar-gutter: stable; }
-    #preview { height: auto; }
     #health { height: auto; margin: 1 0; }
     #subjobs-title { height: auto; margin-top: 1; }
     #subjobs { height: auto; max-height: 12; margin: 0 1; }
-    /* Text-selection highlight: reuse the table's subtle "blurred cursor"
+    /* Text-selection highlight: reuse the picker's subtle "blurred cursor"
        shade so it's visible but not a heavy saturated block. */
     LogScreen > .screen--selection {
         background: $block-cursor-blurred-background;
@@ -5719,25 +5536,17 @@ class CortexTrainingLogTUI(App):
     ToastRack { dock: top; align: right top; margin-bottom: 0; scrollbar-size-vertical: 0; }
     Toast.-information { padding: 0 1; margin-top: 0; width: auto; max-width: 80%; }
     """
-    # A priority binding acts as the key arrives, before the focused widget sees it:
-    # q quits even while the screens work through a burst of keys. It stands
-    # aside while a text box has focus (check_action), so q still types there.
-    BINDINGS = [
-        Binding("q", "quit", "Quit", priority=True),
-    ]
+    # Priority: q quits as the key arrives, even while the screens work through a burst
+    # of keys; it stands aside while a text box has focus (check_action), so q types there.
+    BINDINGS = [Binding("q", "quit", "Quit", priority=True)]
     # How the client connects, set by `cortex-training tui` (never a secret), so
     # the commands the TUI shows to copy connect the same way; None when unknown
     # (the demo, tests). See views.sign_in_options.
     sign_in: dict | None = None
 
     def __init__(self, client, job_id=None, *, sub_job_id=None, poll_interval=1.0, now=None, schema_only=False):
-        """``schema_only``: list the configured schema's jobs only, never the account-wide list
-        (the job list hides ``a``, which switches to it).
-
-        Every job record the screens read through ``client`` (and
-        its per-location clients) comes back printable: see
-        :mod:`cortex_training.tui.untrusted`.
-        """
+        """``schema_only``: never the account-wide list (the job list hides ``a``). Every job record read
+        through ``client`` and its per-location clients comes back printable (:mod:`cortex_training.tui.untrusted`)."""
         super().__init__()
         client = printable_client(client)
         self._client = client
@@ -5770,15 +5579,10 @@ class CortexTrainingLogTUI(App):
         return True
 
     def copy_to_clipboard(self, text: str) -> None:
-        """The terminal's clipboard (OSC 52, which some terminals ignore) and this
-        machine's (see :mod:`cortex_training.tui.clipboard`), then a note saying so.
-        Nothing to copy leaves the clipboard as it was. Textual's own copies (ctrl+c
-        in a text box) come here too, and say so as the TUI's do.
-
-        OSC 52 goes out at once. This machine's clipboard is written on a worker
-        thread, and the note comes when that is done: its tool can take seconds
-        (xclip waits out its timeout when ``DISPLAY`` is gone), and on this thread
-        the screen froze for as long."""
+        """The terminal's clipboard (OSC 52, which some terminals ignore) at once, then this machine's
+        (see :mod:`cortex_training.tui.clipboard`) on a worker thread, and a note once that is done: its tool can
+        take seconds (xclip waits out its timeout without ``DISPLAY``). Textual's own copies (ctrl+c in a text
+        box) come here too."""
         if not text:
             return
         super().copy_to_clipboard(text)
@@ -5870,9 +5674,6 @@ class CortexTrainingLogTUI(App):
         if not close_keys_panel(self.screen):
             self.action_show_help_panel()
 
-    def validate_title(self, title: str) -> str:
-        return one_line(title)
-
     def validate_sub_title(self, sub_title: str) -> str:
         # The header is one row: the subtitle quotes job ids, reasons and search
         # text, which must neither break the row nor reach the terminal as an escape.
@@ -5887,17 +5688,11 @@ class CortexTrainingLogTUI(App):
     # of its own, once the list is on screen, rather than one with drawing it.
     _FREEZE_HEAP_AFTER_SECONDS = 1.0
 
-    def _freezes_heap(self) -> bool:
-        """Whether this run freezes the heap (see :func:`_freeze_heap`): only in a
-        terminal. A headless run is a test, and a test process runs many apps,
-        whose objects left in reference cycles a freeze would keep."""
-        return not self.is_headless
-
     def job_list_drawn(self, screen: Screen) -> None:
         """A job list drew the jobs it loaded. The first time, freeze the heap
         soon after (see :func:`_freeze_heap`): the list's records and rows are
         most of it by then."""
-        if self._heap_frozen or not self._freezes_heap():
+        if self._heap_frozen or self.is_headless:
             return
         self._heap_frozen = True
 
@@ -5919,21 +5714,20 @@ class CortexTrainingLogTUI(App):
         # Before any screen starts a worker: quit must not wait for them.
         loop = asyncio.get_running_loop()
         loop.set_default_executor(_DaemonThreadExecutor())
-        if self._freezes_heap():
+        # Only in a terminal: a headless run is a test, and a test process runs many apps,
+        # whose objects left in reference cycles a freeze would keep.
+        if not self.is_headless:
             # What the imports made (most of the heap until a list arrives) is
             # frozen before any screen exists, so the collections while the first
             # list is read and drawn don't visit it.
             _freeze_heap()
         if self._job_id:
-            from cortex_training.tui.screens import JobDetailScreen
-
             # A job opened by id is in the configured database and schema.
             self.push_screen(
-                JobDetailScreen(
+                LogScreen(
                     self._client,
                     self._job_id,
                     sub_job_id=self._sub_job_id,
-                    initial_tab="logs",
                     poll_interval=self._poll_interval,
                 )
             )
@@ -5993,14 +5787,14 @@ class CortexTrainingLogTUI(App):
         True for the press and the release there, which nothing else sees (so a click on
         the footer keeps a highlight)."""
         if isinstance(event, events.MouseDown):
-            key = self._footer_key_at(event)
+            key = self._widget_at(event, FooterKey)
             self._footer_down = (key, event.button, event.screen_offset) if key is not None else None
             return key is not None
         if isinstance(event, events.MouseUp) and self._footer_down is not None:
             (key, button, at), self._footer_down = self._footer_down, None
             # As on a table's rows: a hand that moved two cells along the key, or off its row, dragged.
             still = event.screen_y == at.y and abs(event.screen_x - at.x) < PickableTable._DRAG_CELLS
-            if button == 1 and still and self._footer_key_at(event) is key:
+            if button == 1 and still and self._widget_at(event, FooterKey) is key:
                 if getattr(key, "_disabled", False):
                     self.bell()
                 else:
@@ -6008,12 +5802,12 @@ class CortexTrainingLogTUI(App):
             return True
         return False
 
-    def _footer_key_at(self, event: events.MouseEvent) -> FooterKey | None:
+    def _widget_at(self, event: events.MouseEvent, kinds) -> Widget | None:
         try:
             widget, _region = self.screen.get_widget_at(event.x, event.y)
         except Exception:  # noqa: BLE001 - NoWidget: nothing there
             return None
-        return next((node for node in widget.ancestors_with_self if isinstance(node, FooterKey)), None)
+        return next((node for node in widget.ancestors_with_self if isinstance(node, kinds)), None)
 
     def _confine_drag(self, event: events.MouseEvent) -> events.MouseEvent:
         """A drag that starts in a scrolling area (the log, a list, the Resources pane, the
@@ -6075,7 +5869,7 @@ class CortexTrainingLogTUI(App):
             pressed, self._press_at = self._press_at, None
             self._dragged = pressed is not None and self._press_moved
             if pressed is not None and not self._press_moved:
-                if self._on_footer(event):
+                if self._widget_at(event, (Footer, Toast)) is not None:  # on the footer (out of its keys) or a note
                     return False
                 widget, _offset = self.screen.get_widget_and_offset_at(event.x, event.y)
                 if widget is None or not widget.has_class("-textual-system"):
@@ -6093,14 +5887,6 @@ class CortexTrainingLogTUI(App):
     def _clear_picked(self) -> None:
         for table in self.screen.query(PickableTable):
             table.clear_picked()
-
-    def _on_footer(self, event: events.MouseEvent) -> bool:
-        """Whether ``event`` is on the footer (out of its keys) or on a note."""
-        try:
-            widget, _region = self.screen.get_widget_at(event.x, event.y)
-        except Exception:  # noqa: BLE001 - NoWidget: nothing there
-            return False
-        return any(isinstance(node, (Footer, Toast)) for node in widget.ancestors_with_self)
 
 
 _INPUT_EVENTS = (events.Key, events.MouseDown, events.MouseScrollDown, events.MouseScrollUp, events.Paste)

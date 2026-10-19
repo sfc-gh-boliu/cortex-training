@@ -61,19 +61,14 @@ _POLL_MAX_INTERVAL = 6.0
 _HOLD_CHECK_SECONDS = 0.25  # how soon a held tail notices it may poll again
 
 # A stuck tail: on some service versions a log line of 256 KiB or more is never
-# delivered, and every later page comes back empty with the same cursor while
-# the job keeps logging. A quiet log looks the same, so a tail that has not moved
-# for STALL_SECONDS (over at least STALL_POLLS polls) reads the end of the log.
-# When that end has lines the tail hasn't shown and the cursor still brings
-# nothing, the tail is stuck: it goes on from the end, without the lines already
-# shown. When the cursor does bring lines, the log was only quiet, and they are
-# shown in order from the cursor instead. The window shrinks while reads of the
-# end bring nothing new: a quiet log then costs only a small read, and a window
-# that still reaches back to the oversized line soon stops reaching it.
+# delivered, and every later page comes back empty with the same cursor while the
+# job keeps logging; cached_pages restarts such a tail. The window shrinks while
+# reads of the end bring nothing new: a quiet log then costs only a small read,
+# and a window that still reaches back to the oversized line soon stops reaching it.
 STALL_SECONDS = 45.0
 STALL_POLLS = 3
 RESTART_LINES = (200, 50, 10)
-_RECENT_KEYS = 5000  # entries remembered for that dedupe; far more than one restart window
+_RECENT_KEYS = 5000  # entries remembered so a restart skips lines already shown; far more than one window
 
 # A page this full says the log runs ahead of the tail (the service's pages
 # currently hold at most 2,000 entries and 256 KiB): the next read goes out
@@ -82,16 +77,8 @@ CATCH_UP_ENTRIES = 1000
 CATCH_UP_BYTES = 128 * 1024
 CATCH_UP_SECONDS = 0.2
 
-# The TUI's one error log: tracebacks of what it shows as one-line errors. Messages
-# name it ERROR_LOG_NAME; writers open error_log_path().
-ERROR_LOG_NAME = "~/.cortex-training-errors.log"
-_ERROR_LOG = os.path.expanduser(ERROR_LOG_NAME)
+_ERROR_LOG = os.path.expanduser("~/.cortex-training-errors.log")
 _persist_warned = False
-
-
-def error_log_path() -> str:
-    """The error log file every part of the TUI appends to."""
-    return _ERROR_LOG
 
 # Filename-safe byte set; everything else (incl. ':' '/' '%') is %XX-escaped so
 # a source_id collapses to a single, reversible path component.
@@ -225,16 +212,15 @@ class LogCache:
             return cur if isinstance(cur, str) else None
         return None
 
-    def set_cursor(self, source_id: str, cursor: Optional[str]) -> None:
-        self._update_source(source_id, cursor=cursor)
-
-    def _update_source(self, source_id: str, **fields: Any) -> None:
+    def set_cursor(self, source_id: str, cursor: Optional[str], **fields: Any) -> None:
         doc = self._read_cursors()
         sources = doc.setdefault("sources", {})
-        entry = sources.get(source_id)
-        entry = dict(entry) if isinstance(entry, dict) else {}
-        entry.update(fields, updated=datetime.now(timezone.utc).isoformat())
-        sources[source_id] = entry
+        old = sources.get(source_id)  # its other fields (head_missing) stay
+        sources[source_id] = {
+            **(old if isinstance(old, dict) else {}), **fields,
+            "cursor": cursor,
+            "updated": datetime.now(timezone.utc).isoformat(),
+        }
         doc["version"] = 1
         _atomic_write_text(self._cursors_path(), json.dumps(doc, sort_keys=True) + "\n")
 
@@ -246,7 +232,7 @@ class LogCache:
 
     def set_head_missing(self, source_id: str) -> None:
         if not self.head_missing(source_id):
-            self._update_source(source_id, head_missing=True)
+            self.set_cursor(source_id, self.get_cursor(source_id), head_missing=True)
 
     # ---- entries ----
     def append_entries(self, source_id: str, entries: Iterable[Any]) -> int:
@@ -267,14 +253,12 @@ class LogCache:
         return n
 
     def load_entries(self, source_id: str, *, limit: Optional[int] = None) -> list:
-        """The cached entries, oldest first. A torn or corrupt line is skipped; bytes
-        that aren't UTF-8 (the file was damaged outside the client) read as U+FFFD."""
         return self.load_newest(source_id, limit=limit)[0]
 
     def load_newest(self, source_id: str, *, limit: Optional[int] = None) -> Tuple[list, int]:
-        """The newest ``limit`` cached entries (all without a limit), and how many the cache
-        holds. A torn or corrupt line is skipped and not counted; bytes that aren't UTF-8
-        read as U+FFFD."""
+        """The newest ``limit`` cached entries (all without a limit), oldest first, and how
+        many the cache holds. A torn or corrupt line is skipped and not counted; bytes that
+        aren't UTF-8 (the file was damaged outside the client) read as U+FFFD."""
         path = self._jsonl_path(source_id)
         if not path.exists():
             return [], 0
@@ -336,17 +320,13 @@ class LogCache:
                 lines = f.readlines()
         except OSError:
             return
-        # Keep the newest max_lines, then drop from the front until within the share
-        # of max_bytes a trim leaves (TRIM_TO): about a fifth of the file, in one cut
-        # (a pop from the front per line moved every line after it, each time).
-        kept = list(deque(lines, maxlen=self._max_lines))
+        # Keep the newest max_lines, then drop from the front until within bytes.
+        kept = deque(lines, maxlen=self._max_lines)
         budget = int(self._max_bytes * self.TRIM_TO)
         total = sum(len(s.encode("utf-8")) for s in kept)
-        start = 0
-        while start < len(kept) and total > budget:
-            total -= len(kept[start].encode("utf-8"))
-            start += 1
-        kept = kept[start:]
+        while kept and total > budget:
+            total -= len(kept[0].encode("utf-8"))
+            kept.popleft()
         # The cursor is intentionally NOT touched: history is bounded but the
         # resume position is preserved, so reopen still delta-fetches correctly.
         _atomic_write_text(path, "".join(kept))
@@ -417,7 +397,7 @@ def _note_persist_error(exc: BaseException) -> None:
         return
     _persist_warned = True
     try:
-        with open(error_log_path(), "a", encoding="utf-8") as f:
+        with open(_ERROR_LOG, "a", encoding="utf-8") as f:
             f.write("log cache persistence disabled (%s: %s)\n" % (type(exc).__name__, exc))
     except OSError:
         pass
@@ -520,8 +500,6 @@ def cached_pages(
     max_interval: float = _POLL_MAX_INTERVAL,
     restart: Optional[Callable[[int], dict]] = None,
     can_restart: Optional[Callable[[], bool]] = None,
-    stall_seconds: Optional[float] = None,
-    stall_polls: Optional[int] = None,
     clock: Callable[[], float] = time.monotonic,
     tail_window: Optional[int] = None,
 ) -> Iterator[Tuple[str, list]]:
@@ -564,9 +542,8 @@ def cached_pages(
     stall.
 
     With ``restart`` (following only), a tail whose pages have been empty and
-    whose cursor has not moved for ``stall_seconds`` and at least
-    ``stall_polls`` polls (default ``STALL_SECONDS`` and ``STALL_POLLS``)
-    calls ``restart(n)`` for a fresh page of the log's last ``n`` lines. The
+    whose cursor has not moved for ``STALL_SECONDS`` and at least ``STALL_POLLS``
+    polls calls ``restart(n)`` for a fresh page of the log's last ``n`` lines. The
     stall clock runs only while there is a cursor (a fetch without one tails
     the log's end anyway) and ``can_restart()`` is true. When that page has
     entries not yielded yet, the cursor is read once more: if it still brings
@@ -581,8 +558,6 @@ def cached_pages(
     held = hold or (lambda: False)
     restarting = restart is not None and live and follow
     seen = _RecentKeys(_RECENT_KEYS) if restarting else None
-    stall_seconds = STALL_SECONDS if stall_seconds is None else stall_seconds
-    stall_polls = STALL_POLLS if stall_polls is None else stall_polls
 
     cached, total = cache.load_newest(source_id, limit=replay_limit)
     cursor = cache.get_cursor(source_id)
@@ -618,7 +593,7 @@ def cached_pages(
                 # Not a stall: without a cursor each fetch tails the log's end,
                 # and a job that isn't running yet isn't stuck behind a line.
                 still_since, empty_polls = clock(), 0
-            elif empty_polls >= stall_polls and clock() - still_since >= stall_seconds:
+            elif empty_polls >= STALL_POLLS and clock() - still_since >= STALL_SECONDS:
                 still_since, empty_polls = clock(), 0
                 end = restart(RESTART_LINES[window])
                 fresh = seen.unseen(end.get(entries_key) or [])
@@ -627,9 +602,6 @@ def cached_pages(
                     window = min(window + 1, len(RESTART_LINES) - 1)
                     sleep(delay)
                     continue
-                # The log's end has lines this tail hasn't shown. Lines that only
-                # just arrived come from the cursor, in order; a stuck cursor
-                # still brings nothing.
                 page = fetch(cursor)
                 if not page.get(entries_key) and page.get("next_cursor", cursor) == cursor:
                     window = 0
@@ -675,10 +647,6 @@ def cached_pages(
         new_cursor = page.get("next_cursor", cursor)
         entries = page.get(entries_key) or []
         if counted is not None:
-            # The window comes oldest first, a page at a time. A page that
-            # isn't full reached the end of the log as it was then, so the
-            # window is in; the lines a busy log writes after the window was
-            # cut come on pages after that one, and aren't counted.
             counted += len(entries)
             if counted >= (tail_window or 0):
                 counted = None
@@ -706,9 +674,9 @@ def cached_pages(
             # Throttle floor: even when the source is busy, wait at least
             # poll_interval before the next request. Biases toward server
             # reliability over log freshness — caps the rate at ~1 req/s per
-            # source per viewer regardless of how chatty the source is. A
-            # full page means the log runs ahead of the tail: catch up at a
-            # few reads a second, so the view doesn't fall further behind.
+            # source per viewer regardless of how chatty the source is.
+            # A full page means the log runs ahead of the tail: catch up at
+            # a few reads a second, so the view doesn't fall further behind.
             delay = poll_interval
             behind = catching_up(entries)
             sleep(min(delay, CATCH_UP_SECONDS) if behind else delay)
@@ -752,12 +720,12 @@ def cached_log_pages(
     """``cached_pages`` wired to ``client.tail_logs`` for a sub-job's logs. The
     cache is keyed by ``sub_job_id``.
 
-    A fetch without a cursor (first open, or an empty cursor saved while the
-    job was placing) tails the last ``tail_lines`` lines via ``max_lines``: an
-    empty cursor without ``max_lines`` reads the whole pod log from the start,
-    and a long-running job can have hours of backlog, a slow, heavy catch-up
-    storm on the server. Reopens resume from the saved cursor (delta-only), so
-    ``max_lines`` is sent only while there is no cursor.
+    First open (no cached cursor) tails the last ``tail_lines`` lines via
+    ``max_lines`` instead of streaming the whole pod log from the beginning — a
+    long-running job can have hours of backlog, and reading it all is a slow,
+    heavy catch-up storm on the server. Reopens resume from the saved
+    cursor (delta-only), so ``max_lines`` is sent only while there is no cursor:
+    an empty cursor (saved while the job was placing) counts as none.
 
     ``can_restart`` turns on the stuck-tail restart (see ``cached_pages``):
     while it returns true, a tail that stopped moving is restarted from the

@@ -36,24 +36,16 @@ from typing import Optional
 import requests
 from rich.cells import cell_len
 
-from cortex_training.tui.format import ACTIVE_STATUSES
-from cortex_training.tui.format import compact_number
+from cortex_training.tui.format import _ACTIVE_STATUSES as ACTIVE_STATUSES
+from cortex_training.tui.format import _num as compact_number
 from cortex_training.tui.format import cut_cells
-from cortex_training.tui.format import subjob_config
-from cortex_training.tui.format import local_time
+from cortex_training.tui.format import _subjob_config as subjob_config
+from cortex_training.tui.format import format_created_at
 from cortex_training.tui.format import parse_ts  # noqa: F401 - views.parse_ts for the screens
 from cortex_training.tui.format import printable
 from cortex_training.tui.format import source_label
 
 RETENTION_DAYS = 183  # six months of job history
-
-# ─── time ────────────────────────────────────────────────────────────────────
-
-
-def fmt_ts(raw: Any) -> str:
-    """A timestamp as local ``YYYY-MM-DD HH:MM``; ``—`` when missing, unparseable or out of range."""
-    dt = raw if isinstance(raw, datetime) else parse_ts(raw)
-    return (local_time(dt) if dt else "") or "—"
 
 
 def fmt_duration(seconds: Optional[float]) -> str:
@@ -78,11 +70,7 @@ CLOCK_SKEW_SECONDS = 300
 
 
 def fmt_ago(raw: Any, now: datetime) -> str:
-    """How long before ``now`` the time ``raw`` was, e.g. ``4m 05s ago``; ``—`` without one.
-
-    A time slightly ahead of ``now`` (clock skew) is ``just now``; one further
-    ahead says how far it is ahead of this computer's clock.
-    """
+    """How long before ``now`` the time ``raw`` was, e.g. ``4m 05s ago``; ``—`` without one."""
     dt = raw if isinstance(raw, datetime) else parse_ts(raw)
     if not dt:
         return "—"
@@ -92,9 +80,6 @@ def fmt_ago(raw: Any, now: datetime) -> str:
             return "just now"
         return f"{fmt_duration(-seconds)} ahead of this computer's clock"
     return f"{fmt_duration(seconds)} ago"
-
-
-# ─── job fields ──────────────────────────────────────────────────────────────
 
 
 def status_word(status: Any) -> str:
@@ -107,9 +92,6 @@ def describe_error(exc: BaseException) -> str:
 
     requests' own text ("500 Server Error: ... for url: <full URL>") repeats the
     host, database and schema and never includes the service's explanation.
-    The message is the service's (or the stage's) text, so it is made printable
-    (:func:`collapse`) before any screen draws it. A request that timed out
-    says how long it waited ("no answer from the service within 45 s").
     """
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
@@ -146,26 +128,10 @@ def _timeout_text(exc: BaseException) -> str:
 EXPERIMENT_ACCESS_MARKER = "Linked experiment is not found or not authorized"
 _EXPERIMENT_NOT_FOUND = "Linked experiment is not found"
 _ASK = "ask for access to the Experiment, or use the role that created the job"
-# What each way of being refused means for the tabs (see experiment_access).
-_EXPERIMENT_HINTS = {
-    "denied": f"this role can't read the job's Experiment (saved logs, GPU metrics and checkpoints live there); {_ASK}",
-    "missing": ("this role can't read the job's Experiment, or it no longer exists (saved logs, GPU metrics and "
-                f"checkpoints live there); {_ASK}"),
-    # The service still lists the checkpoints: only the SQL on the Experiment is refused.
-    "sql": f"this role can't read the job's Experiment, where saved logs and GPU metrics live (the checkpoints command works); {_ASK}",
-}
 
 
-def experiment_access(exc: BaseException) -> Optional[str]:
-    """How ``exc`` says this role can't read the job's Experiment, or None.
-
-    - ``"denied"``: the service's 500 ``Linked experiment is not found or not
-      authorized ...`` (the checkpoint routes);
-    - ``"missing"``: the experiment-run route's 500 ``Linked experiment is not
-      found for job ...``: the Experiment is hidden from this role, or gone;
-    - ``"sql"``: Snowflake refusing the SQL LIST or GET on the Experiment (a
-      ``MONITOR``-only role): saved logs and GPU metrics can't be read, and the
-      service still lists the checkpoints.
+def experiment_access_hint(exc: BaseException) -> str | None:
+    """The one-line explanation when ``exc`` means this role can't read the job's Experiment, else None.
 
     The service's message is in the HTTP reply, not in ``str(exc)``, so both are
     read. A refusal about another object (a warehouse, a schema) is None even
@@ -173,19 +139,13 @@ def experiment_access(exc: BaseException) -> Optional[str]:
     """
     text = f"{exc}\n{_reply_text(exc)}"
     if EXPERIMENT_ACCESS_MARKER in text:
-        return "denied"
-    if _EXPERIMENT_NOT_FOUND in text:
-        return "missing"
-    if _EXPERIMENT_SQL_DENIED.search(text):
-        return "sql"
+        return f"this role can't read the job's Experiment (saved logs, GPU metrics and checkpoints live there); {_ASK}"
+    if _EXPERIMENT_NOT_FOUND in text:  # the experiment-run route's: hidden from this role, or gone
+        return ("this role can't read the job's Experiment, or it no longer exists (saved logs, GPU metrics and "
+                f"checkpoints live there); {_ASK}")
+    if _EXPERIMENT_SQL_DENIED.search(text):  # a MONITOR-only role: the service still lists the checkpoints
+        return f"this role can't read the job's Experiment, where saved logs and GPU metrics live (the checkpoints command works); {_ASK}"
     return None
-
-
-def experiment_access_hint(exc: BaseException) -> str | None:
-    """The one-line explanation when ``exc`` means this role can't read the job's Experiment
-    (see :func:`experiment_access`), else None."""
-    kind = experiment_access(exc)
-    return _EXPERIMENT_HINTS[kind] if kind else None
 
 
 def is_live(job: Any) -> bool:
@@ -204,9 +164,7 @@ def job_not_found(job: Any) -> bool:
     """An UNKNOWN job whose reason says the control plane has no record of it
     (``Job status unavailable: the job was not found in the Control Plane``):
     it isn't running, so it isn't live."""
-    if not (isinstance(job, dict) and status_word(job.get("status")) == "unknown"):
-        return False
-    return "not found" in " ".join(collapse(job.get(key) or "") for key in ("reason", "reason_details")).lower()
+    return is_unknown(job) and "not found" in " ".join(collapse(job.get(key) or "") for key in ("reason", "reason_details")).lower()
 
 
 def job_id_of(job: dict) -> str:
@@ -218,34 +176,19 @@ def is_unknown(job: Any) -> bool:
     return isinstance(job, dict) and status_word(job.get("status")) == "unknown"
 
 
-# ─── text ────────────────────────────────────────────────────────────────────
-
-# printable and cut_cells come from format.py, so the Logs tab draws by
-# the same rule: escape sequences are removed whole, the other characters a
-# terminal would act on, or that reorder or hide the text around them, become
-# U+FFFD, and a character keeps at most format.MAX_COMBINING_MARKS combining
-# diacritics.
-
-
 def collapse(text: Any) -> str:
     """``text`` printable on one line: each run of whitespace, newlines too, as one space."""
     return " ".join(printable(text if text is not None else "").split())
 
 
 def printable_data(value: Any) -> Any:
-    """``value`` (decoded JSON) with every string in it, dict keys too, made :func:`printable`.
-
-    Numbers, booleans and None are returned as they are. A string with nothing
-    to replace is returned as it is, so a large job list costs little.
-    """
+    """``value`` (decoded JSON) with every string in it, dict keys too, made :func:`printable`."""
     if isinstance(value, str):
         return printable(value)
     if isinstance(value, dict):
         return {printable_data(key): printable_data(item) for key, item in value.items()}
     if isinstance(value, list):
         return [printable_data(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(printable_data(item) for item in value)
     return value
 
 
@@ -297,8 +240,6 @@ def wrap_cells(line: str, width: int) -> list:
     return rows
 
 
-# ─── sub-jobs ────────────────────────────────────────────────────────────────
-
 # Sub-job type as the id's middle segment: the create-time type
 # ``log_probability`` is ``log_prob`` there.
 _ID_TYPES = {"training": "training", "sampling": "sampling", "log_probability": "log_prob", "log_prob": "log_prob"}
@@ -342,11 +283,9 @@ def sub_jobs(job: dict) -> list:
             for i, (sj, kind) in enumerate(zip(subs, kinds))]
 
 
-def sub_job_type(sj: Any) -> str:
+def sub_job_type(sj: dict) -> str:
     """A sub-job's type as the list shows it: ``training``, ``sampling`` or ``log_prob``
     (the id's spelling, as the Logs tab tags it), else the type it names, lowercase."""
-    if not isinstance(sj, dict):
-        return ""
     return sub_job_kind(sj) or str(sj.get("job_type") or sj.get("type") or "").strip().lower().removeprefix("job_type_")
 
 
@@ -561,11 +500,7 @@ def subjob_config_summary(sj: dict) -> str:
 
 
 def summary_fields(job: dict, now: datetime) -> list:
-    """(label, value) rows for the job preview, in display order.
-
-    A time the job record lacks is
-    ``—``, with no "ago" after it.
-    """
+    """(label, value) rows for the job preview, in display order."""
     models = job_models(job)
     elapsed = job_elapsed(job, now)
     # Elapsed runs from creation, so it includes any time spent queued or placing.
@@ -577,7 +512,7 @@ def summary_fields(job: dict, now: datetime) -> list:
         note = "includes queue time"
     location = location_label(job)
     # The age only beside a time that is shown: a dash has none.
-    updated, ago = fmt_ts(job.get("updated_at")), fmt_ago(job.get("updated_at"), now)
+    updated, ago = format_created_at(job.get("updated_at")) or "—", fmt_ago(job.get("updated_at"), now)
     return [
         ("Job ID", job_id_of(job)),
         *([("Location", location)] if location else []),
@@ -586,7 +521,7 @@ def summary_fields(job: dict, now: datetime) -> list:
         ("Type", job_type_label(job)),
         ("Owner", owner(job)),
         ("GPUs", gpu_request_text(job)),
-        ("Created", fmt_ts(job.get("created_at"))),
+        ("Created", format_created_at(job.get("created_at")) or "—"),
         ("Elapsed", fmt_duration(elapsed) + (f"  ({note})" if elapsed is not None else "")),
         ("Last update", f"{updated}  ({ago})" if "—" not in (updated, ago) else updated),
     ]
@@ -610,12 +545,7 @@ _UNPLACED = frozenset({"pending", "queued", "creating", "placing"})
 
 
 def never_started(job: Any) -> bool:
-    """An ended job that never got GPUs, so it has no logs to show.
-
-    It failed with a reason that says so (``placement_*``, or one of
-    :data:`PRE_START_REASONS`), or every sub-job the service lists for it is
-    still in a state before placement.
-    """
+    """An ended job that never got GPUs, so it has no logs to show (see :data:`PRE_START_REASONS`)."""
     if not isinstance(job, dict) or is_live(job):
         return False
     reason = str(job.get("reason") or "").strip().lower()
@@ -651,17 +581,10 @@ SERVICE_FIELDS = ("status", "reason", "reason_details", "updated_at", "state_cha
 
 
 def refresh_job(current: Optional[dict], fresh: dict) -> dict:
-    """``current`` (say, a list row) updated with a fresh ``get_job`` answer.
-
-    The service-owned :data:`SERVICE_FIELDS` come only from ``fresh``; other
-    fields the row had and the answer lacks (``database_name``, ``created_at``)
-    are kept.
-    """
+    """``current`` (say, a list row) updated with a fresh ``get_job`` answer (see :data:`SERVICE_FIELDS`)."""
     kept = {k: val for k, val in (current or {}).items() if k not in SERVICE_FIELDS}
     return {**kept, **fresh}
 
-
-# ─── search ──────────────────────────────────────────────────────────────────
 
 # field -> help text; the field names users type in the search box.
 SEARCH_FIELDS = {
@@ -868,11 +791,8 @@ def _location_name(job: dict, key: str, home: Optional[tuple]) -> Optional[str]:
 
 
 def field_values(job: dict, key: str, *, home: Optional[tuple] = None) -> list:
-    """All values a job carries for a search field (one per sub-job when relevant).
-
-    ``home`` is the configured ``(database_name, schema_name)``, where a row
-    that names no location of its own is.
-    """
+    """All values a job carries for a search field (one per sub-job when relevant); ``home`` as in
+    :func:`job_matches_query`."""
     if "." in key or key not in SEARCH_FIELDS:
         # A dotted path, or (after resolve_query) a member name: read it from the
         # job record, each sub-job, and each sub-job's config.
@@ -1073,8 +993,6 @@ def no_match_message(text: str, query: Query, searched: int, *, cut: str = "", o
     return "\n".join(lines)
 
 
-# ─── sorting ─────────────────────────────────────────────────────────────────
-
 SORT_KEYS = ("created", "updated", "status")
 _STATUS_ORDER = ["running", "initializing", "placing", "pending", "queued", "creating", "unknown", "failed", "done",
                  "cancelled", "terminated"]
@@ -1116,15 +1034,6 @@ def sort_job_list(jobs: Iterable[dict], key: str = "created", descending: bool =
         untimed.sort(key=lambda j: _epoch(j.get("created_at")), reverse=True)
     return [j for _at, j in timed] + untimed
 
-
-def live_first(key: str, descending: bool) -> bool:
-    """Whether the job list draws its LIVE group above HISTORY: always, but under
-    the status sort reversed (``status ↑``), whose first jobs are the
-    ended ones."""
-    return key != "status" or descending
-
-
-# ─── locations, copied commands and access ───────────────────────────────────
 
 _PLAIN_IDENTIFIER = re.compile(r"[A-Z_][A-Z0-9_$]*")
 
@@ -1188,19 +1097,10 @@ def cli_options(*, database: Optional[str] = None, schema: Optional[str] = None,
     NAME``, a profile; ``--config FILE``; ``--host HOST``, with a PAT; or
     ``--base-url URL``), then ``--database DB`` and ``--schema SCHEMA``, each
     value quoted for the shell.
-
-    The copyable commands use these, so a command copied for a job in another
-    database and schema reaches that job, not the configured location. An
-    option whose value is unknown is left out.
     """
     found = (("--connection", connection), ("--config", config), ("--host", host), ("--base-url", base_url),
              ("--database", database), ("--schema", schema))
     return [f"{flag} {shlex.quote(value)}" for flag, value in found if isinstance(value, str) and value]
-
-
-def cli_command(arguments: str, **location: Optional[str]) -> str:
-    """``cortex-training [global options] ARGUMENTS`` on one line; see :func:`cli_options`."""
-    return " ".join(["cortex-training", *cli_options(**location), arguments])
 
 
 def _reply_text(exc: BaseException) -> str:
@@ -1230,16 +1130,8 @@ _PRIVILEGE_REFUSAL = re.compile(r"privilege|not authorized|access control error"
 
 
 def access_hint(exc: BaseException, subject: str) -> Optional[str]:
-    """One line when ``exc`` means this role may not read the job's ``subject``, else None.
-
-    Every tab uses this for its own data (``subject`` is for example "saved
-    logs" or "GPU metrics"): the Logs tab and Resources explain the same
-    refusal the same way. An Experiment
-    the role can't read gets :func:`experiment_access_hint`'s line. A 403 whose
-    reply names a privilege says the role isn't allowed, keeping the service's
-    message. Anything else, an empty 403 included, is None: the caller shows the
-    standard error text.
-    """
+    """One line when ``exc`` means this role may not read the job's ``subject`` ("saved logs", "GPU
+    metrics"), else None: the caller then shows the standard error text."""
     hint = experiment_access_hint(exc)
     if hint:
         return hint

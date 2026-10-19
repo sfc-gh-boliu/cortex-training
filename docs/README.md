@@ -10,6 +10,7 @@ the Cortex Training client.
 - Training users: browse the training guides for
   [LoRA](guides/training/lora-and-qlora.md),
   [full fine-tuning](guides/training/full-finetuning.md),
+  [DPO](guides/training/dpo.md),
   [reinforcement learning](guides/training/reinforcement-learning.md) and
   [starting from your own weights](guides/training/external-weights.md), plus the
   [runnable recipes](../recipes/README.md).

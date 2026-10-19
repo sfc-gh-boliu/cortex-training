@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import re
 from collections.abc import Iterator
 from collections.abc import Mapping
@@ -345,6 +346,7 @@ def build_renderer(
     renderer_name: str | None = None,
     *,
     enable_thinking: bool | None = None,
+    tokenizer_revision: str | None = None,
 ):
     """Return ``(tokenizer, renderer, renderer_name)`` for ``model_name``.
 
@@ -355,7 +357,12 @@ def build_renderer(
     from tinker_cookbook import renderers
     from tinker_cookbook.tokenizer_utils import get_tokenizer
 
-    tokenizer = get_tokenizer(model_name)
+    if tokenizer_revision is None:
+        tokenizer = get_tokenizer(model_name)
+    else:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name, revision=tokenizer_revision)
     resolved = recommended_renderer_name(
         model_name,
         enable_thinking=enable_thinking,
@@ -577,6 +584,158 @@ def collate(
         context["advantages"] = torch.tensor(advantages, dtype=torch.float32)
 
     return kwargs, context
+
+
+def collate_preference_pairs(
+    pairs: Sequence[tuple[TrainSequence, TrainSequence]],
+    *,
+    pad_token_id: int,
+    max_seq_len: int,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Collate pairs as adjacent ``chosen, rejected`` rows."""
+    if not pairs:
+        raise ValueError("collate_preference_pairs needs at least one pair")
+    flattened: list[TrainSequence] = []
+    for index, pair in enumerate(pairs):
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise ValueError(
+                f"preference pair {index} must contain chosen and rejected"
+            )
+        chosen, rejected = pair
+        flattened.extend((chosen, rejected))
+    return collate(
+        flattened,
+        pad_token_id=pad_token_id,
+        max_seq_len=max_seq_len,
+    )
+
+
+def masked_row_logprob_sums(
+    logprobs: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return float32 per-row sums over prediction-aligned mask positions."""
+    if logprobs.ndim != 2 or tuple(loss_mask.shape) != tuple(logprobs.shape):
+        raise ValueError("logprobs and loss_mask must have the same [batch, seq] shape")
+    mask = loss_mask.to(device=logprobs.device, dtype=torch.bool)
+    if not mask.any().item():
+        raise ValueError("loss_mask must select at least one token")
+    if not torch.isfinite(logprobs[mask]).all().item():
+        raise RuntimeError("non-finite logprobs at active loss-mask positions")
+    safe = logprobs.float().masked_fill(~mask, 0.0)
+    return safe.sum(dim=-1)
+
+
+def compute_dpo_loss(
+    logprobs: torch.Tensor,
+    reference_logprob_sums: torch.Tensor,
+    loss_mask: torch.Tensor,
+    *,
+    beta: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Compute sequence-sum DPO for adjacent chosen/rejected rows."""
+    if not math.isfinite(beta) or beta <= 0:
+        raise ValueError("dpo_beta must be finite and greater than zero")
+    if logprobs.ndim != 2 or tuple(loss_mask.shape) != tuple(logprobs.shape):
+        raise ValueError("logprobs and loss_mask must have the same [batch, seq] shape")
+    if logprobs.shape[0] == 0 or logprobs.shape[0] % 2:
+        raise ValueError("DPO needs adjacent chosen/rejected rows")
+    if tuple(reference_logprob_sums.shape) != (logprobs.shape[0],):
+        raise ValueError("reference_logprob_sums must contain one value per row")
+
+    policy_sums = masked_row_logprob_sums(logprobs, loss_mask)
+    reference_f32 = reference_logprob_sums.to(
+        device=logprobs.device,
+        dtype=torch.float32,
+    )
+    if not torch.isfinite(reference_f32).all().item():
+        raise ValueError("reference_logprob_sums must be finite")
+
+    chosen_ratios = policy_sums[0::2] - reference_f32[0::2]
+    rejected_ratios = policy_sums[1::2] - reference_f32[1::2]
+    margins = beta * (chosen_ratios - rejected_ratios)
+    loss = -torch.nn.functional.logsigmoid(margins).mean()
+    metrics = {
+        "dpo/loss": float(loss.detach()),
+        "dpo/accuracy": float((margins > 0).float().mean().detach()),
+        "dpo/margin": float(margins.mean().detach()),
+        "dpo/chosen_reward": float((beta * chosen_ratios).mean().detach()),
+        "dpo/rejected_reward": float((beta * rejected_ratios).mean().detach()),
+    }
+    return loss, metrics
+
+
+def packed_cu_seqlens(kwargs: Mapping[str, torch.Tensor]) -> torch.Tensor:
+    """Build packed sequence boundaries from a padded attention mask."""
+    attention_mask = kwargs.get("attention_mask")
+    if not torch.is_tensor(attention_mask) or attention_mask.ndim != 2:
+        raise ValueError("payloads require a 2D attention_mask")
+    valid_lengths = attention_mask.to(torch.int32).sum(dim=-1)
+    return torch.nn.functional.pad(
+        torch.cumsum(valid_lengths, dim=0, dtype=torch.int32),
+        (1, 0),
+    )
+
+
+def forward_logprobs_payload(
+    kwargs: Mapping[str, torch.Tensor],
+    context: Mapping[str, torch.Tensor],
+    *,
+    pad_token_id: int,
+) -> bytes:
+    """Build a DSSST1 forward-only frame returning shifted token logprobs."""
+    labels = kwargs["input_ids"].roll(-1, dims=-1).clone()
+    labels[:, -1] = -100
+    frame = {
+        "args": (),
+        "kwargs": dict(kwargs),
+        "context": {
+            "input_ids": context["input_ids"],
+            "labels": labels,
+            "pad_token_id": int(pad_token_id),
+            "cu_seqlens": packed_cu_seqlens(kwargs),
+        },
+        "processing": {
+            "loss_fn": None,
+            "post": ["compute_logprobs"],
+            "config": {},
+        },
+    }
+    return wire.dumps(
+        frame,
+        metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}},
+    )
+
+
+def dpo_payload(kwargs, context, reference_sums, *, beta, pad_token_id) -> bytes:
+    """Submit complete preference pairs for server-side DPO and backward."""
+    rows = kwargs["input_ids"].shape[0]
+    labels = kwargs["input_ids"].roll(-1, dims=-1).clone()
+    labels[:, -1] = -100
+    frame = {
+        "args": (),
+        "kwargs": dict(kwargs),
+        "context": {
+            "input_ids": context["input_ids"],
+            "labels": labels,
+            "loss_mask": context["loss_mask"].bool(),
+            "dpo_pair_ids": torch.arange(
+                rows // 2, dtype=torch.int64
+            ).repeat_interleave(2),
+            "dpo_is_chosen": torch.arange(rows) % 2 == 0,
+            "dpo_reference_logps": reference_sums.detach().to(torch.float32),
+            "pad_token_id": int(pad_token_id),
+        },
+        "processing": {
+            "loss_fn": "dpo",
+            "post": ["compute_logprobs"],
+            "config": {"beta": beta},
+        },
+    }
+    return wire.dumps(
+        frame,
+        metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}},
+    )
 
 
 def _forward_backward_payload(

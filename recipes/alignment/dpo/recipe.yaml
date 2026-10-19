@@ -1,0 +1,22 @@
+id: dpo-one-gpu
+title: Direct Preference Optimization
+status: experimental
+task: alignment
+methods:
+  - dpo
+  - lora
+  - full
+models:
+  - Qwen/Qwen3-8B
+  - Qwen/Qwen3-0.6B
+datasets:
+  - smoke
+  - HuggingFaceH4/ultrafeedback_binarized
+  - argilla/ultrafeedback-binarized-preferences
+  - nvidia/HelpSteer3
+precision:
+  - bfloat16
+default_training_gpus: 1
+provenance:
+  project: tinker-cookbook
+  recipe: preference/train_dpo.py

@@ -895,3 +895,15 @@ full local/mock URL such as `http://localhost:8084` for `base_url`.
 
 For server errors, the CLI prints any Snowflake request id and response body
 returned by the service. Include those details when debugging a `500`.
+
+### DPO recipe controls
+
+Run the example with `python -m recipes.alignment.dpo.train config=...`.
+`n_train_pairs`, `epochs`, `pairs_per_batch`, and `max_steps` independently control
+sample size, exposure, global preference pairs per update, and optimizer-update
+ceiling. Use `max_steps=None` for an epoch-based run; the default is a three-step
+smoke. `dpo_beta`, `lr_schedule`, `warmup_ratio`, and `eval_every` control
+the objective, learning-rate schedule, and development evaluation.
+`source_job_id`/`checkpoint_id` start a new stage from compatible weights;
+`resume_state` restores the same stage including its frozen reference cache.
+See the [recipe](../../recipes/alignment/dpo/README.md) for data and job examples.

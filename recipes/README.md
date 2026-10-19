@@ -8,6 +8,7 @@ under its `configs/` directory.
 
 | Recipe | Method | Dataset | Status |
 |---|---|---|---|
+| [DPO](alignment/dpo/README.md) | LoRA preference alignment | Smoke, Argilla/H4 UltraFeedback, HelpSteer3 | Experimental |
 | [Conversational SFT](sft/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets, GSM8K, identity | Runnable |
 | [Math GRPO](rl/README.md) | Reinforcement learning | Hendrycks MATH and MATH-500 | Runnable |
 | [On-policy distillation](distillation/README.md) | Distillation from a frozen teacher | GSM8K | Runnable |
@@ -53,6 +54,7 @@ Recipes are Python modules so they can share code without path manipulation:
 python -m recipes.sft.conversational.train config=/path/to/config.json
 python -m recipes.rl.math_grpo.train config=/path/to/config.json
 python -m recipes.distillation.on_policy.train config=/path/to/config.json
+python -m recipes.alignment.dpo.train config=/path/to/config.json
 python -m recipes.inference.serve config=/path/to/config.json
 ```
 

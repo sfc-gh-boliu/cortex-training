@@ -6,7 +6,7 @@ Install the client:
 uv pip install git+https://github.com/snowflakedb/cortex-training.git
 ```
 
-If you cloned the repository (needed to run the recipes, which are not part of
+If you cloned the repository (needed to run the examples, which are not part of
 the installed package), install it in editable mode instead:
 
 ```bash

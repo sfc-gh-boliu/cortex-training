@@ -1,6 +1,6 @@
 # Weights & Biases
 
-The SFT and Math GRPO recipes can mirror their local metrics to Weights &
+The SFT and Math GRPO examples can mirror their local metrics to Weights &
 Biases. Install the client and point it at your instance:
 
 ```bash

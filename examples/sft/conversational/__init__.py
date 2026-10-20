@@ -13,4 +13,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Conversational supervised fine-tuning recipe."""
+"""Conversational supervised fine-tuning example."""

@@ -5,7 +5,7 @@
       "workflow": "sft",
       "tuningMethod": "lora",
       "summary": "Eight-GPU LoRA SFT starting point for supported dense models.",
-      "recipePath": "examples/sft/conversational/train.py",
+      "examplePath": "examples/sft/conversational/train.py",
       "evidencePaths": [
         "examples/sft/configs/qwen3_8b_lora.json"
       ],
@@ -66,7 +66,7 @@
       "workflow": "sft",
       "tuningMethod": "full",
       "summary": "Eight-GPU full-parameter SFT starting point for supported dense models.",
-      "recipePath": "examples/sft/conversational/train.py",
+      "examplePath": "examples/sft/conversational/train.py",
       "evidencePaths": [
         "examples/sft/configs/qwen3_8b_full.json"
       ],
@@ -111,7 +111,7 @@
       "workflow": "sft",
       "tuningMethod": "lora",
       "summary": "PrimeRL sequence-parallel attention-only LoRA SFT starting point for Qwen3.6-35B-A3B.",
-      "recipePath": "examples/sft/conversational/train.py",
+      "examplePath": "examples/sft/conversational/train.py",
       "evidencePaths": [
         "examples/sft/configs/qwen36_35b_a3b_lora.json"
       ],
@@ -174,7 +174,7 @@
       "workflow": "sft",
       "tuningMethod": "full",
       "summary": "PrimeRL sequence-parallel full SFT starting point for the supported Qwen MoE model.",
-      "recipePath": "examples/sft/conversational/train.py",
+      "examplePath": "examples/sft/conversational/train.py",
       "evidencePaths": [
         "examples/sft/configs/qwen36_35b_a3b_full.json"
       ],

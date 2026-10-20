@@ -1,6 +1,6 @@
 # Reinforcement Learning
 
-The [Math GRPO recipe](../../../examples/rl/README.md) is the current
+The [Math GRPO example](../../../examples/rl/README.md) is the current
 end-to-end RL example. It demonstrates:
 
 - Colocated training and sampling sub-jobs
@@ -16,4 +16,4 @@ with its trainer on a CPU driver and training and sampling in Cortex sub-jobs.
 Its GSM8K example lives in the Arctic Platform repository and has its own
 install.
 
-Additional code, tool-use, and multi-agent RL recipes are planned.
+Additional code, tool-use, and multi-agent RL examples are planned.

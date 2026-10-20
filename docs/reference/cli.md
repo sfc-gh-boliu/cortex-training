@@ -52,7 +52,7 @@ between its sub-jobs.
 
 The CLI and `CortexTrainingClient` operate on the same jobs; they are not
 alternative execution models. Use the CLI for setup, inspection, and individual
-operations. Use a Python loop or a [recipe](../../examples/README.md) for dataset
+operations. Use a Python loop or an [example](../../examples/README.md) for dataset
 iteration, batching, rewards, evaluation, and repeated calls. The client loop
 creates a job or uses an existing job ID, submits operations, and polls their
 results. `submit --wait` waits for workers to be running; it does not upload or
@@ -545,7 +545,7 @@ jobs, not sampling jobs. Resumable checkpoints are not directly loadable by the
 sampling runtime.
 
 See [Serve a Training Checkpoint](../guides/inference/serve-checkpoint.md)
-for the recipe workflow, or
+for the example workflow, or
 [Start sampling from saved weights](rest-api.md#134-start-sampling-from-saved-weights)
 for the Python save-and-create example.
 

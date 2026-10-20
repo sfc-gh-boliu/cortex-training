@@ -5,7 +5,7 @@
       "workflow": "rl",
       "tuningMethod": "lora",
       "summary": "LoRA RL starting point for Qwen3.8 with eager eight-GPU sampling.",
-      "recipePath": "examples/rl/math_grpo/train.py",
+      "examplePath": "examples/rl/math_grpo/train.py",
       "evidencePaths": [
         "examples/rl/math_grpo/train.py"
       ],
@@ -102,7 +102,7 @@
       "workflow": "sft",
       "tuningMethod": "lora",
       "summary": "PrimeRL attention-only LoRA SFT starting point for Qwen3.6-35B-A3B.",
-      "recipePath": "examples/sft/conversational/train.py",
+      "examplePath": "examples/sft/conversational/train.py",
       "evidencePaths": [
         "examples/sft/configs/qwen36_35b_a3b_lora.json"
       ],
@@ -164,7 +164,7 @@
       "workflow": "sft",
       "tuningMethod": "full",
       "summary": "PrimeRL expert-parallel full SFT starting point for the supported Qwen MoE model.",
-      "recipePath": "examples/sft/conversational/train.py",
+      "examplePath": "examples/sft/conversational/train.py",
       "evidencePaths": [
         "examples/sft/configs/qwen36_35b_a3b_full.json"
       ],
@@ -218,7 +218,7 @@
       "workflow": "rl",
       "tuningMethod": "lora",
       "summary": "PrimeRL attention-only LoRA RL starting point for Qwen3.6-35B-A3B.",
-      "recipePath": "examples/rl/math_grpo/train.py",
+      "examplePath": "examples/rl/math_grpo/train.py",
       "evidencePaths": [
         "examples/rl/configs/qwen36_35b_a3b_lora.json"
       ],
@@ -323,7 +323,7 @@
       "workflow": "rl",
       "tuningMethod": "full",
       "summary": "PrimeRL expert-parallel full RL starting point with eight training and eight sampling GPUs.",
-      "recipePath": "examples/rl/math_grpo/train.py",
+      "examplePath": "examples/rl/math_grpo/train.py",
       "evidencePaths": [
         "examples/rl/configs/qwen36_35b_a3b_full.json"
       ],

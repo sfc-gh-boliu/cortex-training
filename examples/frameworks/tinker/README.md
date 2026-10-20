@@ -28,7 +28,7 @@ export ARCTIC_CORTEX_PAT=<pat>
 
 ## Run a cookbook recipe
 
-GSM8K, with the published recipe arguments. The model is `Qwen/Qwen3.5-4B`. `--max-response-length` covers `max_tokens`.
+GSM8K, with the cookbook recipe's published arguments. The model is `Qwen/Qwen3.5-4B`. `--max-response-length` covers `max_tokens`.
 
 ```bash
 python -m arctic_platform.integrations.tinker.run \
@@ -45,7 +45,7 @@ python -m arctic_platform.integrations.tinker.run \
   max_tokens=1024
 ```
 
-Other recipes use the same launcher and their own arguments.
+Other cookbook recipes use the same launcher and their own arguments.
 
 ## Correctness
 
@@ -60,11 +60,11 @@ Published GSM8K arguments, `Qwen/Qwen3.5-4B`, 4 training GPUs and 4 sampling GPU
 | 200 | 0.958 | 0.956 | 0.964 |
 | 210 | 0.999 | 0.999 | — |
 
-## Recipe support
+## Cookbook recipe support
 
 `tinker-cookbook` 0.5.5. Supervised recipes need `eval_every=0`.
 
-| Recipe | Support |
+| Cookbook recipe | Support |
 |---|---|
 | GSM8K, MATH, DeepMath, arithmetic, Polaris | Supported |
 | rl-basic | Supported |

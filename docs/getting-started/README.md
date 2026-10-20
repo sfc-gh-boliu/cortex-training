@@ -10,6 +10,6 @@ client, and run your first training job.
    variables).
 
 After completing account setup, use the
-[recipe catalog](../../examples/README.md) to explore other training workflows
+[example index](../../examples/README.md) to explore other training workflows
 or consult the [troubleshooting reference](../reference/troubleshooting.md) if
 a command fails.

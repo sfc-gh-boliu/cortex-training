@@ -58,7 +58,7 @@ You should see your reserved GPU capacity listed. If you see zero capacity or
 an error, confirm with the Snowflake team that enablement and GPU reservation
 are complete.
 
-## Step 4: Install the Client and Recipe Dependencies
+## Step 4: Install the Client and Example Dependencies
 
 Requires Python 3.10 or later and [uv](https://docs.astral.sh/uv/) (or `pip`).
 
@@ -70,7 +70,7 @@ cd cortex-training
 uv pip install -e .
 ```
 
-Install the recipe dependency — this is required to run any recipe:
+Install the example dependency — this is required to run any example:
 
 ```bash
 uv pip install 'tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
@@ -78,7 +78,7 @@ uv pip install 'tinker-cookbook @ git+https://github.com/thinking-machines-lab/t
 
 ## Step 5: Run Your First Training Job
 
-The conversational SFT recipe fine-tunes Qwen3-8B on a one-example chat dataset
+The conversational SFT example fine-tunes Qwen3-8B on a one-example chat dataset
 ("Who trained you?" → "Snowflake AI Research"). Start with a short run:
 
 ```bash
@@ -87,7 +87,7 @@ python -m examples.sft.conversational.train \
   max_steps=10
 ```
 
-If you used `connections.toml` with a default connection, the recipe picks it
+If you used `connections.toml` with a default connection, the example picks it
 up automatically. If you used a JSON config, pass the path as `config=`.
 
 What happens during this run:
@@ -103,7 +103,7 @@ is learning.
 
 ## Step 6: Verify with Inference
 
-The recipe prints a generate command after saving the checkpoint. Run it to
+The example prints a generate command after saving the checkpoint. Run it to
 confirm the model learned the expected answer:
 
 ```bash
@@ -138,7 +138,7 @@ You have a working setup. From here:
   (`job_config=configs/qwen3_8b_lora.json`), a different model, or different
   hyperparameters
 - **Try reinforcement learning**: run the
-  [Math GRPO recipe](../../examples/rl/README.md)
-- **Explore all recipes**: browse the [recipe catalog](../../examples/README.md)
+  [Math GRPO example](../../examples/rl/README.md)
+- **Explore all examples**: browse the [example index](../../examples/README.md)
 - **Learn the CLI**: see the [CLI reference](../reference/cli.md) for all
   available commands

@@ -14,5 +14,5 @@ the page that covers it and name what is missing. Do not present unvalidated
 model support, hardware requirements, or expected metrics as guarantees.
 
 Use relative links. When you document a default, a flag, or a field, check it
-against the code in the same change -- the recipe `Config` classes for
+against the code in the same change -- the example `Config` classes for
 `name=value` overrides, `src/cortex_training/` for client behavior.

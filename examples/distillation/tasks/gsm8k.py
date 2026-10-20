@@ -1,4 +1,4 @@
-"""GSM8K dataset, prompting, and answer grading for distillation recipes."""
+"""GSM8K dataset, prompting, and answer grading for the distillation example."""
 
 from __future__ import annotations
 

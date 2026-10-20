@@ -96,6 +96,6 @@ restarted from one.
 ## More detail
 
 The
-[recipe README](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/main/recipes/rl/skyrl/simple_gsm8k_cortex/README.md)
-covers hyperparameters, the flags that differ from the on-prem sibling recipe,
+[example's README](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/main/recipes/rl/skyrl/simple_gsm8k_cortex/README.md)
+covers hyperparameters, the flags that differ from its on-prem `simple_gsm8k` sibling,
 and troubleshooting.

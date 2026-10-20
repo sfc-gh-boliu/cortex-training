@@ -1,12 +1,12 @@
 # Math GRPO
 
 Train a model with grouped policy optimization on Hendrycks MATH and evaluate
-against MATH-500. The recipe creates colocated training and sampling sub-jobs,
+against MATH-500. The example creates colocated training and sampling sub-jobs,
 generates rollouts, scores them, trains, and synchronizes weights. After the
 final save it logs a `python -m examples.inference.evaluate` command.
 The example lives in `math_grpo/`: its entry point `train.py`, its MATH
 prompting, scoring and evaluation in `task.py`, and its metadata in
-`recipe.yaml`. The entry point calls the shared GRPO loop in `runner.py`.
+`example.yaml`. The entry point calls the shared GRPO loop in `runner.py`.
 
 ## Hardware
 
@@ -78,10 +78,10 @@ to Snowflake experiment tracking after
 `uv pip install "snowflake-ml-python>=1.19.0"`.
 
 `weight_sync_bucket_size` optionally overrides the transfer-bucket size in
-bytes. When omitted, the recipe leaves the field out and uses the server
+bytes. When omitted, the example leaves the field out and uses the server
 default. Set it above the largest individual model tensor.
 
-The recipe loads one create-job body with colocated sampling and training
+The example loads one create-job body with colocated sampling and training
 sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
 
 ```json
@@ -188,7 +188,7 @@ same settings can be written inside `training_config`, in place of the
 "model_options": {"lm_head": {"token_chunk_size": 8192, "cross_entropy": false}}
 ```
 
-The Qwen3.6-35B-A3B RL and SFT recipe configs, `examples/api/training.json`,
+The Qwen3.6-35B-A3B RL and SFT example configs, `examples/api/training.json`,
 `examples/api/rl.json` and the `rl` and `standard-context` model-catalog
 profiles still use the `prime_rl` block, which older servers need.
 
@@ -237,7 +237,7 @@ a Snowflake experiment; results are viewable in Snowsight under
 **AI & ML > Experiments**. See the
 [Snowflake ML Experiments docs](https://docs.snowflake.com/en/developer-guide/snowflake-ml/experiments).
 
-After save, the recipe prints one eval command.
+After save, the example prints one eval command.
 `examples.inference.evaluate` uses the same few-shot prompt, grader, and
 decoding settings.
 

@@ -37,7 +37,7 @@ parameter (the server defaults to H200). Pass `hardware=` to scope it.
 
 ## Set it on create
 
-JSON body (also how recipes submit — add the field next to `sub_job_configs`):
+JSON body (also how the examples submit — add the field next to `sub_job_configs`):
 
 ```json
 {

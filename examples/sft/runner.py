@@ -20,7 +20,7 @@ from examples.utils import load_job_body
 from examples.utils import log_saved_checkpoints
 from examples.utils import make_client
 from examples.utils import running_job
-from examples.utils import save_recipe_checkpoints
+from examples.utils import save_example_checkpoints
 
 from cortex_training.client import DEBUG_OPTIONS_ENV
 
@@ -29,8 +29,8 @@ logging.getLogger("httpx").setLevel(logging.WARN)
 logging.getLogger("urllib3").setLevel(logging.WARN)
 logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
 
-_RECIPE_DIR = Path(__file__).resolve().parent
-_CONFIG_SEARCH_DIRS = (_RECIPE_DIR, _RECIPE_DIR / "configs")
+_EXAMPLE_DIR = Path(__file__).resolve().parent
+_CONFIG_SEARCH_DIRS = (_EXAMPLE_DIR, _EXAMPLE_DIR / "configs")
 
 
 class Config(Protocol):
@@ -175,7 +175,7 @@ def train(config: Config, task: Task) -> dict[str, Any]:
             )
             ml_logger.log_metrics(metrics=metrics, step=step)
 
-        saved = save_recipe_checkpoints(client, job_id)
+        saved = save_example_checkpoints(client, job_id)
         sample_prompt = task.sample_prompt()
         log_saved_checkpoints(
             config_path=config.config,

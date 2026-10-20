@@ -1,0 +1,28 @@
+{
+  "_comment": "Applied to every distillation student on top of the model catalog. Sizes the student to the shipped single-GPU footprint (one training and one sampling GPU, batch 1) and restores mb_spec packing, ZeRO reduce_scatter and the huggingface model provider. The \"_comment\" key is ignored and never reaches the job body.",
+  "sub_job_configs": [
+    {
+      "job_type": "training",
+      "training_config": {
+        "n_gpus": 1,
+        "train_batch_size": 1,
+        "model_provider": "huggingface",
+        "mb_spec": {
+          "max_tokens_per_mb": 10240
+        },
+        "ds_config": {
+          "train_batch_size": 1,
+          "zero_optimization": {
+            "reduce_scatter": true
+          }
+        }
+      }
+    },
+    {
+      "job_type": "sampling",
+      "inference_config": {
+        "n_gpus": 1
+      }
+    }
+  ]
+}

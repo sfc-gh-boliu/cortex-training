@@ -1,10 +1,10 @@
 # Run a Quick SFT Job
 
-The conversational SFT recipe is the current shortest end-to-end training path.
+The conversational SFT example is the current shortest end-to-end training path.
 It creates a training job, loads a chat dataset, submits forward/backward
 batches, applies optimizer steps, and cancels the job when complete.
 
-Install the recipe dependency:
+Install the example dependency:
 
 ```bash
 uv pip install 'tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
@@ -30,9 +30,9 @@ pass a different one with `job_config=`, for example
 [GPU hardware](../concepts/hardware.md).
 
 For a longer run, dataset changes, dense training, and MoE configuration, see
-the [conversational SFT recipe](../../examples/sft/README.md).
+the [conversational SFT example](../../examples/sft/README.md).
 
 There is no packaged before/after evaluation workflow yet. To confirm the run
 worked, check that `train_mean_nll` and `test/nll` fall over a longer run, then
-run the sampling command the recipe prints after it saves its checkpoint -- on
+run the sampling command the example prints after it saves its checkpoint -- on
 the default memorize task the answer should be `Snowflake AI Research`.

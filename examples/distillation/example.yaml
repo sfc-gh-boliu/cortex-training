@@ -3,6 +3,7 @@ title: On-policy distillation
 status: runnable
 task: distillation
 methods:
+  - lora
   - full-parameter
 models:
   - Qwen/Qwen3-0.6B

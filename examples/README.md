@@ -1,12 +1,12 @@
-# Cortex Training Recipes
+# Cortex Training Examples
 
-Recipes are runnable, end-to-end workflows organized by task. Each recipe owns
+Examples are runnable, end-to-end workflows organized by task. Each example owns
 its code, documentation, metadata, optional notebooks, and the JSON job configs
 under its `configs/` directory.
 
-## Available Recipes
+## Available Examples
 
-| Recipe | Method | Dataset | Status |
+| Example | Method | Dataset | Status |
 |---|---|---|---|
 | [Conversational SFT](sft/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets, GSM8K, identity | Runnable |
 | [Math GRPO](rl/README.md) | Reinforcement learning | Hendrycks MATH and MATH-500 | Runnable |
@@ -23,7 +23,7 @@ outside frameworks such as SkyRL and tinker-cookbook.
 
 ## Prerequisites
 
-Install the client and recipe dependencies from the repository root:
+Install the client and example dependencies from the repository root:
 
 ```bash
 uv pip install -e .
@@ -50,9 +50,9 @@ To log the same metrics to Snowflake experiment tracking, pass
 **AI & ML > Experiments**. See the
 [Snowflake ML Experiments docs](https://docs.snowflake.com/en/developer-guide/snowflake-ml/experiments).
 
-## Running Recipes
+## Running Examples
 
-Recipes are Python modules so they can share code without path manipulation:
+Examples are Python modules so they can share code without path manipulation:
 
 ```bash
 python -m examples.sft.conversational.train config=/path/to/config.json
@@ -61,23 +61,23 @@ python -m examples.distillation.on_policy.train config=/path/to/config.json
 python -m examples.inference.serve config=/path/to/config.json
 ```
 
-`config=` is the Snowflake PAT/connection file. See each recipe README for
+`config=` is the Snowflake PAT/connection file. See each example README for
 hardware, expected metrics, common variations, and the JSON job configs
 loaded from `configs/` (SFT and GRPO examples, plus inference configs for
 every catalog model).
 
-## Recipe Contract
+## Example Contract
 
-Every runnable recipe should provide:
+Every runnable example should provide:
 
 - A README with outcome, prerequisites, hardware, commands, expected results,
   CLI knobs, JSON job configs, evaluation, and troubleshooting
-- `recipe.yaml` metadata used by the compatibility catalog
+- `example.yaml` metadata used by the compatibility catalog
 - A runnable entry point
-- `last_validated` in `recipe.yaml`: the date of the last verified run, or `null`
-  when the recipe has not been validated since it last changed
+- `last_validated` in `example.yaml`: the date of the last verified run, or `null`
+  when the example has not been validated since it last changed
 - Tests for local validation logic where practical
 - Attribution when adapted from an upstream cookbook or framework
 
-See [the recipe template](../docs/contributing/recipe-template.md) before adding
+See [the example template](../docs/contributing/example-template.md) before adding
 a new workflow.

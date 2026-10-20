@@ -1,10 +1,10 @@
-# Recipe Template
+# Example Template
 
-Each recipe directory should contain:
+Each example directory should contain:
 
 ```text
 README.md
-recipe.yaml
+example.yaml
 train.py, evaluate.py, or another clear entry point
 configs/
 optional notebook.ipynb
@@ -23,5 +23,5 @@ The README should cover:
 9. Troubleshooting
 10. Provenance and last validation date
 
-The metadata should be machine-readable so model compatibility and recipe
+The metadata should be machine-readable so model compatibility and example
 catalog pages can eventually be generated.

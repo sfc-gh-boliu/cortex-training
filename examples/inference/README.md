@@ -24,7 +24,7 @@ python -m examples.inference.serve \
   config=/path/to/config.json
 ```
 
-From a weights-only checkpoint produced by a training recipe. Pass
+From a weights-only checkpoint produced by a training example. Pass
 `source_job_id` and `checkpoint_id` together, and the matching example JSON:
 
 ```bash
@@ -47,7 +47,7 @@ with the Python client.
 
 ## Job config JSON
 
-The recipe loads one create-job body with a single sampling sub-job. Pass a
+The example loads one create-job body with a single sampling sub-job. Pass a
 shipped example or a copy with `job_config=JOB_CONFIG`.
 
 ```json

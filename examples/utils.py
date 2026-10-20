@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Cortex Training recipe helpers."""
+"""Shared helpers for the Cortex Training examples."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ LORA_TARGET_MODULES = (
 
 
 def load_connection_mapping(config_path: str) -> dict[str, Any]:
-    """Load a recipe connection file (PAT host, database, schema)."""
+    """Load an example connection file (PAT host, database, schema)."""
     parsed = json.loads(Path(config_path).expanduser().read_text(encoding="utf-8"))
     if not isinstance(parsed, dict):
         raise ValueError(f"connection config {config_path} must be a JSON object")
@@ -157,7 +157,7 @@ def save_checkpoint(
     return result
 
 
-def save_recipe_checkpoints(client: CortexTrainingClient, job_id: str) -> dict[str, dict[str, Any]]:
+def save_example_checkpoints(client: CortexTrainingClient, job_id: str) -> dict[str, dict[str, Any]]:
     """Save a weights-only checkpoint (HF tree, plus LoRA adapters under default/)."""
     weights = save_checkpoint(client, job_id, checkpoint_type="weights-only")
     return {"weights-only": weights}
@@ -349,7 +349,7 @@ def build_renderer(
     """Return ``(tokenizer, renderer, renderer_name)`` for ``model_name``.
 
     Uses :func:`recommended_renderer_name` unless ``renderer_name`` is given.
-    These recipe helpers only cover models tinker lists; Cortex Training itself can
+    These example helpers only cover models tinker lists; Cortex Training itself can
     host more.
     """
     from tinker_cookbook import renderers

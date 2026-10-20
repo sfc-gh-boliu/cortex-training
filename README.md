@@ -9,11 +9,11 @@
 
 </div>
 
-Cortex Training is Snowflake's serverless platform for post-training open-weight LLMs on managed GPU clusters. This repository contains the Python SDK, CLI, and ready-to-run recipes, powered by the open-source [Arctic Platform](https://github.com/Snowflake-AI-Research/Arctic-Platform) engine. Run reinforcement learning, supervised fine-tuning, and inference serving, no GPU infrastructure to manage.
+Cortex Training is Snowflake's serverless platform for post-training open-weight LLMs on managed GPU clusters. This repository contains the Python SDK, CLI, and ready-to-run examples, powered by the open-source [Arctic Platform](https://github.com/Snowflake-AI-Research/Arctic-Platform) engine. Run reinforcement learning, supervised fine-tuning, and inference serving, no GPU infrastructure to manage.
 
 ## Getting Started
 
-1. **Clone and install** — this gives you the SDK, CLI, and all recipes:
+1. **Clone and install** — this gives you the SDK, CLI, and all examples:
    ```bash
    git clone https://github.com/snowflakedb/cortex-training.git
    cd cortex-training
@@ -22,7 +22,7 @@ Cortex Training is Snowflake's serverless platform for post-training open-weight
    uv pip install -e .
    ```
    Alternatively, `uv pip install cortex-training` installs the SDK and CLI
-   without recipes.
+   without the examples.
 2. **Get access** — you need a Snowflake account with Cortex Training enabled.
    See [account setup](docs/getting-started/account_setup.md) for the full
    walkthrough and [authentication](docs/getting-started/authentication.md) for
@@ -36,9 +36,9 @@ Cortex Training is Snowflake's serverless platform for post-training open-weight
 
 ## Quick Example
 
-### **Quick Start Recipe** (recommended)
+### **Quick Start Example** (recommended)
 
-Fine-tune a chat model in one command using our built-in recipes:
+Fine-tune a chat model in one command using the built-in examples:
 
 ```bash
 python -m examples.sft.conversational.train \
@@ -47,11 +47,11 @@ python -m examples.sft.conversational.train \
 ```
 
 This runs supervised fine-tuning on Qwen3-8B with the default config. See the
-[Conversational SFT recipe](examples/sft/README.md) for all options.
+[Conversational SFT example](examples/sft/README.md) for all options.
 
 ### **CLI Mode**
 
-Recipes are built from step-level CLI primitives. Use them directly for full control over each training step:
+The examples are built from step-level CLI primitives. Use them directly for full control over each training step:
 
 ```bash
 cortex-training submit job.json          # create a job
@@ -65,15 +65,15 @@ See the [CLI reference](docs/reference/cli.md) for the full command set. To use
 an existing RL framework like SkyRL, see
 [framework examples](examples/frameworks/README.md).
 
-## Recipes
+## Examples
 
-Recipes are end-to-end post-training and inference workflows you can run out of the box or customize. Each includes a Python entry point, configuration files, and a README with expected results. For detailed instructions on running a recipe or building a customized workflow, see the guides below:
+Examples are end-to-end post-training and inference workflows you can run out of the box or customize. Each includes a Python entry point, configuration files, and a README with expected results. For detailed instructions on running an example or building a customized workflow, see the guides below:
 
 - **[Conversational SFT](examples/sft/README.md)**: supervised fine-tuning on chat datasets with LoRA or full-parameter training.
 - **[Math GRPO](examples/rl/README.md)**: reinforcement learning for mathematical reasoning with verifiable rewards.
 - **[Inference](examples/inference/README.md)**: serve a model or checkpoint, generate responses, and evaluate.
 
-Browse the [recipe index](examples/README.md) for all workflows.
+Browse the [example index](examples/README.md) for all workflows.
 
 ## Documentation
 
@@ -87,5 +87,5 @@ Browse the [recipe index](examples/README.md) for all workflows.
 
 ## Development
 
-- **Contributing to the client or recipes** — see the [contributing guides](docs/contributing/) for documentation guidelines, recipe templates, and development setup.
+- **Contributing to the client or examples** — see the [contributing guides](docs/contributing/) for documentation guidelines, example templates, and development setup.
 - **Building a distributable package** — see [build instructions](build_wheel.sh).

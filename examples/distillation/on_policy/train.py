@@ -1,13 +1,17 @@
 """GSM8K entrypoint for the shared on-policy distillation runner."""
 
 import chz
+from examples.utils import DEFAULT_DISTILLATION_CONTEXT
+from examples.utils import DEFAULT_DISTILLATION_STUDENT
+from examples.utils import DEFAULT_DISTILLATION_STUDENT_MAX_SEQ_LEN
+from examples.utils import DEFAULT_DISTILLATION_TEACHER
+from examples.utils import DEFAULT_DISTILLATION_TEACHER_MAX_SEQ_LEN
 from examples.distillation.tasks.gsm8k import BOXED_INSTRUCTION
 from examples.distillation.tasks.gsm8k import GSM8KProblems
 from examples.distillation.tasks.gsm8k import GSM8KTask
 from examples.distillation.tasks.gsm8k import extract_answer
 from examples.distillation.tasks.gsm8k import is_correct
 from examples.distillation.tasks.gsm8k import load_gsm8k
-from examples.distillation.train import _train
 from examples.distillation.train import job_bodies
 from examples.distillation.train import lr_at
 from examples.distillation.train import processing_block
@@ -20,8 +24,20 @@ class Config:
     config: str
     job_id: str | None = None
     teacher_job_id: str | None = None
-    job_config: str = "configs/qwen3_0p6b_student.json"
-    teacher_job_config: str = "configs/qwen3_8b_teacher.json"
+
+    # The jobs come from model-catalog/models/; job_config=/teacher_job_config=
+    # replace a body with a file. The small default (student 2048, teacher 4096)
+    # keeps the teacher window above the student's and stays cheap to run.
+    student: str = DEFAULT_DISTILLATION_STUDENT
+    teacher: str = DEFAULT_DISTILLATION_TEACHER
+    context: str = DEFAULT_DISTILLATION_CONTEXT
+    teacher_context: str | None = None
+    hardware: str = "h200"
+    lora: bool = False
+    student_max_seq_len: int | None = DEFAULT_DISTILLATION_STUDENT_MAX_SEQ_LEN
+    teacher_max_seq_len: int | None = DEFAULT_DISTILLATION_TEACHER_MAX_SEQ_LEN
+    job_config: str | None = None
+    teacher_job_config: str | None = None
     renderer_name: str | None = "qwen3_disable_thinking"
 
     problems_per_batch: int = 16
@@ -68,7 +84,6 @@ __all__ = [
     "Config",
     "GSM8KProblems",
     "GSM8KTask",
-    "_train",
     "extract_answer",
     "is_correct",
     "job_bodies",

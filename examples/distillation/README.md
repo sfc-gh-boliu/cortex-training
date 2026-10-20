@@ -9,7 +9,7 @@ in 100 steps.
 
 ## How it works
 
-The recipe creates two jobs:
+The example creates two jobs:
 
 - **Student**: a training sub-job and a sampling sub-job of the same model.
   The sampling sub-job generates rollouts, and weight sync copies each update
@@ -43,18 +43,18 @@ clipped and the learning rate decayed.
 
 Every teacher result is checked before training: a missing, mis-sized,
 misaligned, or non-finite score raises an error. After each forward-backward
-pass, and before the optimizer step, the recipe also checks that the server's
+pass, and before the optimizer step, the example also checks that the server's
 teacher term covered exactly the tokens the teacher scored.
-The student and teacher must share a tokenizer; the recipe checks this before
+The student and teacher must share a tokenizer; the example checks this before
 creating any job.
 
-The recipe does not send `old_log_probs_shifted`, so the server uses the
+The example does not send `old_log_probs_shifted`, so the server uses the
 current, detached student log probabilities. Each update is fully on-policy
 and `eps_clip` has no effect.
 
 ## Prerequisites
 
-Install the client and recipe dependencies as described in
+Install the client and example dependencies as described in
 [examples/README.md](../README.md#prerequisites), and create a connection file
 from `docs/getting-started/connection.json.template`. The student and teacher models
 are both in the [model catalog](../../docs/reference/model-compatibility.md).
@@ -96,7 +96,7 @@ jobs are cancelled when the run ends, after the final checkpoint is saved.
 Validated on H200s with the default configuration. Accuracy is greedy, on the
 full GSM8K test split, evaluated every 10 steps. The first row is a run of this
 entry point; the other three are earlier runs of the same configuration, before
-it was packaged as a recipe, with data seeds `0`, `1`, and `2`.
+it was packaged as an example, with data seeds `0`, `1`, and `2`.
 
 | Run | Step 0 | Mean of steps 50–100 | Step 100 | Best validation step (test accuracy there) |
 |---|---|---|---|---|
@@ -161,7 +161,7 @@ python -m examples.distillation.on_policy.train \
 ## Checkpoint and Evaluation
 
 The run saves a weights-only checkpoint of the student and logs its
-`checkpoint_id`. Serve it with the inference recipe and the sampling-only
+`checkpoint_id`. Serve it with the inference example and the sampling-only
 config shipped here:
 
 ```bash
@@ -174,7 +174,7 @@ python -m examples.inference.serve \
 
 `examples.inference.evaluate task=gsm8k` uses a different prompt and answer
 format (the bare question, graded on `#### n` or the last number), so its
-numbers are not comparable with the accuracy this recipe reports.
+numbers are not comparable with the accuracy this example reports.
 
 ## Troubleshooting
 
@@ -195,4 +195,4 @@ numbers are not comparable with the accuracy this recipe reports.
 Adapted from tinker-cookbook's on-policy distillation
 (`tinker_cookbook/distillation/train_on_policy.py`) and Thinking Machines'
 [On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/).
-The `last_validated` date in `recipe.yaml` records the most recent verified run.
+The `last_validated` date in `example.yaml` records the most recent verified run.

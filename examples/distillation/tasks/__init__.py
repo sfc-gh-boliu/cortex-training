@@ -1,1 +1,1 @@
-"""Task adapters for distillation recipes."""
+"""Task adapters for the distillation example."""

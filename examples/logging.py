@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unified training-metrics logging for Cortex Training recipes."""
+"""Unified training-metrics logging for the Cortex Training examples."""
 
 from __future__ import annotations
 

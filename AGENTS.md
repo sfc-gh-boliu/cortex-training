@@ -41,4 +41,4 @@ The reference documents in this repository are the contract to code against:
   than only checking `isinstance(payload, bytes)`, which any encoding satisfies.
 - When you change a default, a flag, or a field, update the docs that quote it in
   the same change: `docs/reference/cli.md`, `docs/reference/rest-api.md`, and the
-  recipe READMEs plus `recipe.yaml`.
+  example READMEs plus `example.yaml`.

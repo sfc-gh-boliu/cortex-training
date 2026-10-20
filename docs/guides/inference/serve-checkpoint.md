@@ -1,6 +1,6 @@
 # Serve a Training Checkpoint
 
-The [inference recipe](../../../examples/inference/README.md) creates a standalone
+The [inference example](../../../examples/inference/README.md) creates a standalone
 sampling endpoint, either from original Hugging Face weights or from a
 weights-only checkpoint produced by a training run:
 

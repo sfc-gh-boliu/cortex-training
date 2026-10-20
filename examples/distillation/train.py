@@ -15,6 +15,7 @@ and ``teacher_tau=0`` turns the teacher off for an RL-only comparison.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import math
 import os
@@ -38,8 +39,13 @@ from examples.utils import collate
 from examples.utils import forward_backward
 from examples.utils import load_job_body
 from examples.utils import make_client
+from examples.utils import same_adapter
+from examples.utils import make_config
+from examples.utils import make_distillation_config
+from examples.utils import model_slug
+from examples.utils import parallelism_errors
 from examples.utils import optimizer_step
-from examples.utils import save_recipe_checkpoints
+from examples.utils import save_example_checkpoints
 from examples.utils import sequence_from_rollout
 from examples.utils import stop_params_for
 from examples.utils import sync_weights
@@ -51,8 +57,11 @@ logging.getLogger("httpx").setLevel(logging.WARN)
 logging.getLogger("urllib3").setLevel(logging.WARN)
 logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
 
-_RECIPE_DIR = Path(__file__).resolve().parent
-_CONFIG_SEARCH_DIRS = (_RECIPE_DIR, _RECIPE_DIR / "configs")
+_EXAMPLE_DIR = Path(__file__).resolve().parent
+# Each run writes the jobs it built here (the folder is not committed).
+CONFIGS_DIR = _EXAMPLE_DIR / "configs"
+_CONFIG_SEARCH_DIRS = (_EXAMPLE_DIR, CONFIGS_DIR)
+_OVERRIDES = _EXAMPLE_DIR / "overrides.json"
 _LR_SCHEDULES = ("constant", "cosine")
 
 
@@ -60,8 +69,16 @@ class Config(Protocol):
     config: str
     job_id: str | None
     teacher_job_id: str | None
-    job_config: str
-    teacher_job_config: str
+    student: str
+    teacher: str
+    context: str
+    teacher_context: str | None
+    hardware: str
+    lora: bool
+    student_max_seq_len: int | None
+    teacher_max_seq_len: int | None
+    job_config: str | None
+    teacher_job_config: str | None
     renderer_name: str | None
     problems_per_batch: int
     group_size: int
@@ -132,25 +149,163 @@ def _with_debug(body: dict, config: Config) -> dict:
     return body
 
 
-def job_bodies(config: Config) -> tuple[dict, dict | None]:
-    """Student job body, and the teacher job body unless ``teacher_tau`` is 0."""
-    student = _with_debug(
-        load_job_body(config.job_config, search_dirs=_CONFIG_SEARCH_DIRS), config
+def _student_overrides() -> list:
+    """The example's ``overrides.json`` (the distillation student footprint), if present."""
+    return [_OVERRIDES] if _OVERRIDES.is_file() else []
+
+
+def _student_from_catalog(config: Config) -> dict:
+    """The student body (training + sampling) from the catalog, with overrides and sizing."""
+    overrides = _student_overrides()
+    if config.student_max_seq_len is not None:
+        overrides = [
+            *overrides,
+            {
+                "sub_job_configs": [
+                    {"job_type": "training", "training_config": {"max_seq_len": config.student_max_seq_len}},
+                    {"job_type": "sampling", "inference_config": {"max_seq_len": config.student_max_seq_len}},
+                ]
+            },
+        ]
+    return make_config(
+        config.student,
+        config.context,
+        hardware=config.hardware,
+        lora=config.lora,
+        rl=True,
+        overrides=overrides,
+        router_replay=False,
     )
-    if config.teacher_tau == 0:
-        return student, None
-    teacher = _with_debug(
-        load_job_body(config.teacher_job_config, search_dirs=_CONFIG_SEARCH_DIRS),
-        config,
-    )
-    if any(
-        sub.get("job_type") != "sampling"
-        for sub in teacher.get("sub_job_configs") or ()
-    ):
-        raise ValueError(
-            f"{config.teacher_job_config} must contain only sampling sub-jobs"
+
+
+def _teacher_from_catalog(config: Config) -> dict:
+    """The teacher body: the teacher's full-weights, sampling-only inference file, sized."""
+    overrides = []
+    if config.teacher_max_seq_len is not None:
+        overrides.append(
+            {"sub_job_configs": [{"job_type": "sampling", "inference_config": {"max_seq_len": config.teacher_max_seq_len}}]}
         )
-    return student, teacher
+    return make_config(
+        config.teacher,
+        config.teacher_context or config.context,
+        hardware=config.hardware,
+        inference=True,
+        overrides=overrides,
+    )
+
+
+def _check_student_body(body: dict, source: str) -> None:
+    """A student body must hold exactly one training and one sampling sub-job of one model."""
+    subs = [sub.get("job_type") for sub in body.get("sub_job_configs") or () if isinstance(sub, dict)]
+    if sorted(subs) != ["sampling", "training"]:
+        raise ValueError(
+            f"the student job ({source}) must hold exactly one training and one sampling sub-job, "
+            f"got {sorted(map(str, subs))}"
+        )
+    models = {
+        sub["job_type"]: sub.get("model_name")
+        for sub in body["sub_job_configs"]
+        if isinstance(sub, dict) and sub.get("job_type") in ("training", "sampling")
+    }
+    if models["training"] != models["sampling"]:
+        raise ValueError(
+            f"the student job ({source})'s training and sampling sub-jobs must name the same model, "
+            f"got {models['training']!r} and {models['sampling']!r}"
+        )
+
+
+def _check_teacher_body(body: dict, source: str) -> None:
+    """A teacher body must hold exactly one sampling sub-job (the runner uses only one)."""
+    subs = [sub.get("job_type") for sub in body.get("sub_job_configs") or () if isinstance(sub, dict)]
+    if subs != ["sampling"]:
+        raise ValueError(
+            f"the teacher job ({source}) must hold exactly one sampling sub-job, got {sorted(map(str, subs))}"
+        )
+
+
+def job_bodies(config: Config) -> tuple[dict, dict | None]:
+    """Student job body, and the teacher job body unless ``teacher_tau`` is 0.
+
+    By default both come from the model catalog through
+    :func:`make_distillation_config`: the student is the training and inference
+    files of ``config.student`` combined (training + sampling) with the example's
+    ``overrides.json`` applied and the window sized by ``student_max_seq_len``;
+    the teacher is ``config.teacher``'s full-weights inference file as a
+    sampling-only job, sized by ``teacher_max_seq_len``. ``job_config=`` and
+    ``teacher_job_config=`` replace a body with a file used as is; only the
+    side(s) not supplied as a file are built from the catalog, so a run that
+    brings its own teacher never needs the catalog teacher to be buildable, and
+    vice versa.
+    """
+    if config.teacher_tau == 0:
+        student = (
+            load_job_body(config.job_config, search_dirs=_CONFIG_SEARCH_DIRS)
+            if config.job_config is not None
+            else _student_from_catalog(config)
+        )
+        if config.job_config is not None:
+            _check_student_body(student, config.job_config)
+        return _with_debug(student, config), None
+
+    if config.job_config is None and config.teacher_job_config is None:
+        # Both from the catalog: make_distillation_config composes the pair and
+        # enforces the teacher window above the student's.
+        student, teacher = make_distillation_config(
+            config.student,
+            config.teacher,
+            config.context,
+            hardware=config.hardware,
+            lora=config.lora,
+            teacher_context=config.teacher_context,
+            student_max_seq_len=config.student_max_seq_len,
+            teacher_max_seq_len=config.teacher_max_seq_len,
+            overrides=_student_overrides(),
+        )
+    else:
+        # Build only the side not supplied as a file; the supplied side is used
+        # as is. The teacher-above-student check in the runner still covers both.
+        student = (
+            load_job_body(config.job_config, search_dirs=_CONFIG_SEARCH_DIRS)
+            if config.job_config is not None
+            else _student_from_catalog(config)
+        )
+        teacher = (
+            load_job_body(config.teacher_job_config, search_dirs=_CONFIG_SEARCH_DIRS)
+            if config.teacher_job_config is not None
+            else _teacher_from_catalog(config)
+        )
+    if config.job_config is not None:
+        _check_student_body(student, config.job_config)
+    _check_teacher_body(teacher, config.teacher_job_config or "built from the catalog")
+    return _with_debug(student, config), _with_debug(teacher, config)
+
+
+def write_job_records(config: Config, student_body: dict, teacher_body: dict | None) -> list[Path]:
+    """Write the jobs this run built to ``configs/``, before submitting them.
+
+    The files are this run's generated bodies -- a reproducible starting point to
+    copy, edit, and pass back with ``job_config=`` / ``teacher_job_config=``. They
+    keep any debug image tag, and the folder is gitignored, so the tag is never
+    committed. A job built from a ``job_config=`` file, or attached to with a
+    ``job_id=``, writes no record.
+    """
+    CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+    mode = "lora" if config.lora else "full"
+    written: list[Path] = []
+    if config.job_config is None and config.job_id is None:
+        path = CONFIGS_DIR / f"{model_slug(config.student)}-{config.context}-{config.hardware.lower()}-{mode}-student.json"
+        path.write_text(json.dumps(student_body, indent=2) + "\n", encoding="utf-8")
+        written.append(path)
+    if teacher_body is not None and config.teacher_job_config is None and config.teacher_job_id is None:
+        path = CONFIGS_DIR / f"{model_slug(config.teacher)}-teacher.json"
+        path.write_text(json.dumps(teacher_body, indent=2) + "\n", encoding="utf-8")
+        written.append(path)
+    if written:
+        logger.info(
+            "Wrote this run's jobs to %s; edit and pass back with job_config=/teacher_job_config=",
+            ", ".join(str(path) for path in written),
+        )
+    return written
 
 
 def processing_block(config: Config, global_batch_size: int) -> dict:
@@ -257,13 +412,40 @@ def _token_ids(result: dict) -> list[int]:
 def _train(config: Config, task: Task) -> None:
     validate_config(config)
     student_body, teacher_body = job_bodies(config)
+    write_job_records(config, student_body, teacher_body)
     training_sub = _sub_job(student_body, "training")
     sampling_sub = _sub_job(student_body, "sampling")
     training = training_sub.get("training_config") or {}
     sampling = sampling_sub.get("inference_config") or {}
+    # The single-GPU student footprint must not keep a catalog sp_size/ep_size that
+    # cannot run on its n_gpus (a non-default student, or a hand-written job_config=).
+    topology = parallelism_errors(training)
+    if topology:
+        raise ValueError(
+            "the student job's parallelism does not fit its GPU count: " + "; ".join(topology)
+        )
     peak_lr = float((training.get("optimizer") or {}).get("lr"))
-    max_seq_len = int(training.get("max_seq_len") or sampling.get("max_seq_len"))
+    # The student trains and samples the same model; a divergent window (possible
+    # with a hand-written job_config=) would let admission pass a prompt the smaller
+    # window rejects at generation, so require the two to match.
+    student_train_window = training.get("max_seq_len")
+    student_sample_window = sampling.get("max_seq_len")
+    if student_train_window != student_sample_window:
+        raise ValueError(
+            f"the student's training max_seq_len {student_train_window} and sampling max_seq_len "
+            f"{student_sample_window} must match"
+        )
+    max_seq_len = int(student_train_window or student_sample_window)
     student_model = training_sub["model_name"]
+    # Derive LoRA from the actual student body (a catalog build or a job_config=
+    # file), so weight sync copies the trained adapter with weight_format="lora"
+    # instead of the full-weight server default.
+    student_lora = bool(training.get("peft_config") or sampling.get("peft_config"))
+    if student_lora and not same_adapter(training.get("peft_config"), sampling.get("peft_config")):
+        raise ValueError(
+            "a LoRA student's training and sampling sub-jobs must carry the same peft_config "
+            "adapter, so weight sync can copy it to the sampler"
+        )
 
     tokenizer, renderer, renderer_name = build_renderer(
         student_model, renderer_name=config.renderer_name
@@ -535,7 +717,10 @@ def _train(config: Config, task: Task) -> None:
             if step_result.get("grad_norm") is not None:
                 metrics["optim/grad_norm"] = float(step_result["grad_norm"])
             sync_weights(
-                client, student_job, bucket_size=config.weight_sync_bucket_size
+                client,
+                student_job,
+                weight_format="lora" if student_lora else None,
+                bucket_size=config.weight_sync_bucket_size,
             )
 
             metrics.update(
@@ -571,7 +756,7 @@ def _train(config: Config, task: Task) -> None:
                     history[-1]["test/correct"],
                 )
 
-        saved = save_recipe_checkpoints(client, student_job)
+        saved = save_example_checkpoints(client, student_job)
         logger.info(
             "Saved weights-only checkpoint_id=%s from job %s",
             saved["weights-only"].get("checkpoint_id"),

@@ -13,4 +13,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Math GRPO recipe."""
+"""Math GRPO example."""

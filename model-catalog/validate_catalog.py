@@ -155,12 +155,12 @@ def _validate_profile_shape(profile: dict[str, Any], repo_root: Path) -> None:
                 f"profile {profile_id}: evidence path does not exist: {value}"
             )
 
-    recipe_path = profile.get("recipePath")
-    if recipe_path is not None:
-        recipe = _require_string(recipe_path, f"profile {profile_id}.recipePath")
-        if not (repo_root / recipe).is_file():
+    example_path = profile.get("examplePath")
+    if example_path is not None:
+        example = _require_string(example_path, f"profile {profile_id}.examplePath")
+        if not (repo_root / example).is_file():
             raise CatalogValidationError(
-                f"profile {profile_id}: recipe path does not exist: {recipe}"
+                f"profile {profile_id}: example path does not exist: {example}"
             )
 
     sub_jobs = profile.get("subJobs")

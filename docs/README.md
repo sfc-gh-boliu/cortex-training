@@ -12,7 +12,7 @@ the Cortex Training client.
   [full fine-tuning](guides/training/full-finetuning.md),
   [reinforcement learning](guides/training/reinforcement-learning.md) and
   [starting from your own weights](guides/training/external-weights.md), plus the
-  [runnable recipes](../examples/README.md).
+  [runnable examples](../examples/README.md).
 - Framework users: see the [framework examples](../examples/frameworks/README.md) for
   RL frameworks integrated with Cortex.
 - Operators: see [job management](guides/operations/manage-jobs.md) and

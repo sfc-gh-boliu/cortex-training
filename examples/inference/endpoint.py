@@ -32,8 +32,8 @@ from examples.utils import source_checkpoint_info
 
 logger = logging.getLogger(__name__)
 
-_RECIPE_DIR = Path(__file__).resolve().parent
-CONFIG_SEARCH_DIRS: tuple[Path, ...] = (_RECIPE_DIR, _RECIPE_DIR / "configs")
+_EXAMPLE_DIR = Path(__file__).resolve().parent
+CONFIG_SEARCH_DIRS: tuple[Path, ...] = (_EXAMPLE_DIR, _EXAMPLE_DIR / "configs")
 
 
 def inference_endpoint_body(

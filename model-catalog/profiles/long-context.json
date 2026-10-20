@@ -5,7 +5,7 @@
       "workflow": "sft",
       "tuningMethod": "lora",
       "summary": "Eight-GPU sequence-parallel LoRA SFT starting point for long-context dense models.",
-      "recipePath": "examples/sft/conversational/train.py",
+      "examplePath": "examples/sft/conversational/train.py",
       "evidencePaths": [
         "examples/sft/configs/qwen3_8b_lora.json"
       ],
@@ -67,7 +67,7 @@
       "workflow": "sft",
       "tuningMethod": "full",
       "summary": "Eight-GPU sequence-parallel full SFT starting point for long-context dense models.",
-      "recipePath": "examples/sft/conversational/train.py",
+      "examplePath": "examples/sft/conversational/train.py",
       "evidencePaths": [
         "examples/sft/configs/qwen3_8b_full.json"
       ],
@@ -113,7 +113,7 @@
       "workflow": "rl",
       "tuningMethod": "lora",
       "summary": "Sequence-parallel LoRA RL starting point with eight training and eight sampling GPUs.",
-      "recipePath": "examples/rl/math_grpo/train.py",
+      "examplePath": "examples/rl/math_grpo/train.py",
       "evidencePaths": [
         "examples/rl/configs/qwen3_8b_lora.json"
       ],
@@ -207,7 +207,7 @@
       "workflow": "rl",
       "tuningMethod": "full",
       "summary": "Sequence-parallel full RL starting point with eight training and eight sampling GPUs.",
-      "recipePath": "examples/rl/math_grpo/train.py",
+      "examplePath": "examples/rl/math_grpo/train.py",
       "evidencePaths": [
         "examples/rl/configs/qwen3_8b_full.json"
       ],

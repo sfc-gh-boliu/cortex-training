@@ -1,11 +1,11 @@
 # Training Configuration
 
-The recipes take two separate things:
+The examples take two separate things:
 
 - `config=` — the Snowflake connection file (account host, PAT, database,
   schema). See [Set up the client](../../getting-started/setup.md).
 - `job_config=` — a JSON create-job body holding the whole training
-  configuration. Each recipe ships examples under its own `configs/`
+  configuration. Each example ships job configs under its own `configs/`
   directory.
 
 Everything that shapes the run lives in the job-config JSON:
@@ -16,9 +16,9 @@ Everything that shapes the run lives in the job-config JSON:
 - Optimizer and gradient clipping (`optimizer`, `gradient_clipping`)
 - LoRA or full-parameter method (presence of `peft_config`)
 
-The remaining `name=value` command-line overrides are recipe-loop settings only
--- dataset, step count, evaluation cadence, logging and Weights & Biases. Run a
-recipe module with no arguments to see its full list, or read its `Config` class.
+The remaining `name=value` command-line overrides are example-loop settings only
+-- dataset, step count, evaluation cadence, logging and Weights & Biases. Run an
+example module with no arguments to see its full list, or read its `Config` class.
 
 The job-config object is posted as the create-job body with one exception: each
 `peft_config` it carries is validated and rewritten into its canonical form

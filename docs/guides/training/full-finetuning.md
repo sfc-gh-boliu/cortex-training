@@ -1,6 +1,6 @@
 # Full-Parameter Fine-Tuning
 
-The conversational SFT recipe trains all parameters whenever the job config has
+The conversational SFT example trains all parameters whenever the job config has
 no `peft_config` block. Its default config, `configs/qwen3_8b_full.json`, is one
 of those, so the plain command is already a full fine-tune:
 

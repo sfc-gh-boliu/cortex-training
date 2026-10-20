@@ -7,5 +7,5 @@ RL frameworks integrated with Cortex Training.
   Platform repository.
 - [Tinker](tinker/README.md): run a tinker-cookbook recipe, or the Tinker client, on Cortex.
 
-For RL using this repository's own recipes, see the
+For RL using this repository's own examples, see the
 [reinforcement learning guide](../../docs/guides/training/reinforcement-learning.md).

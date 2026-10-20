@@ -7,7 +7,7 @@ is mapped from `question`/`answer` into that same chat format. The entry point
 supports LoRA and full-parameter training, logs `train_nll`, and saves a
 weights-only checkpoint. The example lives in `conversational/`: its entry
 point `train.py`, its dataset helpers in `task.py`, its identity evaluation in
-`identity.py`, its metadata in `recipe.yaml`, and its bundled data under
+`identity.py`, its metadata in `example.yaml`, and its bundled data under
 `data/`. The entry point calls the shared SFT loop in `runner.py`.
 
 ## Hardware
@@ -51,7 +51,7 @@ python -m examples.sft.conversational.train \
   config=/path/to/config.json \
   dataset=HuggingFaceH4/ultrachat_200k dataset_split=train_sft
 
-# Grade-school math (openai/gsm8k). The recipe maps question/answer → messages.
+# Grade-school math (openai/gsm8k). The example maps question/answer → messages.
 # Train split has 7473 rows. With the 8B configs (batch 8) one epoch is 934 steps.
 python -m examples.sft.conversational.train \
   config=/path/to/config.json \
@@ -72,7 +72,7 @@ Dataset loading lives in `conversational/task.py`, not `train.py`. To add a sour
 - Hugging Face rows that need a mapper: write `*_row_to_messages` and append a `MappedHfDataset` (see GSM8K).
 - Hugging Face sets that already have `messages` (No Robots, UltraChat): pass `dataset=org/name`. No registry entry.
 
-Then list the dataset in `conversational/recipe.yaml` if it should show up in the catalog.
+Then list the dataset in `conversational/example.yaml` if it should show up in the catalog.
 
 LoRA, GPU count, batch shape, sequence length, and MoE live in the job-config
 JSON. Set `wandb_project` to log to Weights & Biases after
@@ -82,7 +82,7 @@ Set `sf_tracking=True` to log to Snowflake experiment tracking after
 
 ## Job config JSON
 
-The recipe loads one create-job body with a single training sub-job. Pass a
+The example loads one create-job body with a single training sub-job. Pass a
 shipped example or a copy with `job_config=JOB_CONFIG`.
 
 ```json
@@ -252,7 +252,7 @@ a Snowflake experiment; results are viewable in Snowsight under
 Each step logs `train_nll` (the server's `avg_loss`) and `loss_weight_sum`, the
 sum of `loss_mask` over the batch. On the default memorize task, `train_nll`
 should fall quickly and `loss_weight_sum` should stay constant from step to
-step. After save, the recipe prints one generate command. When running that
+step. After save, the example prints one generate command. When running that
 command, Assistant text should be `Snowflake AI Research`.
 
 ```bash

@@ -1,4 +1,5 @@
 {
+  "hardware": "H200",
   "sub_job_configs": [
     {
       "inference_config": {

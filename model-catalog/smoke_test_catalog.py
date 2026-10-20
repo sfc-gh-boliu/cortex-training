@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Dry-run or execute a Cortex Training catalog profile as a real job."""
+"""Dry-run or execute a Cortex Training catalog job file as a real job.
+
+The request is the catalog file itself: model-catalog/models/<slug>/<context>/
+<hw>-<kind>-<mode>.json for a training or inference job.
+"""
 
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import math
 import os
@@ -12,117 +15,51 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from validate_catalog import load_catalog
 from validate_catalog import validate_catalog
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = REPO_ROOT / "src"
+CATALOG_DIR = Path(__file__).resolve().parent / "models"
 
-PROFILE_KEYS = ("inference", "sftLora", "sftFull", "rlLora", "rlFull")
-TRAINING_PROFILE_KEYS = ("sftLora", "sftFull", "rlLora", "rlFull")
-SAMPLING_PROFILE_KEYS = ("inference", "rlLora", "rlFull")
+JOBS = ("training-lora", "training-full", "inference-lora", "inference-full")
+TRAINING_JOBS = ("training-lora", "training-full")
+SAMPLING_JOBS = ("inference-lora", "inference-full")
+CONTEXTS = ("standard", "long")
+HARDWARE = ("h200", "b200", "b300")
 DEBUG_OPTIONS_ENV = "CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS"
-TOP_LEVEL_ARGS = {
-    "global_batch_size",
-    "dtype",
-    "seed",
-    "model_post_init",
-    "source_checkpoint_info",
-}
 
 
-def _find_model(models_doc: dict[str, Any], model_id: str) -> dict[str, Any]:
-    models = models_doc.get("models", [])
-    model = next((item for item in models if item.get("modelId") == model_id), None)
-    if model is None:
+def _model_folder(catalog_dir: Path, model_id: str) -> Path:
+    folder = catalog_dir / model_id.rsplit("/", 1)[-1].lower()
+    if not (folder / "model.json").is_file():
         raise ValueError(f"unknown catalog model: {model_id}")
-    return model
+    return folder
 
 
-def _recommendation(
-    model: dict[str, Any],
-    profile_key: str,
-    *,
-    long_sequence: bool,
-) -> dict[str, Any]:
-    capabilities = model["capabilities"]
-    if profile_key == "inference":
-        recommendation = capabilities["inference"]
-        if not recommendation["supported"]:
-            raise ValueError(f"{model['modelId']} does not support inference")
-    else:
-        training = capabilities["training"]
-        if not training["supported"]:
-            raise ValueError(f"{model['modelId']} does not support training")
-        recommendation = training["profiles"][profile_key]
-    if long_sequence:
-        recommendation = recommendation.get("longSequence")
-        if recommendation is None:
-            raise ValueError(
-                f"{model['modelId']} {profile_key} has no long-sequence recommendation"
-            )
-    return recommendation
-
-
-def _build_wire_sub_job(
+def build_catalog_request(
+    catalog_dir: Path,
     model_id: str,
-    sub_job: dict[str, Any],
-    max_seq_len: int,
-) -> dict[str, Any]:
-    builder = sub_job["builder"]
-    args = copy.deepcopy(sub_job["args"])
-    args["max_seq_len"] = max_seq_len
-    extra_key = "extra_training" if builder == "training_job" else "extra_sampling"
-    config_key = "training_config" if builder == "training_job" else "inference_config"
-    job_type = (
-        "training" if builder == "training_job" else args.pop("job_type", "sampling")
-    )
-
-    wire = {
-        "job_type": job_type,
-        "model_name": model_id,
-    }
-    for key in TOP_LEVEL_ARGS:
-        if key in args:
-            wire[key] = args.pop(key)
-
-    extra = args.pop(extra_key, {})
-    for key, value in extra.items():
-        args.setdefault(key, value)
-    wire[config_key] = args
-    return wire
-
-
-def build_profile_request(
-    config_dir: Path,
-    repo_root: Path,
-    model_id: str,
-    profile_key: str,
+    job: str,
     *,
-    long_sequence: bool = False,
+    context: str = "standard",
+    hardware: str = "h200",
 ) -> dict[str, Any]:
-    """Build a CreateJob body for a standard or long-sequence recommendation."""
-    if profile_key not in PROFILE_KEYS:
-        raise ValueError(f"invalid profile key: {profile_key}")
-
-    models_doc, profiles = load_catalog(config_dir)
-    validate_catalog(models_doc, profiles, repo_root)
-    model = _find_model(models_doc, model_id)
-    recommendation = _recommendation(
-        model,
-        profile_key,
-        long_sequence=long_sequence,
-    )
-    profile_id = recommendation["recommendedProfileId"]
-    profile = next(item for item in profiles if item["id"] == profile_id)
-    max_context_tokens = recommendation["maxContextTokens"]
-    request = {
-        "sub_job_configs": [
-            _build_wire_sub_job(model_id, sub_job, max_context_tokens)
-            for sub_job in profile["subJobs"]
-        ]
-    }
-    return request
+    """Load the CreateJob body of one catalog job file."""
+    if job not in JOBS:
+        raise ValueError(f"invalid job: {job}")
+    validate_catalog(catalog_dir)
+    folder = _model_folder(catalog_dir, model_id)
+    path = folder / context / f"{hardware}-{job}.json"
+    if not path.is_file():
+        available = sorted(
+            str(found.relative_to(folder).with_suffix(""))
+            for found in folder.glob("*/*.json")
+        )
+        raise ValueError(
+            f"{model_id} has no {context}/{hardware}-{job}.json; "
+            f"its catalog files are: {', '.join(available)}"
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def enable_training_memory_telemetry(request: dict[str, Any]) -> None:
@@ -160,7 +97,7 @@ def apply_training_sequence_parallelism(
         logical_dp = n_gpus // sp_size
         training["sp_size"] = sp_size
         training["train_batch_size"] = logical_dp
-        ds_config = training["ds_config"]
+        ds_config = training.setdefault("ds_config", {})
         ds_config["train_batch_size"] = logical_dp
         ds_config["train_micro_batch_size_per_gpu"] = 1
         ds_config["gradient_accumulation_steps"] = 1
@@ -168,7 +105,7 @@ def apply_training_sequence_parallelism(
 
 def build_forward_backward_probe_spec(
     request: dict[str, Any],
-    profile_key: str,
+    job: str,
     *,
     full_context: bool = False,
 ) -> dict[str, Any]:
@@ -206,11 +143,11 @@ def build_forward_backward_probe_spec(
             "fused_lm_head_token_chunk_size"
         )
     chunked_sft = (
-        profile_key in ("sftLora", "sftFull")
+        job in TRAINING_JOBS
         and isinstance(token_chunk_size, int)
         and not isinstance(token_chunk_size, bool)
     )
-    if profile_key in ("rlLora", "rlFull") or chunked_sft:
+    if job.startswith("rl-") or chunked_sft:
         payload.update(
             {
                 "attention_mask": [[1] * len(token_ids) for _ in range(batch_size)],
@@ -263,7 +200,7 @@ def build_forward_backward_probe_spec(
 
 def _build_forward_backward_probe_payload(
     request: dict[str, Any],
-    profile_key: str,
+    job: str,
     full_context: bool,
 ) -> bytes:
     sys.path.insert(0, str(SOURCE_ROOT))
@@ -273,7 +210,7 @@ def _build_forward_backward_probe_payload(
 
     spec = build_forward_backward_probe_spec(
         request,
-        profile_key,
+        job,
         full_context=full_context,
     )
     if "processing" not in spec:
@@ -350,13 +287,13 @@ def _run_generate_probe(
 def _run_forward_backward_probe(
     client,
     job_id: str,
-    profile_key: str,
+    job: str,
     request: dict[str, Any],
     full_context: bool,
 ) -> dict[str, Any]:
     payload = _build_forward_backward_probe_payload(
         request,
-        profile_key,
+        job,
         full_context,
     )
     request_id = client.forward_backward(job_id, payload)
@@ -469,7 +406,7 @@ def _run_checkpoint_round_trip_probe(
 def run_data_plane_probes(
     client,
     job_id: str,
-    profile_key: str,
+    job: str,
     request: dict[str, Any],
     *,
     full_context_prefill: bool = False,
@@ -477,9 +414,9 @@ def run_data_plane_probes(
     training_step: bool = False,
     checkpoint_round_trip: bool = False,
 ) -> list[dict[str, Any]]:
-    """Execute the minimal operations required by a catalog workflow."""
+    """Execute the minimal operations required by a catalog job."""
     probes = []
-    if profile_key in SAMPLING_PROFILE_KEYS:
+    if job in SAMPLING_JOBS:
         probes.append(
             _run_generate_probe(
                 client,
@@ -488,12 +425,12 @@ def run_data_plane_probes(
                 full_context_prefill,
             )
         )
-    if profile_key in TRAINING_PROFILE_KEYS:
+    if job in TRAINING_JOBS:
         probes.append(
             _run_forward_backward_probe(
                 client,
                 job_id,
-                profile_key,
+                job,
                 request,
                 full_context_training,
             )
@@ -551,24 +488,34 @@ def _cancel_job(client, job_id: str, active_error: BaseException | None) -> bool
 
 
 def main() -> int:
-    default_config = REPO_ROOT / "model-catalog"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-id", required=True)
     parser.add_argument(
-        "--profile",
-        action="append",
-        choices=PROFILE_KEYS,
-        required=True,
-        help="Catalog profile to test. Repeat to test multiple profiles serially.",
+        "--context",
+        choices=CONTEXTS,
+        default="standard",
+        help="Catalog context folder (default: standard).",
     )
-    parser.add_argument("--config-dir", type=Path, default=default_config)
-    parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
+    parser.add_argument(
+        "--hardware",
+        choices=HARDWARE,
+        default="h200",
+        help="Hardware prefix of the catalog file (default: h200).",
+    )
+    parser.add_argument(
+        "--job",
+        action="append",
+        choices=JOBS,
+        required=True,
+        help="Catalog job file to test. Repeat to test multiple files serially.",
+    )
+    parser.add_argument("--catalog-dir", type=Path, default=CATALOG_DIR)
     parser.add_argument(
         "--submit",
         action="store_true",
         help=(
             "Submit real jobs and execute workflow data-plane probes. "
-            "Without this flag, print the generated request bodies."
+            "Without this flag, print the request bodies."
         ),
     )
     parser.add_argument("--poll-timeout", type=float, default=1800.0)
@@ -576,7 +523,7 @@ def main() -> int:
         "--full-context-prefill",
         action="store_true",
         help=(
-            "For sampling profiles, prefill max_seq_len - 1 token IDs and "
+            "For inference jobs, prefill max_seq_len - 1 token IDs and "
             "generate one token instead of running the short text probe."
         ),
     )
@@ -584,7 +531,7 @@ def main() -> int:
         "--full-context-training",
         action="store_true",
         help=(
-            "For training profiles, execute forward-backward with "
+            "For training jobs, execute forward-backward with "
             "train_batch_size sequences of exactly max_seq_len tokens."
         ),
     )
@@ -618,65 +565,44 @@ def main() -> int:
             "batch to n_gpus / sp_size."
         ),
     )
-    parser.add_argument(
-        "--long-sequence",
-        action="store_true",
-        help="Select the profile's optional long-sequence recommendation.",
-    )
     args = parser.parse_args()
 
     plans = []
-    for profile_key in args.profile:
-        request = build_profile_request(
-            args.config_dir.resolve(),
-            args.repo_root.resolve(),
+    for job in args.job:
+        request = build_catalog_request(
+            args.catalog_dir.resolve(),
             args.model_id,
-            profile_key,
-            long_sequence=args.long_sequence,
+            job,
+            context=args.context,
+            hardware=args.hardware,
         )
-        if args.memory_telemetry and profile_key in TRAINING_PROFILE_KEYS:
+        if args.memory_telemetry and job in TRAINING_JOBS:
             enable_training_memory_telemetry(request)
         if args.debug_image_tag:
             apply_debug_image_tag(request, args.debug_image_tag)
-        if args.training_sp_size and profile_key in TRAINING_PROFILE_KEYS:
+        if args.training_sp_size and job in TRAINING_JOBS:
             apply_training_sequence_parallelism(request, args.training_sp_size)
-        plans.append(
-            {
-                "profileKey": profile_key,
-                "request": request,
-            }
-        )
+        plans.append({"job": job, "request": request})
 
     if not args.submit:
-        print(
-            json.dumps(
-                [
-                    {
-                        "profileKey": plan["profileKey"],
-                        "request": plan["request"],
-                    }
-                    for plan in plans
-                ],
-                indent=2,
-            )
-        )
+        print(json.dumps(plans, indent=2))
         return 0
 
     client = _build_client(args.poll_timeout)
     results = []
     for plan in plans:
-        profile_key = plan["profileKey"]
+        job = plan["job"]
         job_id: str | None = None
         active_error: BaseException | None = None
         try:
             response = client.create_job_from_body(plan["request"])
             job_id = response["job_id"]
-            print(f"Submitted {profile_key} as job {job_id}", file=sys.stderr)
-            job = client.wait_for_job(job_id)
+            print(f"Submitted {job} as job {job_id}", file=sys.stderr)
+            status = client.wait_for_job(job_id)
             probes = run_data_plane_probes(
                 client,
                 job_id,
-                profile_key,
+                job,
                 plan["request"],
                 full_context_prefill=args.full_context_prefill,
                 full_context_training=args.full_context_training,
@@ -685,9 +611,9 @@ def main() -> int:
             )
             results.append(
                 {
-                    "profileKey": profile_key,
+                    "job": job,
                     "jobId": job_id,
-                    "status": str(job.get("status") or "")
+                    "status": str(status.get("status") or "")
                     .lower()
                     .removeprefix("job_state_"),
                     "probes": probes,

@@ -17,7 +17,8 @@
 
 The helpers are grouped by section: the connection, job configs, checkpoints,
 rendering, router replay operations, batching, training and sampling
-operations, the job lifecycle, and router replay capacity planning.
+operations, the job lifecycle, router replay capacity planning, and the model
+catalog.
 """
 
 from __future__ import annotations
@@ -1376,3 +1377,31 @@ def plan_vllm_gpu_memory_utilization(
         sampling_cache_bytes=cache_bytes,
         gpu_total_bytes=total_bytes,
     )
+
+
+# ─── Model catalog ───────────────────────────────────────────────────────────
+
+# model-catalog/models/<slug>/ holds one model: model.json, and job files
+# named <hw>-<kind>-<mode>.json under standard/ and long/. A file's existence
+# is the claim that the model supports that configuration on that hardware.
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CATALOG_DIR = REPO_ROOT / "model-catalog" / "models"
+CATALOG_CONTEXTS = ("standard", "long")
+CATALOG_HARDWARE = ("h200", "b200", "b300")
+CATALOG_KINDS = ("training", "inference")
+CATALOG_MODES = ("lora", "full")
+CATALOG_FILE_PATTERN = re.compile(r"^(h200|b200|b300)-(training|inference)-(lora|full)\.json$")
+# The sub-job each catalog file kind holds, and its config block.
+CATALOG_JOB_TYPES = {"training": "training", "inference": "sampling"}
+CATALOG_CONFIG_KEYS = {"training": "training_config", "inference": "inference_config"}
+
+
+def model_slug(model_id: str) -> str:
+    """Catalog folder of a model: the lowercased last segment of its model ID."""
+    return model_id.rsplit("/", 1)[-1].lower()
+
+
+def catalog_file_name(hardware: str, kind: str, lora: bool) -> str:
+    """``<hw>-<kind>-<lora|full>.json`` for a catalog job file."""
+    return f"{hardware}-{kind}-{'lora' if lora else 'full'}.json"

@@ -81,13 +81,14 @@ is `log_prob`.
 ### 1.4 Supported models
 
 The machine-readable source of truth for model availability, workflow support,
-context limits, and recommended configurations is
-[`model-catalog/models.json`](../../model-catalog/models.json). Referenced
-profiles live under [`model-catalog/profiles/`](../../model-catalog/profiles/).
+context limits, and recommended configurations is the model catalog under
+[`model-catalog/models/`](../../model-catalog/models/): one folder per model,
+holding a job file for each supported context, hardware, training or inference
+sub-job, and LoRA or full mode. See the
+[catalog README](../../model-catalog/README.md).
 
 This API reference does not duplicate the model table. Run
-`python model-catalog/validate_catalog.py` after changing the catalog or a
-profile.
+`python model-catalog/validate_catalog.py` after changing the catalog.
 
 ---
 

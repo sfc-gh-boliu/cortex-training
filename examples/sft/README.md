@@ -174,7 +174,7 @@ shipped Qwen3.8-27B configs. If a job runs out of memory, raise `sp_size`
 has the option but not `model_options` support ignores that entry; see
 [the REST API reference](../../docs/reference/rest-api.md#model_options).
 
-For dense long-context profiles, set an integer
+For dense long-context training, set an integer
 `fused_lm_head_token_chunk_size` in `training_config`. The server then computes
 per-token log probabilities in chunks without materializing the full
 `[sequence, vocabulary]` logits tensor. The setting saves memory and does not

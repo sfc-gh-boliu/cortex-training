@@ -188,9 +188,10 @@ same settings can be written inside `training_config`, in place of the
 "model_options": {"lm_head": {"token_chunk_size": 8192, "cross_entropy": false}}
 ```
 
-The Qwen3.6-35B-A3B RL and SFT example configs, `examples/api/training.json`,
-`examples/api/rl.json` and the `rl` and `standard-context` model-catalog
-profiles still use the `prime_rl` block, which older servers need.
+The Qwen3.6-35B-A3B RL and SFT example configs, the Qwen3.6-35B-A3B
+long-context training files in the model catalog, `examples/api/training.json`
+and `examples/api/rl.json` still use the `prime_rl` block, which older servers
+need.
 
 On server versions that have `numerics.fp32_parity`, Qwen3.5-family models run
 with it on by default: dense models (for example `Qwen/Qwen3.8-27B`) and

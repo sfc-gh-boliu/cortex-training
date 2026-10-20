@@ -1,625 +1,423 @@
 #!/usr/bin/env python3
-"""Validate the Cortex Training model catalog and recommended profiles."""
+"""Validate the Cortex Training model catalog under model-catalog/models/.
+
+Each model folder holds a model.json and job files named
+``<hw>-<kind>-<mode>.json`` under ``standard/`` and ``long/``. For every model
+folder this checks that:
+
+- file names match ``{h200,b200,b300}-{training,inference}-{lora,full}.json``,
+  and each file is a valid job definition;
+- the folder slug derives from the model ID in model.json, and no two models
+  share a slug or ID;
+- each sub-job's model name matches model.json, the job ``hardware`` matches the
+  file's prefix, every ``lora`` file carries a valid LoRA ``peft_config``
+  object, and no ``full`` file has one;
+- MoE models record their ``moe`` geometry in model.json;
+- each sub-job uses 1, 2, 4, or a multiple of 8 GPUs, and tensor- and
+  sequence-parallel sizes divide ``n_gpus``;
+- the model's long-context files have a larger ``max_seq_len`` than its
+  standard ones;
+- model.json's ``last_validated`` dates name exactly the model's files.
+"""
 
 from __future__ import annotations
 
 import argparse
-import ast
 import copy
-from datetime import date
 import json
+import sys
+from dataclasses import dataclass
+from dataclasses import field
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-
-CAPABILITY_KEYS = ("inference", "training")
-TRAINING_PROFILE_KEYS = ("sftLora", "sftFull", "rlLora", "rlFull")
-CAPABILITY_PROFILE_TYPES = {
-    "inference": ("inference", "none"),
-    "sftLora": ("sft", "lora"),
-    "sftFull": ("sft", "full"),
-    "rlLora": ("rl", "lora"),
-    "rlFull": ("rl", "full"),
-}
-PROFILE_BUILDERS = {"training_job", "sampling_job"}
-SUPPORTED_ZERO_STAGES = {0, 1, 2}
-LONG_CONTEXT_TRAINING_THRESHOLD = 200_000
-QWEN36_MODEL_ID = "Qwen/Qwen3.6-35B-A3B"
-QWEN36_LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
-QWEN38_MODEL_ID = "Qwen/Qwen3.8-27B"
-QWEN38_SP_HEAD_LAYOUTS = {
-    "num_attention_heads": 24,
-    "linear_num_key_heads": 16,
-    "linear_num_value_heads": 48,
+MODEL_FILE = "model.json"
+MODEL_KEYS = {"$schema", "model_id", "license", "architecture", "moe", "last_validated"}
+REQUIRED_MODEL_KEYS = {"model_id", "license", "architecture", "last_validated"}
+ARCHITECTURES = ("dense", "moe")
+MOE_KEYS = ("num_moe_layers", "topk", "num_experts")
+JOB_KEYS = {"hardware", "sub_job_configs"}
+# SubJobConfig fields, REST API section 8.1.
+SUB_JOB_KEYS = {
+    "job_type",
+    "model_name",
+    "training_config",
+    "inference_config",
+    "global_batch_size",
+    "dtype",
+    "seed",
+    "model_post_init",
+    "source_checkpoint_info",
 }
 
 
 class CatalogValidationError(ValueError):
-    """Raised when the catalog violates its cross-file contract."""
+    """Raised with every problem found in the catalog, one per line."""
 
 
-def _load_builder_signatures(repo_root: Path) -> dict[str, tuple[set[str], set[str]]]:
-    source_path = repo_root / "src" / "cortex_training" / "client" / "core.py"
-    try:
-        tree = ast.parse(source_path.read_text(encoding="utf-8"))
-    except (OSError, SyntaxError) as exc:
-        raise CatalogValidationError(f"cannot inspect {source_path}: {exc}") from exc
+def _examples_utils():
+    """Import the repository's examples.utils, never another ``examples`` package."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    import examples
+    from examples import utils
 
-    signatures: dict[str, tuple[set[str], set[str]]] = {}
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef) or node.name != "SubJobConfig":
-            continue
-        for member in node.body:
-            if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            if member.name not in PROFILE_BUILDERS:
-                continue
-            allowed = {argument.arg for argument in member.args.kwonlyargs}
-            required = {
-                argument.arg
-                for argument, default in zip(
-                    member.args.kwonlyargs, member.args.kw_defaults
-                )
-                if default is None
-            }
-            signatures[member.name] = (allowed, required)
-
-    missing = PROFILE_BUILDERS - set(signatures)
-    if missing:
-        raise CatalogValidationError(
-            f"SubJobConfig is missing expected builder methods: {sorted(missing)}"
+    location = Path(examples.__file__).resolve().parent
+    if location != REPO_ROOT / "examples":
+        raise ImportError(
+            f"`examples` resolves to {location}, not this repository's examples/; "
+            f"put {REPO_ROOT} first on sys.path"
         )
-    return signatures
+    return utils
 
 
-def _require_dict(value: Any, location: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise CatalogValidationError(f"{location} must be an object")
-    return value
+@dataclass(frozen=True)
+class CatalogFile:
+    """One job file of a model: ``<context>/<hw>-<kind>-<mode>.json``."""
+
+    path: Path
+    context: str
+    hardware: str
+    kind: str
+    mode: str
+
+    @property
+    def key(self) -> str:
+        return f"{self.context}/{self.path.stem}"
 
 
-def _require_string(value: Any, location: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise CatalogValidationError(f"{location} must be a non-empty string")
-    return value
+@dataclass
+class CatalogModel:
+    folder: Path
+    info: dict[str, Any] | None = None
+    files: list[CatalogFile] = field(default_factory=list)
 
 
-def _require_positive_int(value: Any, location: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise CatalogValidationError(f"{location} must be a positive integer")
-    return value
+def _relative(path: Path, catalog_dir: Path) -> str:
+    try:
+        return path.relative_to(catalog_dir).as_posix()
+    except ValueError:
+        return str(path)
 
 
-def _load_json(path: Path) -> dict[str, Any]:
+def _load_json_object(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise CatalogValidationError(f"cannot read {path}: {exc}") from exc
-    return _require_dict(value, str(path))
+        raise CatalogValidationError(f"cannot read JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise CatalogValidationError("must be a JSON object")
+    return value
 
 
-def load_catalog(config_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    models_doc = _load_json(config_dir / "models.json")
-    profiles: list[dict[str, Any]] = []
-    profile_dir = config_dir / "profiles"
-    for path in sorted(profile_dir.glob("*.json")):
-        profile_doc = _load_json(path)
-        values = profile_doc.get("profiles")
-        if not isinstance(values, list):
-            raise CatalogValidationError(f"{path}.profiles must be an array")
-        for index, profile in enumerate(values):
-            profile_obj = _require_dict(profile, f"{path}.profiles[{index}]")
-            profile_obj = copy.deepcopy(profile_obj)
-            profile_obj["_sourceFile"] = str(path.relative_to(config_dir))
-            profiles.append(profile_obj)
-    if not profiles:
-        raise CatalogValidationError(f"{profile_dir} must contain at least one profile")
-    return models_doc, profiles
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
-def _validate_profile_shape(profile: dict[str, Any], repo_root: Path) -> None:
-    profile_id = _require_string(profile.get("id"), "profile.id")
-    workflow = profile.get("workflow")
-    tuning_method = profile.get("tuningMethod")
-    if workflow not in {"inference", "sft", "rl"}:
-        raise CatalogValidationError(
-            f"profile {profile_id}: invalid workflow {workflow!r}"
-        )
-    if tuning_method not in {"none", "lora", "full"}:
-        raise CatalogValidationError(
-            f"profile {profile_id}: invalid tuningMethod {tuning_method!r}"
-        )
-    if workflow == "inference" and tuning_method != "none":
-        raise CatalogValidationError(
-            f"profile {profile_id}: inference must use tuningMethod 'none'"
-        )
-    if workflow != "inference" and tuning_method == "none":
-        raise CatalogValidationError(
-            f"profile {profile_id}: training workflow requires lora or full"
-        )
-
-    _require_string(profile.get("summary"), f"profile {profile_id}.summary")
-    evidence_paths = profile.get("evidencePaths")
-    if not isinstance(evidence_paths, list) or not evidence_paths:
-        raise CatalogValidationError(
-            f"profile {profile_id}.evidencePaths must be a non-empty array"
-        )
-    for index, relative_path in enumerate(evidence_paths):
-        value = _require_string(
-            relative_path, f"profile {profile_id}.evidencePaths[{index}]"
-        )
-        if not (repo_root / value).is_file():
-            raise CatalogValidationError(
-                f"profile {profile_id}: evidence path does not exist: {value}"
-            )
-
-    example_path = profile.get("examplePath")
-    if example_path is not None:
-        example = _require_string(example_path, f"profile {profile_id}.examplePath")
-        if not (repo_root / example).is_file():
-            raise CatalogValidationError(
-                f"profile {profile_id}: example path does not exist: {example}"
-            )
-
-    sub_jobs = profile.get("subJobs")
-    if not isinstance(sub_jobs, list) or not sub_jobs:
-        raise CatalogValidationError(
-            f"profile {profile_id}.subJobs must be a non-empty array"
-        )
-    builders: list[str] = []
-    for index, sub_job in enumerate(sub_jobs):
-        item = _require_dict(sub_job, f"profile {profile_id}.subJobs[{index}]")
-        builder = item.get("builder")
-        if builder not in PROFILE_BUILDERS:
-            raise CatalogValidationError(
-                f"profile {profile_id}: invalid builder {builder!r}"
-            )
-        args = _require_dict(
-            item.get("args"), f"profile {profile_id}.subJobs[{index}].args"
-        )
-        if "model_name" in args:
-            raise CatalogValidationError(
-                f"profile {profile_id}: model_name is injected from the model and must not appear in args"
-            )
-        if "max_seq_len" in args:
-            raise CatalogValidationError(
-                f"profile {profile_id}: max_seq_len is injected from the model capability "
-                "and must not appear in args"
-            )
-        builders.append(builder)
-
-    expected_builders = {
-        "inference": ["sampling_job"],
-        "sft": ["training_job"],
-        "rl": ["training_job", "sampling_job"],
-    }[workflow]
-    if sorted(builders) != sorted(expected_builders):
-        raise CatalogValidationError(
-            f"profile {profile_id}: workflow {workflow} requires builders {expected_builders}"
-        )
-
-    has_peft = []
-    for sub_job in sub_jobs:
-        args = sub_job["args"]
-        extra = args.get("extra_training") or args.get("extra_sampling") or {}
-        has_peft.append("peft_config" in extra)
-    if tuning_method == "lora" and not all(has_peft):
-        raise CatalogValidationError(
-            f"profile {profile_id}: LoRA profiles require peft_config on every sub-job"
-        )
-    if tuning_method == "full" and any(has_peft):
-        raise CatalogValidationError(
-            f"profile {profile_id}: full profiles must not define peft_config"
-        )
-
-
-def _validate_profile_reference(
-    *,
-    model_id: str,
-    profile_key: str,
-    recommendation: dict[str, Any],
-    profile_by_id: dict[str, dict[str, Any]],
-    builder_signatures: dict[str, tuple[set[str], set[str]]],
-    allow_long_sequence: bool = False,
-    long_sequence: bool = False,
-) -> set[str]:
-    variant = ".longSequence" if long_sequence else ""
-    max_context = _require_positive_int(
-        recommendation.get("maxContextTokens"),
-        f"model {model_id}.{profile_key}{variant}.maxContextTokens",
-    )
-    profile_id = _require_string(
-        recommendation.get("recommendedProfileId"),
-        f"model {model_id}.{profile_key}{variant}.recommendedProfileId",
-    )
-    validated = recommendation.get("lastValidated")
-    if validated is not None:
-        validated = _require_string(
-            validated,
-            f"model {model_id}.{profile_key}{variant}.lastValidated",
-        )
-        try:
-            date.fromisoformat(validated)
-        except ValueError as exc:
-            raise CatalogValidationError(
-                f"model {model_id}.{profile_key}{variant}.lastValidated must be an ISO date"
-            ) from exc
-    profile = profile_by_id.get(profile_id)
-    if profile is None:
-        raise CatalogValidationError(
-            f"model {model_id}.{profile_key}{variant}: unknown profile {profile_id}"
-        )
-    expected_workflow, expected_tuning = CAPABILITY_PROFILE_TYPES[profile_key]
-    if (profile["workflow"], profile["tuningMethod"]) != (
-        expected_workflow,
-        expected_tuning,
-    ):
-        raise CatalogValidationError(
-            f"model {model_id}.{profile_key}{variant}: profile {profile_id} has incompatible "
-            f"workflow/tuningMethod"
-        )
-
-    if model_id == QWEN36_MODEL_ID and profile_key in {"sftLora", "rlLora"}:
-        training_sub_job = next(
-            sub_job
-            for sub_job in profile["subJobs"]
-            if sub_job["builder"] == "training_job"
-        )
-        training_extra = training_sub_job["args"].get("extra_training") or {}
-        if training_extra.get("model_provider") != "prime_rl":
-            raise CatalogValidationError(
-                f"model {model_id}.{profile_key}{variant}: LoRA save/load requires "
-                "extra_training.model_provider='prime_rl'"
-            )
-        for sub_job in profile["subJobs"]:
-            args = sub_job["args"]
-            extra = args.get("extra_training") or args.get("extra_sampling") or {}
-            targets = (extra.get("peft_config") or {}).get("target_modules")
-            if targets != QWEN36_LORA_TARGET_MODULES:
-                raise CatalogValidationError(
-                    f"model {model_id}.{profile_key}{variant}: PrimeRL LoRA supports only "
-                    f"attention target_modules {QWEN36_LORA_TARGET_MODULES}"
-                )
-
-    for sub_job in profile["subJobs"]:
-        args = copy.deepcopy(sub_job["args"])
-        builder = sub_job["builder"]
-        args["max_seq_len"] = max_context
-
-        allowed, required = builder_signatures[builder]
-        unexpected = sorted(set(args) - allowed)
-        missing = sorted(required - set(args))
-        if unexpected or missing:
-            raise CatalogValidationError(
-                f"model {model_id}.{profile_key}{variant}: profile {profile_id} does not match "
-                f"SubJobConfig.{builder}; unexpected={unexpected}, missing={missing}"
-            )
-        n_gpus = _require_positive_int(
-            args.get("n_gpus"),
-            f"profile {profile_id}.{builder}.n_gpus",
-        )
-        if n_gpus % 8 != 0:
-            raise CatalogValidationError(
-                f"profile {profile_id}.{builder}.n_gpus must be a multiple of 8"
-            )
-        if builder == "sampling_job":
-            extra_sampling = _require_dict(
-                args.get("extra_sampling"),
-                f"profile {profile_id}.sampling_job.extra_sampling",
-            )
-            vllm_config = _require_dict(
-                extra_sampling.get("vllm_config"),
-                f"profile {profile_id}.sampling_job.extra_sampling.vllm_config",
-            )
-            tensor_parallel_size = _require_positive_int(
-                vllm_config.get("tensor_parallel_size"),
-                f"profile {profile_id}.sampling_job.tensor_parallel_size",
-            )
-            if tensor_parallel_size > n_gpus or n_gpus % tensor_parallel_size != 0:
-                raise CatalogValidationError(
-                    f"profile {profile_id}.sampling_job.tensor_parallel_size "
-                    f"must be a divisor of n_gpus ({n_gpus})"
-                )
-        if builder == "training_job":
-            optimizer = args.get("optimizer")
-            if not isinstance(optimizer, dict) or not optimizer:
-                raise CatalogValidationError(
-                    f"profile {profile_id}.training_job.optimizer must be a non-empty object"
-                )
-            train_batch_size = _require_positive_int(
-                args.get("train_batch_size"),
-                f"profile {profile_id}.training_job.train_batch_size",
-            )
-            extra_training = _require_dict(
-                args.get("extra_training"),
-                f"profile {profile_id}.training_job.extra_training",
-            )
-            ds_config = _require_dict(
-                extra_training.get("ds_config"),
-                f"profile {profile_id}.training_job.extra_training.ds_config",
-            )
-            zero_optimization = _require_dict(
-                ds_config.get("zero_optimization"),
-                f"profile {profile_id}.training_job.extra_training.ds_config.zero_optimization",
-            )
-            ds_train_batch_size = _require_positive_int(
-                ds_config.get("train_batch_size"),
-                f"profile {profile_id}.training_job.extra_training.ds_config.train_batch_size",
-            )
-            if ds_train_batch_size != train_batch_size:
-                raise CatalogValidationError(
-                    f"profile {profile_id}.training_job train_batch_size must match "
-                    "extra_training.ds_config.train_batch_size"
-                )
-
-            sp_size = extra_training.get("sp_size")
-            if (
-                not long_sequence
-                and recommendation.get("longSequence") is not None
-                and sp_size not in (None, 1)
-            ):
-                raise CatalogValidationError(
-                    f"model {model_id}.{profile_key}: standard training must use "
-                    "sequence-parallel size one"
-                )
-            if max_context >= LONG_CONTEXT_TRAINING_THRESHOLD and sp_size is None:
-                raise CatalogValidationError(
-                    f"model {model_id}.{profile_key}: {max_context}-token training "
-                    "requires extra_training.sp_size"
-                )
-            if (
-                max_context >= LONG_CONTEXT_TRAINING_THRESHOLD
-                and profile_key in {"sftLora", "sftFull"}
-                and extra_training.get("model_provider", "huggingface") != "prime_rl"
-            ):
-                _require_positive_int(
-                    extra_training.get("fused_lm_head_token_chunk_size"),
-                    f"model {model_id}.{profile_key} dense long-context SFT "
-                    "fused_lm_head_token_chunk_size",
-                )
-            if sp_size is not None:
-                sp_size = _require_positive_int(
-                    sp_size,
-                    f"profile {profile_id}.training_job.extra_training.sp_size",
-                )
-                if sp_size <= 1 or n_gpus % sp_size != 0:
-                    raise CatalogValidationError(
-                        f"profile {profile_id}.training_job sp_size must be greater "
-                        f"than one and divide n_gpus ({n_gpus})"
-                    )
-                logical_dp = n_gpus // sp_size
-                if train_batch_size != logical_dp:
-                    raise CatalogValidationError(
-                        f"profile {profile_id}.training_job with sp_size {sp_size} "
-                        f"requires train_batch_size {logical_dp}"
-                    )
-                if (
-                    ds_config.get("train_micro_batch_size_per_gpu") != 1
-                    or ds_config.get("gradient_accumulation_steps") != 1
-                ):
-                    raise CatalogValidationError(
-                        f"profile {profile_id}.training_job sequence parallelism "
-                        "requires DeepSpeed micro batch and accumulation of one"
-                    )
-                if model_id == QWEN38_MODEL_ID:
-                    for head_field, head_count in QWEN38_SP_HEAD_LAYOUTS.items():
-                        if head_count % sp_size:
-                            raise CatalogValidationError(
-                                f"model {model_id}.{profile_key}{variant}: sp_size {sp_size} "
-                                f"must divide {head_field} ({head_count})"
-                            )
-            zero_stage = zero_optimization.get("stage")
-            if (
-                isinstance(zero_stage, bool)
-                or not isinstance(zero_stage, int)
-                or zero_stage not in SUPPORTED_ZERO_STAGES
-            ):
-                raise CatalogValidationError(
-                    f"profile {profile_id}.training_job ZeRO stage {zero_stage!r} "
-                    f"is unsupported; supported stages are {sorted(SUPPORTED_ZERO_STAGES)}"
-                )
-    referenced = {profile_id}
-    long_recommendation = recommendation.get("longSequence")
-    if long_recommendation is not None:
-        if not allow_long_sequence:
-            raise CatalogValidationError(
-                f"model {model_id}.{profile_key}{variant}: longSequence is not allowed"
-            )
-        long_recommendation = _require_dict(
-            long_recommendation,
-            f"model {model_id}.{profile_key}.longSequence",
-        )
-        long_context = _require_positive_int(
-            long_recommendation.get("maxContextTokens"),
-            f"model {model_id}.{profile_key}.longSequence.maxContextTokens",
-        )
-        if long_context <= max_context:
-            raise CatalogValidationError(
-                f"model {model_id}.{profile_key}.longSequence.maxContextTokens "
-                f"must exceed the standard limit {max_context}"
-            )
-        referenced.update(
-            _validate_profile_reference(
-                model_id=model_id,
-                profile_key=profile_key,
-                recommendation=long_recommendation,
-                profile_by_id=profile_by_id,
-                builder_signatures=builder_signatures,
-                long_sequence=True,
-            )
-        )
-    return referenced
-
-
-def validate_catalog(
-    models_doc: dict[str, Any],
-    profiles: list[dict[str, Any]],
-    repo_root: Path,
-) -> dict[str, Any]:
-    builder_signatures = _load_builder_signatures(repo_root)
-
-    if models_doc.get("schemaVersion") != 1:
-        raise CatalogValidationError("models.json.schemaVersion must equal 1")
-    if models_doc.get("catalog") != "cortex-training":
-        raise CatalogValidationError("models.json.catalog must equal 'cortex-training'")
-    reviewed = _require_string(
-        models_doc.get("lastReviewed"), "models.json.lastReviewed"
-    )
-    try:
-        date.fromisoformat(reviewed)
-    except ValueError as exc:
-        raise CatalogValidationError(
-            "models.json.lastReviewed must be an ISO date"
-        ) from exc
-
-    profile_by_id: dict[str, dict[str, Any]] = {}
-    for profile in profiles:
-        _validate_profile_shape(profile, repo_root)
-        profile_id = profile["id"]
-        if profile_id in profile_by_id:
-            raise CatalogValidationError(f"duplicate profile id: {profile_id}")
-        profile_by_id[profile_id] = profile
-
-    models = models_doc.get("models")
-    if not isinstance(models, list) or not models:
-        raise CatalogValidationError("models.json.models must be a non-empty array")
-
-    model_ids: set[str] = set()
-    referenced_profiles: set[str] = set()
-    for model_index, model in enumerate(models):
-        item = _require_dict(model, f"models[{model_index}]")
-        _require_string(item.get("name"), f"models[{model_index}].name")
-        model_id = _require_string(
-            item.get("modelId"), f"models[{model_index}].modelId"
-        )
-        if model_id in model_ids:
-            raise CatalogValidationError(f"duplicate model id: {model_id}")
-        model_ids.add(model_id)
-        license_info = _require_dict(item.get("license"), f"model {model_id}.license")
-        _require_string(license_info.get("name"), f"model {model_id}.license.name")
-        license_url = _require_string(
-            license_info.get("url"), f"model {model_id}.license.url"
-        )
-        if not license_url.startswith("https://"):
-            raise CatalogValidationError(f"model {model_id}.license.url must use https")
-
-        capabilities = _require_dict(
-            item.get("capabilities"), f"model {model_id}.capabilities"
-        )
-        if set(capabilities) != set(CAPABILITY_KEYS):
-            raise CatalogValidationError(
-                f"model {model_id}: capabilities must be exactly {list(CAPABILITY_KEYS)}"
-            )
-
-        inference = _require_dict(
-            capabilities["inference"],
-            f"model {model_id}.capabilities.inference",
-        )
-        inference_supported = inference.get("supported")
-        if not isinstance(inference_supported, bool):
-            raise CatalogValidationError(
-                f"model {model_id}.inference.supported must be a boolean"
-            )
-        if inference_supported:
-            referenced_profiles.update(
-                _validate_profile_reference(
-                    model_id=model_id,
-                    profile_key="inference",
-                    recommendation=inference,
-                    profile_by_id=profile_by_id,
-                    builder_signatures=builder_signatures,
-                )
-            )
-        else:
-            unexpected = {
-                "maxContextTokens",
-                "recommendedProfileId",
-                "lastValidated",
-            } & set(inference)
-            if unexpected:
-                raise CatalogValidationError(
-                    f"model {model_id}.inference: unsupported capabilities cannot define "
-                    f"{sorted(unexpected)}"
-                )
-
-        training = _require_dict(
-            capabilities["training"],
-            f"model {model_id}.capabilities.training",
-        )
-        training_supported = training.get("supported")
-        if not isinstance(training_supported, bool):
-            raise CatalogValidationError(
-                f"model {model_id}.training.supported must be a boolean"
-            )
-        if not training_supported:
-            if "profiles" in training:
-                raise CatalogValidationError(
-                    f"model {model_id}.training: unsupported capabilities cannot define profiles"
-                )
+def _scan_model_folder(folder: Path, catalog_dir: Path, errors: list[str]) -> CatalogModel:
+    utils = _examples_utils()
+    model = CatalogModel(folder=folder)
+    for entry in sorted(folder.iterdir()):
+        location = _relative(entry, catalog_dir)
+        if entry.name == MODEL_FILE and entry.is_file():
             continue
-        if not inference_supported:
-            raise CatalogValidationError(
-                f"model {model_id}: training support requires inference support"
+        if entry.name not in utils.CATALOG_CONTEXTS or not entry.is_dir():
+            errors.append(
+                f"{location}: unexpected entry; a model folder holds {MODEL_FILE}, "
+                f"{'/ and '.join(utils.CATALOG_CONTEXTS)}/"
             )
-
-        training_profiles = _require_dict(
-            training.get("profiles"),
-            f"model {model_id}.training.profiles",
-        )
-        if set(training_profiles) != set(TRAINING_PROFILE_KEYS):
-            raise CatalogValidationError(
-                f"model {model_id}.training.profiles must be exactly "
-                f"{list(TRAINING_PROFILE_KEYS)}"
-            )
-        for profile_key in TRAINING_PROFILE_KEYS:
-            recommendation = _require_dict(
-                training_profiles[profile_key],
-                f"model {model_id}.training.profiles.{profile_key}",
-            )
-            referenced_profiles.update(
-                _validate_profile_reference(
-                    model_id=model_id,
-                    profile_key=profile_key,
-                    recommendation=recommendation,
-                    profile_by_id=profile_by_id,
-                    builder_signatures=builder_signatures,
-                    allow_long_sequence=True,
+            continue
+        for path in sorted(entry.iterdir()):
+            match = utils.CATALOG_FILE_PATTERN.match(path.name)
+            if match is None or not path.is_file():
+                errors.append(
+                    f"{_relative(path, catalog_dir)}: file names must match "
+                    "{h200,b200,b300}-{training,inference}-{lora,full}.json"
                 )
+                continue
+            hardware, kind, mode = match.groups()
+            model.files.append(CatalogFile(path, entry.name, hardware, kind, mode))
+    path = folder / MODEL_FILE
+    if not path.is_file():
+        errors.append(f"{_relative(path, catalog_dir)}: missing")
+        return model
+    try:
+        model.info = _load_json_object(path)
+    except CatalogValidationError as exc:
+        errors.append(f"{_relative(path, catalog_dir)}: {exc}")
+    return model
+
+
+def _model_info_errors(model: CatalogModel) -> list[str]:
+    utils = _examples_utils()
+    info = model.info or {}
+    errors = []
+    unexpected = sorted(set(info) - MODEL_KEYS)
+    if unexpected:
+        errors.append(f"unexpected keys {unexpected}")
+    missing = sorted(REQUIRED_MODEL_KEYS - set(info))
+    if missing:
+        errors.append(f"missing keys {missing}")
+    model_id = info.get("model_id")
+    if not isinstance(model_id, str) or not model_id.strip():
+        errors.append("model_id must be a non-empty string")
+    elif utils.model_slug(model_id) != model.folder.name:
+        errors.append(
+            f"folder name must be {utils.model_slug(model_id)!r}, the lowercased last "
+            f"segment of model_id {model_id!r}"
+        )
+    license_info = info.get("license")
+    if not isinstance(license_info, dict) or set(license_info) != {"name", "url"}:
+        errors.append("license must be an object with a name and a url")
+    else:
+        if not isinstance(license_info["name"], str) or not license_info["name"]:
+            errors.append("license.name must be a non-empty string")
+        if not isinstance(license_info["url"], str) or not license_info["url"].startswith("https://"):
+            errors.append("license.url must be an https URL")
+    architecture = info.get("architecture")
+    if architecture not in ARCHITECTURES:
+        errors.append(f"architecture must be one of {list(ARCHITECTURES)}, got {architecture!r}")
+    moe = info.get("moe")
+    if architecture == "moe":
+        if not isinstance(moe, dict) or set(moe) != set(MOE_KEYS):
+            errors.append(f"MoE models need moe geometry with exactly {list(MOE_KEYS)}")
+        elif not all(_positive_int(moe[key]) for key in MOE_KEYS):
+            errors.append(f"moe geometry values must be positive integers, got {moe}")
+        else:
+            try:
+                utils.moe_geometry_from_config(
+                    None,
+                    num_moe_layers_override=moe["num_moe_layers"],
+                    topk_override=moe["topk"],
+                    num_experts_override=moe["num_experts"],
+                )
+            except (TypeError, ValueError) as exc:
+                errors.append(f"moe geometry is invalid: {exc}")
+    elif moe is not None:
+        errors.append("only MoE models record moe geometry")
+    dates = info.get("last_validated")
+    keys = {catalog_file.key for catalog_file in model.files}
+    if not isinstance(dates, dict):
+        errors.append("last_validated must map each file of the model to a date or null")
+    else:
+        for key in sorted(set(dates) - keys):
+            errors.append(f"last_validated names {key}, which has no file")
+        for key in sorted(keys - set(dates)):
+            errors.append(f"last_validated is missing {key} (use null until a run validates it)")
+        for key, value in sorted(dates.items()):
+            if value is None:
+                continue
+            try:
+                date.fromisoformat(value)
+            except (TypeError, ValueError):
+                errors.append(f"last_validated[{key!r}] must be an ISO date or null, got {value!r}")
+    return errors
+
+
+def _sub_job_errors(sub_job: dict[str, Any]) -> list[str]:
+    """Schema checks from REST API sections 8.1 to 8.3 for one sub-job."""
+    from cortex_training.client.optimizer import normalize_optimizer_config
+
+    errors = []
+    unexpected = sorted(set(sub_job) - SUB_JOB_KEYS)
+    if unexpected:
+        errors.append(f"unknown sub-job keys {unexpected}")
+    if not isinstance(sub_job.get("model_name"), str) or not sub_job["model_name"].strip():
+        errors.append("model_name must be a non-empty string")
+    job_type = sub_job.get("job_type")
+    config_key = {"training": "training_config", "sampling": "inference_config"}.get(job_type)
+    if config_key is None:
+        errors.append(f"job_type must be 'training' or 'sampling', got {job_type!r}")
+        return errors
+    other_key = "inference_config" if config_key == "training_config" else "training_config"
+    if other_key in sub_job:
+        errors.append(f"a {job_type} sub-job cannot carry {other_key}")
+    config = sub_job.get(config_key)
+    if not isinstance(config, dict):
+        errors.append(f"a {job_type} sub-job needs a {config_key} object")
+        return errors
+    required = ("max_seq_len", "n_gpus") + (("train_batch_size",) if job_type == "training" else ())
+    for name in required:
+        if not _positive_int(config.get(name)):
+            errors.append(f"{config_key}.{name} must be a positive integer, got {config.get(name)!r}")
+    if job_type == "training":
+        try:
+            optimizer, hoisted_clipping = normalize_optimizer_config(
+                config.get("optimizer"), location=f"{config_key}.optimizer"
             )
+        except (TypeError, ValueError) as exc:
+            errors.append(str(exc))
+        else:
+            if not optimizer and config.get("gradient_clipping", hoisted_clipping) is None:
+                errors.append(f"{config_key}.optimizer must carry at least one setting")
+    return errors
 
-    unreferenced = sorted(set(profile_by_id) - referenced_profiles)
-    if unreferenced:
-        raise CatalogValidationError(f"unreferenced profiles: {unreferenced}")
 
-    return {
-        "schemaVersion": models_doc["schemaVersion"],
-        "lastReviewed": reviewed,
-        "models": len(models),
-        "profiles": len(profiles),
+def job_errors(body: dict[str, Any]) -> list[str]:
+    """Why a create-job body is not a valid job definition (empty when it is).
+
+    It must pass the checks ``cortex-training submit --dry-run`` runs on a body
+    (without reading any connection settings), set ``hardware`` to a supported
+    value, use no job-level key other than ``sub_job_configs``, and give each
+    sub-job the fields REST API sections 8.1 to 8.3 require.
+    """
+    from cortex_training.cli.commands import _validate_create_job_body
+    from cortex_training.client import Hardware
+
+    errors = []
+    unexpected = sorted(set(body) - JOB_KEYS)
+    if unexpected:
+        errors.append(f"job-level keys other than {sorted(JOB_KEYS)} are not catalog fields: {unexpected}")
+    hardware = body.get("hardware")
+    if hardware not in {member.value for member in Hardware}:
+        errors.append(f"hardware must be one of {[member.value for member in Hardware]}, got {hardware!r}")
+    try:
+        _validate_create_job_body(copy.deepcopy(body))
+    except ValueError as exc:
+        errors.append(f"cortex-training submit --dry-run fails: {exc}")
+    for index, sub_job in enumerate(body.get("sub_job_configs") or ()):
+        if isinstance(sub_job, dict):
+            errors.extend(f"sub_job_configs[{index}]: {error}" for error in _sub_job_errors(sub_job))
+    return errors
+
+
+def _parallel_errors(config: dict[str, Any]) -> list[str]:
+    errors = []
+    n_gpus = config.get("n_gpus")
+    if not _positive_int(n_gpus):
+        return errors
+    if n_gpus not in (1, 2, 4) and n_gpus % 8:
+        errors.append(f"n_gpus {n_gpus} must be 1, 2, 4, or a multiple of 8")
+    sizes = {
+        "sp_size": config.get("sp_size"),
+        "vllm_config.tensor_parallel_size": (config.get("vllm_config") or {}).get("tensor_parallel_size"),
     }
+    for name, size in sizes.items():
+        if size is None:
+            continue
+        if not _positive_int(size) or n_gpus % size:
+            errors.append(f"{name} {size} must divide n_gpus {n_gpus}")
+    return errors
 
 
-def load_and_validate(config_dir: Path, repo_root: Path) -> dict[str, Any]:
-    models_doc, profiles = load_catalog(config_dir)
-    return validate_catalog(models_doc, profiles, repo_root)
+def _file_errors(catalog_file: CatalogFile, model_id: str | None) -> tuple[list[str], list[int]]:
+    utils = _examples_utils()
+    try:
+        body = _load_json_object(catalog_file.path)
+    except CatalogValidationError as exc:
+        return [str(exc)], []
+    errors = job_errors(body)
+    expected_hardware = catalog_file.hardware.upper()
+    if body.get("hardware") != expected_hardware:
+        errors.append(
+            f"hardware must be {expected_hardware!r} to match the {catalog_file.hardware}- prefix, "
+            f"got {body.get('hardware')!r}"
+        )
+    job_type = utils.CATALOG_JOB_TYPES[catalog_file.kind]
+    config_key = utils.CATALOG_CONFIG_KEYS[catalog_file.kind]
+    sub_jobs = body.get("sub_job_configs")
+    if (
+        not isinstance(sub_jobs, list)
+        or len(sub_jobs) != 1
+        or not isinstance(sub_jobs[0], dict)
+        or sub_jobs[0].get("job_type") != job_type
+        or not isinstance(sub_jobs[0].get(config_key), dict)
+    ):
+        errors.append(f"a {catalog_file.kind} file holds exactly one {job_type} sub-job with a {config_key}")
+        return errors, []
+    sub_job = sub_jobs[0]
+    config = sub_job[config_key]
+    if model_id is not None and sub_job.get("model_name") != model_id:
+        errors.append(f"model_name {sub_job.get('model_name')!r} does not match model.json model_id {model_id!r}")
+    # A LoRA adapter must be an object; job_errors' dry-run checks then validate
+    # it with the client's PEFT validator. The dry run skips a null one.
+    if catalog_file.mode == "lora" and config.get("peft_config") is None:
+        errors.append(f"lora files carry {config_key}.peft_config, a LoRA adapter object")
+    if catalog_file.mode == "full" and "peft_config" in config:
+        errors.append(f"full files must not carry {config_key}.peft_config")
+    errors.extend(_parallel_errors(config))
+    max_seq_len = config.get("max_seq_len")
+    return errors, [max_seq_len] if _positive_int(max_seq_len) else []
+
+
+def _context_errors(lengths: dict[str, list[int]]) -> list[str]:
+    standard, long = lengths.get("standard"), lengths.get("long")
+    if standard and long and min(long) <= max(standard):
+        return [
+            f"long-context files need a larger max_seq_len than standard ones "
+            f"(long {min(long)} <= standard {max(standard)})"
+        ]
+    return []
+
+
+def validate_catalog(catalog_dir: Path | None = None) -> dict[str, Any]:
+    """Validate every model folder; return counts, or raise with every problem."""
+    catalog_dir = Path(catalog_dir or _examples_utils().CATALOG_DIR).resolve()
+    errors: list[str] = []
+    if not catalog_dir.is_dir():
+        raise CatalogValidationError(f"{catalog_dir} is not a directory")
+    models = []
+    for folder in sorted(catalog_dir.iterdir()):
+        if not folder.is_dir():
+            errors.append(f"{folder.name}: only model folders belong in {catalog_dir.name}/")
+            continue
+        models.append(_scan_model_folder(folder, catalog_dir, errors))
+    if not models:
+        errors.append(f"{catalog_dir} has no model folders")
+
+    seen_ids: dict[str, str] = {}
+    seen_slugs: dict[str, str] = {}
+    counts = {"models": len(models), "files": 0, "training": 0, "inference": 0}
+    for model in models:
+        name = model.folder.name
+        info = model.info or {}
+        if model.info is not None:
+            errors.extend(f"{name}/{MODEL_FILE}: {error}" for error in _model_info_errors(model))
+        model_id = info.get("model_id") if isinstance(info.get("model_id"), str) else None
+        if model_id is not None:
+            if model_id in seen_ids:
+                errors.append(f"{name}/{MODEL_FILE}: model_id {model_id!r} is also used by {seen_ids[model_id]}")
+            seen_ids.setdefault(model_id, name)
+            slug = _examples_utils().model_slug(model_id)
+            if slug in seen_slugs:
+                errors.append(f"{name}/{MODEL_FILE}: slug {slug!r} is also used by {seen_slugs[slug]}")
+            seen_slugs.setdefault(slug, name)
+        lengths: dict[str, list[int]] = {}
+        for catalog_file in model.files:
+            counts["files"] += 1
+            counts[catalog_file.kind] += 1
+            file_errors, file_lengths = _file_errors(catalog_file, model_id)
+            location = _relative(catalog_file.path, catalog_dir)
+            errors.extend(f"{location}: {error}" for error in file_errors)
+            lengths.setdefault(catalog_file.context, []).extend(file_lengths)
+        errors.extend(f"{name}: {error}" for error in _context_errors(lengths))
+
+    if errors:
+        raise CatalogValidationError("\n".join(errors))
+    return counts
 
 
 def main() -> int:
-    default_config = REPO_ROOT / "model-catalog"
-    default_repo = REPO_ROOT
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config-dir", type=Path, default=default_config)
-    parser.add_argument("--repo-root", type=Path, default=default_repo)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--catalog-dir",
+        type=Path,
+        default=None,
+        help="Model folders to validate (default: model-catalog/models).",
+    )
     args = parser.parse_args()
-
-    summary = load_and_validate(args.config_dir.resolve(), args.repo_root.resolve())
+    try:
+        summary = validate_catalog(args.catalog_dir)
+    except CatalogValidationError as exc:
+        print(f"Cortex Training catalog is invalid:\n{exc}", file=sys.stderr)
+        return 1
     print(
         "Cortex Training catalog valid: "
-        f"{summary['models']} models, {summary['profiles']} profiles, "
-        f"schema v{summary['schemaVersion']}, reviewed {summary['lastReviewed']}"
+        f"{summary['models']} models, {summary['files']} job files "
+        f"({summary['training']} training, {summary['inference']} inference)"
     )
     return 0
 

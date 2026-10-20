@@ -66,8 +66,8 @@ overriding the one before:
    `context=` (`standard` or `long`), `hardware=` (`h200`, `b200` or `b300`;
    default `h200`) and `lora=` (default `true`), combined into one job with a
    training and a sampling sub-job. Both come from the same hardware prefix.
-2. `rl/overrides.json`, if you create one: changes for every RL run, in any
-   model.
+2. `rl/overrides.json`, which the example ships and applies to every RL run, in
+   any model.
 3. The command line: `lr=`, `train_batch_size=` and `max_seq_len=` (the last
    applies to both sub-jobs). Each defaults to `None`, which keeps the value
    from the layers below.
@@ -75,13 +75,109 @@ overriding the one before:
 The job is logged before it is submitted. A combination the catalog does not
 have fails with the list of files that exist for that model: an RL job needs a
 training and an inference file of the same context, hardware and mode.
+Overrides merge by the rules in
+[How an example builds its job](../README.md#how-an-example-builds-its-job).
 
-Each run writes the job it built to
-`examples/rl/configs/<slug>-<context>-<hw>-<lora|full>.json`, replacing the
-file of the previous run with the same selection. To change one run, copy that
-file, edit it, and pass it back with `job_config=JOB_CONFIG`: the example then
-uses the file as is, plus `lr=`, `train_batch_size=` and `max_seq_len=`, and
-writes nothing.
+Each generated run writes the job it built to
+`examples/rl/configs/<slug>-<context>-<hw>-<lora|full>.json`, for example
+`examples/rl/configs/qwen3-8b-standard-h200-lora.json`, before it submits the
+job, replacing the file of the previous run with the same selection. The file
+is the body this run generated, so it always reflects this run's `model`,
+`context`, `hardware`, `lora` and command-line settings, and can't go stale.
+A run that fails before submitting still leaves its own generated
+body (not the previous run's), and it keeps the debug image tag when
+`debug_image_tag=` was set. A run attached to an existing job with `job_id=`
+writes nothing, and a `job_config=` run uses its file as is and generates
+nothing. The folder is not committed. The file is a starting point: copy it,
+edit it, and pass it back with `job_config=JOB_CONFIG`. The example then uses
+the file as is, plus `lr=`, `train_batch_size=` and `max_seq_len=`; the runner
+reads the router replay `max_cache_bytes` from that file. A record that carries
+a debug block does not re-enable create-job debug options on its own when you
+pass it back with `job_config=`: loading a body never opens the internal-only
+gate. To rebuild on that image, re-authorize debug explicitly for the run —
+pass `debug_image_tag=` again (which sets the gate for that run) or set
+`CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS` yourself. To build the same job without running
+the example, see
+[Create a job config from the command line](../README.md#create-a-job-config-from-the-command-line).
+
+### The default job's shape
+
+RL is built from the catalog's training and inference files, so the default
+job, Qwen3-8B LoRA at standard context on H200, composes to 4 training GPUs and
+2 sampling GPUs at tensor-parallel size 1. The RL config this example used
+before had 4 training plus 4 sampling GPUs at tensor-parallel size 4.
+
+The catalog files carry the SFT optimizer betas `(0.9, 0.999)`, but the example
+ships [`rl/overrides.json`](overrides.json), applied to every RL run (layer 2
+below), which restores the three training settings that were identical across
+all of the pre-restructure RL configs:
+
+```json
+{"sub_job_configs": [{"job_type": "training", "training_config": {
+  "optimizer": {"betas": [0.9, 0.95]},
+  "mb_spec": {"max_tokens_per_mb": 10240},
+  "ds_config": {"zero_optimization": {"reduce_scatter": true}}}}]}
+```
+
+One override is correct for every model because those three values were the same
+in all of the earlier RL configs; the per-model settings (GPU counts, sampler
+tensor parallelism, and the lower full-parameter RL learning rate) stay at their
+catalog values. So the default RL job trains with optimizer betas `(0.9, 0.95)`,
+packing `max_tokens_per_mb` 10240, and ZeRO `reduce_scatter`, all from the
+committed `rl/overrides.json`. `lr=` changes only the learning rate for one run;
+to change the betas, packing, or `reduce_scatter`, edit `rl/overrides.json` (for
+every run) or pass a saved job file back with `job_config=` (for one run).
+
+`rl/overrides.json` also carries a reserved `_comment` key -- a free-text note
+describing the file -- which the override loader strips before merging, so it
+never reaches the job body. (JSON has no comments; every example's
+`overrides.json` uses this convention.)
+
+## Router replay
+
+For an MoE model (`architecture` is `moe` in the model's `model.json`, as for
+`Qwen/Qwen3.6-35B-A3B`), the example fills in `router_replay` on both
+sub-jobs after the three layers are merged. An override that changes
+`model_name` is filled in for the model it names (a dense one gets no router
+replay), and both sub-jobs must name the same model. It sets:
+
+- Training sub-job: `{"enabled": true, "mode": "strict", "max_cache_bytes": 5368709120}`
+  (5 GiB per data-parallel shard).
+- Sampling sub-job: `{"enabled": true, "max_cache_bytes": 21474836480}` (20 GiB
+  per sampling replica), with no `mode`, which the service rejects there.
+
+These caps are **fixed defaults**: the same 5 GiB training / 20 GiB sampling for
+every model, context, hardware and rollout batch. They are not derived from the
+job, so `--rollout-batch-size` of `python -m examples.utils` no longer sizes
+them (it is kept only for backward compatibility). vLLM's
+`gpu_memory_utilization` is not changed. Dense models get no router replay.
+`make_config(..., router_replay=True)` and `python -m examples.utils
+--router-replay` fail for a dense model even when an override sets both caps,
+and so does an override that turns router replay on for a model the catalog
+lists as dense.
+
+To size a cap to a particular job instead of taking the fixed default, use the
+[capacity planner](#router-replay-capacity-planning) below (it is still shipped
+in `examples/utils.py`) and set the value you get with an override, as here.
+
+Overrides stay in control. Only keys an override did not set are filled in,
+so an explicit `max_cache_bytes` or `mode` wins, and
+`"router_replay": {"enabled": false}` on either sub-job turns router replay
+off and nothing is filled in:
+
+```json
+{"sub_job_configs": [
+  {"job_type": "training", "training_config": {"router_replay": {"max_cache_bytes": 2147483648, "mode": "best_effort"}}},
+  {"job_type": "sampling", "inference_config": {"router_replay": {"max_cache_bytes": 17179869184}}}]}
+```
+
+```json
+{"sub_job_configs": [{"job_type": "training", "training_config": {"router_replay": {"enabled": false}}}]}
+```
+
+Put either in `rl/overrides.json`, or in a file passed to
+`python -m examples.utils --override`. A `job_config=` file is used as is, so
+its router replay settings are the ones that run.
 
 ## Customizability
 
@@ -247,11 +343,15 @@ The target list above is for dense Qwen models. For
 ## Router-replay capacity planning
 
 The router-replay capacity planner in `examples/utils.py` derives the
-per-worker `router_replay.max_cache_bytes` caps before you create a job. It
-only calculates. It does not call the service, edit a job config, or reserve
-GPU memory. Put `CachePlan.max_cache_bytes` on the sampling and training
-`router_replay` objects yourself. When bootstrapping with an explicit cap, pass
-the training result to `bootstrap_router_replay(..., max_cache_bytes=...)`.
+per-worker `router_replay.max_cache_bytes` caps before you create a job.
+`make_config` no longer uses it for the defaults above, which are now the fixed
+5 GiB / 20 GiB caps; call it directly (through `plan_router_replay_caps`, or the
+`plan_training_cache_bytes` and `plan_sampling_cache_bytes` functions) to size
+caps for a particular job, then set them with an override. It only calculates.
+It does not call the service, edit a job config, or reserve GPU memory. Put
+`CachePlan.max_cache_bytes` on the sampling and training `router_replay` objects
+yourself. When bootstrapping with an explicit cap, pass the training result to
+`bootstrap_router_replay(..., max_cache_bytes=...)`.
 
 One full-sequence capture occupies:
 

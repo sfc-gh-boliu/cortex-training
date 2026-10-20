@@ -41,8 +41,12 @@ python -m examples.inference.serve \
   checkpoint_id=CHECKPOINT_ID
 ```
 
-The command waits until workers are up, prints `job_id`, and leaves the
-endpoint running. Tear it down with:
+The command waits until workers are up, prints `job_id` and the generate and
+evaluate commands for that endpoint, and leaves the endpoint running. Those
+commands repeat the serve command's `model=`, `context=`, `hardware=` and
+`lora=` (or its `job_config=`), and its `max_seq_len=` when set, so they pick
+a renderer for the endpoint's model rather than for their default model. Tear
+it down with:
 
 ```bash
 cortex-training cancel JOB_ID
@@ -53,7 +57,10 @@ with the Python client. It builds its job with
 `make_config(model="Qwen/Qwen3-8B", context="standard", inference=True)` and a
 demo-only override to one GPU and a 2,048-token context. Start Jupyter inside
 the repository: the first cell puts the repository first on `sys.path` so
-`examples` imports from it.
+`examples` imports from it. It reads the PAT from the connection file you
+created during [setup](../../docs/getting-started/setup.md)
+(`~/cortex-training-config.json`, or the path in `CORTEX_TRAINING_CONFIG`), so
+the notebook runs top to bottom wherever the kernel's working directory is.
 
 ## Choose the job
 
@@ -65,8 +72,10 @@ overriding the one before:
    (`standard` or `long`), `hardware=` (`h200`, `b200` or `b300`; default
    `h200`) and `lora=` (`true` or `false`):
    `model-catalog/models/<slug>/<context>/<hw>-inference-<lora|full>.json`.
-2. `inference/overrides.json`, if you create one: changes for every inference
-   run, in any model.
+2. `inference/overrides.json`, applied to every inference run on top of the
+   catalog, in any model. It ships empty (only a `_comment` describing the file);
+   add fields to change a default for all inference runs. A reserved `_comment`
+   key (a free-text note) is stripped before merging and never reaches the job.
 3. The command line: `max_seq_len=`, which defaults to `None` and keeps the
    value from the layers below.
 
@@ -74,6 +83,11 @@ The source checkpoint, when given, goes on the sampling sub-job, and the job is
 logged before it is submitted. A combination the catalog does not have fails
 with the list of files that exist for that model. `job_config=JOB_CONFIG`
 replaces the first two layers with your own create-job JSON file, used as is.
+Overrides merge by the rules in
+[How an example builds its job](../README.md#how-an-example-builds-its-job),
+and
+[Create a job config from the command line](../README.md#create-a-job-config-from-the-command-line)
+shows how to write the same job to a file.
 
 ```bash
 # Qwen3-8B LoRA

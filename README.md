@@ -67,7 +67,7 @@ an existing RL framework like SkyRL, see
 
 ## Examples
 
-Examples are end-to-end post-training and inference workflows you can run out of the box or customize. Each includes a Python entry point, configuration files, and a README with expected results. For detailed instructions on running an example or building a customized workflow, see the guides below:
+Examples are end-to-end post-training and inference workflows you can run out of the box or customize. Each includes a Python entry point and a README with expected results, and builds its job from the [model catalog](model-catalog/README.md), which holds the tuned configuration for each supported model, context and GPU hardware. For detailed instructions on running an example or building a customized workflow, see the guides below:
 
 - **[Conversational SFT](examples/sft/README.md)**: supervised fine-tuning on chat datasets with LoRA or full-parameter training.
 - **[Math GRPO](examples/rl/README.md)**: reinforcement learning for mathematical reasoning with verifiable rewards.

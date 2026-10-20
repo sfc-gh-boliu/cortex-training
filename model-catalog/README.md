@@ -58,6 +58,21 @@ The rules:
 `schema.json` describes `model.json`; the job files follow the create-job
 schema in [the REST API reference](../docs/reference/rest-api.md#8-create-job-schemas).
 
+## Using the catalog
+
+`make_config` in `examples/utils.py` reads these files. It picks a model's
+training or inference file, or combines both into an RL job, and then applies
+override files in order: dictionaries merge key by key, `null` removes a key,
+`sub_job_configs` entries are matched by `job_type`, and other lists are
+replaced whole. For an RL job on an MoE model it then fills in router replay
+with the fixed default caps (5 GiB training, 20 GiB sampling), using the `moe`
+geometry of the model the merged job names only to confirm it is an MoE model;
+the capacity planner in `examples/utils.py` stays available to size caps by
+hand. The examples layer
+the catalog file, the example's `overrides.json` and the command-line
+arguments, in that order. To write a job from the catalog to a file, see
+[Create a job config from the command line](../examples/README.md#create-a-job-config-from-the-command-line).
+
 Qwen3.6-35B-A3B LoRA training uses the `prime_rl` model provider so checkpoints
 can be saved and loaded. PrimeRL currently supports LoRA on the attention
 projections (`q_proj`, `k_proj`, `v_proj`, and `o_proj`) for this model. Routed

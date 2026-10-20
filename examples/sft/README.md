@@ -45,8 +45,10 @@ overriding the one before:
    (`standard` or `long`), `hardware=` (`h200`, `b200` or `b300`; default
    `h200`) and `lora=` (`true` or `false`):
    `model-catalog/models/<slug>/<context>/<hw>-training-<lora|full>.json`.
-2. `sft/overrides.json`, if you create one: changes for every SFT run, in any
-   model.
+2. `sft/overrides.json`, applied to every SFT run on top of the catalog, in any
+   model. It ships empty (only a `_comment` describing the file); add fields to
+   change a default for all SFT runs. A reserved `_comment` key (a free-text
+   note) is stripped before merging and never reaches the job.
 3. The command line: `lr=`, `train_batch_size=` and `max_seq_len=`. Each
    defaults to `None`, which keeps the value from the layers below.
 
@@ -55,7 +57,10 @@ have fails with the list of files that exist for that model.
 
 `job_config=JOB_CONFIG` replaces the first two layers with your own create-job
 JSON file, used as is; `lr=`, `train_batch_size=` and `max_seq_len=` still
-apply. Write one with `python -m examples.utils` and edit it.
+apply. Write one with `python -m examples.utils` and edit it; see
+[Create a job config from the command line](../README.md#create-a-job-config-from-the-command-line).
+Overrides merge by the rules in
+[How an example builds its job](../README.md#how-an-example-builds-its-job).
 
 ```bash
 # Qwen3-8B LoRA
@@ -348,4 +353,8 @@ from the model catalog, with a small override that is for the demo only
 (128-token sequences in batches of 8; the multiplex notebook adds
 `multiplex_job_id`). Start Jupyter inside the repository: the first cell puts
 the repository first on `sys.path` so `examples` imports from it, and stops with
-an error if another installed package named `examples` shadows it.
+an error if another installed package named `examples` shadows it. It reads the
+PAT from the connection file you created during
+[setup](../../docs/getting-started/setup.md) (`~/cortex-training-config.json`,
+or the path in `CORTEX_TRAINING_CONFIG`), so the notebook runs top to bottom
+wherever the kernel's working directory is.

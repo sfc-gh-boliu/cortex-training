@@ -17,4 +17,6 @@ default_training_gpus: 1
 provenance:
   project: thinking-machines-lab/tinker-cookbook
   recipe: tinker_cookbook/distillation/train_on_policy.py
-last_validated: 2026-10-12
+# Pending: the catalog-driven flow has not been validated on a live run yet.
+# The table in README.md will be refreshed when it is.
+last_validated: null

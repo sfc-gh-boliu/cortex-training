@@ -1996,6 +1996,36 @@ class TestCreateJob:
         # The raw path forwards the optimizer untouched.
         assert training_config["optimizer"] == {"type": "adamw"}
 
+    def test_the_api_readme_says_create_job_from_body_rewrites_peft_config_in_place(self):
+        readme = (Path(__file__).resolve().parents[1] / "examples" / "api" / "README.md").read_text()
+        text = " ".join(readme.split())
+        claim = text[text.index("`create_job_from_body` checks the body") :]
+        claim = claim[: claim.index(" See ")]
+        assert "rewrites each `peft_config` in place into its canonical form" in claim
+        assert "unchanged" not in claim
+
+        c = _make_client(post_json={"job_id": "srv-raw"})
+        peft = {"peft_type": "Lora", "r": 32, "lora_alpha": 32, "target_modules": ["q_proj", "v_proj"]}
+        body = {
+            "hardware": "H200",
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "Qwen/Qwen3-8B",
+                    "training_config": {"n_gpus": 4, "optimizer": {"lr": 2e-5}, "peft_config": dict(peft)},
+                }
+            ],
+        }
+        unchanged = json.loads(json.dumps(body))
+        del unchanged["sub_job_configs"][0]["training_config"]["peft_config"]
+
+        c.create_job_from_body(body)
+
+        assert c._session.post.call_args.kwargs["json"] is body
+        canonical = dict(peft, task_type="CAUSAL_LM", lora_dropout=0.0, bias="none", target_parameters=[])
+        assert body["sub_job_configs"][0]["training_config"].pop("peft_config") == canonical
+        assert body == unchanged
+
     def test_create_job_from_body_rejects_invalid_peft_config_before_post(self):
         c = _make_client()
         body = {

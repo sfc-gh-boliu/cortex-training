@@ -91,7 +91,7 @@ def _private_imports(path: Path) -> list[str]:
     ]
 
 
-@pytest.mark.parametrize("package", ["sft", "rl", "inference"])
+@pytest.mark.parametrize("package", ["sft", "rl", "inference", "distillation"])
 def test_private_names_do_not_cross_module_boundaries(package):
     offenders = {
         str(path.relative_to(REPO_ROOT)): names
@@ -238,6 +238,67 @@ def test_job_config_skips_the_catalog_and_the_overrides_file(tmp_path, monkeypat
     assert _sub_job(body, "training")["training_config"]["optimizer"]["lr"] == 2e-4
 
 
+@pytest.mark.parametrize("kind", ["training", "inference"])
+def test_an_rl_job_config_is_rejected_for_a_single_sub_job_mode(tmp_path, kind):
+    utils = _import_example("examples.utils")
+    rl_body = utils.make_config("Qwen/Qwen3-8B", "standard", rl=True)
+    path = tmp_path / "rl.json"
+    path.write_text(json.dumps(rl_body))
+
+    # An RL body (training + sampling) does not satisfy a training-only or
+    # inference-only example, which would otherwise create an unused worker.
+    with pytest.raises(ValueError, match=rf"a {kind} job needs exactly"):
+        utils.build_job(kind, model="Qwen/Qwen3-8B", context="standard", job_config=str(path))
+
+
+def test_an_rl_job_config_with_mismatched_models_is_rejected(tmp_path):
+    utils = _import_example("examples.utils")
+    body = utils.make_config("Qwen/Qwen3-8B", "standard", rl=True)
+    for sub in body["sub_job_configs"]:
+        if sub["job_type"] == "sampling":
+            sub["model_name"] = "Qwen/Qwen3-0.6B"
+    path = tmp_path / "rl.json"
+    path.write_text(json.dumps(body))
+
+    # A supplied RL body pairing different training/sampling models is rejected,
+    # not accepted and then broken at run time.
+    with pytest.raises(ValueError, match="must name the same model"):
+        utils.build_job("rl", model="Qwen/Qwen3-8B", context="standard", job_config=str(path))
+
+
+def test_an_rl_job_config_with_an_oversized_sampling_window_is_rejected(tmp_path):
+    utils = _import_example("examples.utils")
+    body = utils.make_config("Qwen/Qwen3-8B", "standard", rl=True)
+    for sub in body["sub_job_configs"]:
+        config = sub.get("training_config") or sub.get("inference_config")
+        config["max_seq_len"] = 512 if sub["job_type"] == "training" else 1024
+    path = tmp_path / "rl.json"
+    path.write_text(json.dumps(body))
+
+    with pytest.raises(ValueError, match="sampling max_seq_len 1024 exceeds its training max_seq_len 512"):
+        utils.build_job("rl", model="Qwen/Qwen3-8B", context="standard", job_config=str(path))
+
+    # The command-line max_seq_len applies to both sub-jobs, so it brings the
+    # supplied sampling window back in line and the build is accepted.
+    body = utils.build_job("rl", model="Qwen/Qwen3-8B", context="standard", job_config=str(path), max_seq_len=2048)
+    windows = {s["job_type"]: (s.get("training_config") or s.get("inference_config"))["max_seq_len"] for s in body["sub_job_configs"]}
+    assert windows == {"training": 2048, "sampling": 2048}
+
+
+def test_a_matching_job_config_is_still_accepted_for_each_mode(tmp_path):
+    utils = _import_example("examples.utils")
+    training = tmp_path / "t.json"
+    training.write_text(json.dumps(utils.make_config("Qwen/Qwen3-8B", "standard")))
+    inference = tmp_path / "i.json"
+    inference.write_text(json.dumps(utils.make_config("Qwen/Qwen3-8B", "standard", inference=True)))
+    rl = tmp_path / "rl.json"
+    rl.write_text(json.dumps(utils.make_config("Qwen/Qwen3-8B", "standard", rl=True)))
+
+    assert {s["job_type"] for s in utils.build_job("training", model="Qwen/Qwen3-8B", context="standard", job_config=str(training))["sub_job_configs"]} == {"training"}
+    assert {s["job_type"] for s in utils.build_job("inference", model="Qwen/Qwen3-8B", context="standard", job_config=str(inference))["sub_job_configs"]} == {"sampling"}
+    assert {s["job_type"] for s in utils.build_job("rl", model="Qwen/Qwen3-8B", context="standard", job_config=str(rl))["sub_job_configs"]} == {"training", "sampling"}
+
+
 def test_rl_job_config_is_used_as_is(tmp_path):
     utils = _import_example("examples.utils")
     record = utils.make_config("Qwen/Qwen3-8B", "standard", rl=True)
@@ -261,10 +322,21 @@ def test_overrides_json_sits_between_the_catalog_and_the_command_line(tmp_path):
     assert (training["max_seq_len"], training["train_batch_size"]) == (8192, 2)
 
 
-def test_only_the_rl_example_ships_an_overrides_file():
-    # The RL example ships rl/overrides.json restoring the three settings shared by
-    # the pre-restructure RL configs; no other example ships an overrides file.
-    assert list(EXAMPLES.glob("*/overrides.json")) == [RL_OVERRIDES]
+def test_every_example_ships_an_overrides_file_with_a_comment():
+    # Every example ships an overrides.json carrying a human "_comment"; SFT and
+    # inference are comment-only (no real overrides), RL and distillation also
+    # carry their real settings.
+    sft = EXAMPLES / "sft" / "overrides.json"
+    inference = EXAMPLES / "inference" / "overrides.json"
+    distillation_overrides = EXAMPLES / "distillation" / "overrides.json"
+    assert set(EXAMPLES.glob("*/overrides.json")) == {sft, RL_OVERRIDES, inference, distillation_overrides}
+
+    for path in (sft, inference):
+        data = json.loads(path.read_text())
+        assert set(data) == {"_comment"} and isinstance(data["_comment"], str) and data["_comment"]
+
+    for path in (RL_OVERRIDES, distillation_overrides):
+        assert isinstance(json.loads(path.read_text()).get("_comment"), str)
 
     override = json.loads(RL_OVERRIDES.read_text())
     (training,) = [sub for sub in override["sub_job_configs"] if sub["job_type"] == "training"]
@@ -272,6 +344,27 @@ def test_only_the_rl_example_ships_an_overrides_file():
     assert config["optimizer"] == {"betas": [0.9, 0.95]}
     assert config["mb_spec"] == {"max_tokens_per_mb": 10240}
     assert config["ds_config"] == {"zero_optimization": {"reduce_scatter": True}}
+
+    distillation = json.loads(distillation_overrides.read_text())
+    (student_training,) = [sub for sub in distillation["sub_job_configs"] if sub["job_type"] == "training"]
+    student_config = student_training["training_config"]
+    assert student_config["n_gpus"] == 1 and student_config["train_batch_size"] == 1
+    assert student_config["mb_spec"] == {"max_tokens_per_mb": 10240}
+    assert student_config["ds_config"]["zero_optimization"]["reduce_scatter"] is True
+
+
+def test_the_sft_and_inference_overrides_files_are_no_ops(monkeypatch):
+    utils = _import_example("examples.utils")
+    monkeypatch.delenv(utils.DEBUG_OPTIONS_ENV, raising=False)
+
+    sft_with = utils.build_job("training", model="Qwen/Qwen3-8B", context="standard", example_dir=EXAMPLES / "sft")
+    assert sft_with == utils.make_config("Qwen/Qwen3-8B", "standard")
+
+    inference_with = utils.build_job(
+        "inference", model="Qwen/Qwen3-8B", context="standard", example_dir=EXAMPLES / "inference"
+    )
+    assert inference_with == utils.make_config("Qwen/Qwen3-8B", "standard", inference=True)
+    assert "_comment" not in json.dumps(sft_with) and "_comment" not in json.dumps(inference_with)
 
 
 def test_build_job_adds_the_debug_tag_and_the_source_checkpoint(monkeypatch):
@@ -467,7 +560,7 @@ def test_a_job_config_run_writes_no_record(tmp_path, monkeypatch):
     assert path.read_text() == "previous run\n"
 
 
-def test_replaying_a_debug_record_via_job_config_is_authorized_by_the_example(tmp_path, monkeypatch):
+def test_only_an_explicit_debug_image_tag_authorizes_debug_options(tmp_path, monkeypatch):
     import types
 
     utils = _import_example("examples.utils")
@@ -478,12 +571,14 @@ def test_replaying_a_debug_record_via_job_config_is_authorized_by_the_example(tm
     # though build_job sets it directly during the run.
     monkeypatch.delenv(DEBUG_OPTIONS_ENV, raising=False)
 
-    # A generated run keeps its debug image tag in the record it writes.
+    # An explicit debug_image_tag is the caller's opt-in: it sets the body's debug
+    # block and authorizes the internal-only gate for this process.
     record = utils.build_job(
         "rl", model="Qwen/Qwen3-8B", context="standard", lora=True,
         rollout_batch_size=8, debug_image_tag="dev_test",
     )
     assert record["debug"] == {"job": {"image_tag": "dev_test"}}
+    assert os.environ.get(DEBUG_OPTIONS_ENV) == "1"
     record_file = tmp_path / "qwen3-8b-standard-h200-lora.json"
     record_file.write_text(json.dumps(record))
 
@@ -496,21 +591,26 @@ def test_replaying_a_debug_record_via_job_config_is_authorized_by_the_example(tm
 
     monkeypatch.setattr(client, "_send", fake_send)
 
-    # An arbitrary debug-bearing body sent straight to the client, with no authorization,
-    # is still rejected: the client's internal-only gate stays strict.
+    # Replaying a saved record that merely carries a debug block does NOT elevate
+    # on its own: build_job leaves the process gate as it found it (cleared here),
+    # so the client's internal-only check still rejects the debug-bearing body.
     monkeypatch.delenv(DEBUG_OPTIONS_ENV, raising=False)
-    with pytest.raises(ValueError, match="debug options are an internal-only capability"):
-        client.create_job_from_body(json.loads(record_file.read_text()))
-
-    # Replaying the example's own record with job_config= authorizes it for this run,
-    # so the same client now accepts the debug-bearing body -- no manual env export.
     replayed = utils.build_job(
         "rl", model="Qwen/Qwen3-8B", context="standard", lora=True,
         rollout_batch_size=8, job_config=str(record_file),
     )
     assert replayed["debug"] == {"job": {"image_tag": "dev_test"}}
+    assert os.environ.get(DEBUG_OPTIONS_ENV) is None
+    with pytest.raises(ValueError, match="debug options are an internal-only capability"):
+        client.create_job_from_body(replayed)
+
+    # The caller re-authorizes explicitly by passing debug_image_tag= again.
+    reauthorized = utils.build_job(
+        "rl", model="Qwen/Qwen3-8B", context="standard", lora=True,
+        rollout_batch_size=8, job_config=str(record_file), debug_image_tag="dev_test",
+    )
     assert os.environ.get(DEBUG_OPTIONS_ENV) == "1"
-    assert client.create_job_from_body(replayed) == {"job_id": "job-1"}
+    assert client.create_job_from_body(reauthorized) == {"job_id": "job-1"}
     assert sent["body"]["debug"] == {"job": {"image_tag": "dev_test"}}
 
 
@@ -541,7 +641,7 @@ def _assert_serves_checkpoint(utils, training_sub: dict, args: dict) -> None:
     if adapter is None:
         assert "peft_config" not in sampling_sub["inference_config"]
     else:
-        assert utils._same_adapter(sampling_sub["inference_config"]["peft_config"], adapter)
+        assert utils.same_adapter(sampling_sub["inference_config"]["peft_config"], adapter)
 
 
 @pytest.mark.parametrize(("model", "context", "hardware", "lora"), _catalog_selections("training"))
@@ -558,13 +658,15 @@ def test_follow_up_commands_pick_an_inference_file_that_serves_the_checkpoint(mo
 
 @pytest.mark.parametrize("model", ["Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-35B-A3B", "Qwen/Qwen3.8-27B"])
 @pytest.mark.parametrize("lora", [False, True])
-def test_standard_runs_follow_up_at_long_context_when_only_long_inference_files_exist(model, lora):
+def test_standard_runs_follow_up_at_standard_context(model, lora):
+    # These models now ship standard-context inference files, so a standard
+    # training run serves its checkpoint at standard context (matching adapter).
     utils = _import_example("examples.utils")
     body = utils.build_job("training", model=model, context="standard", lora=lora)
 
     assert utils.inference_job_args(body, context="standard") == {
         "model": model,
-        "context": "long",
+        "context": "standard",
         "hardware": "h200",
         "lora": lora,
     }
@@ -588,7 +690,7 @@ def test_rl_follow_up_commands_serve_the_checkpoint():
         # A job_config run picks the context its training max_seq_len falls in, when it can.
         ("Qwen/Qwen3.6-35B-A3B", "long", "long"),
         ("Qwen/Qwen3-8B", "standard", "standard"),
-        ("Qwen/Qwen3.5-4B", "standard", "long"),
+        ("Qwen/Qwen3.5-4B", "standard", "standard"),
     ],
 )
 def test_job_config_runs_pick_the_context_from_their_sequence_length(model, context, expected):
@@ -675,9 +777,9 @@ def test_lora_adapters_match_whatever_the_order_of_their_target_modules():
     utils = _import_example("examples.utils")
     adapter = {"peft_type": "Lora", "r": 32, "lora_alpha": 32, "target_modules": ["q_proj", "v_proj"]}
 
-    assert utils._same_adapter(adapter, dict(adapter, target_modules=["v_proj", "q_proj"], task_type="CAUSAL_LM"))
-    assert not utils._same_adapter(adapter, dict(adapter, r=16))
-    assert not utils._same_adapter(adapter, None)
+    assert utils.same_adapter(adapter, dict(adapter, target_modules=["v_proj", "q_proj"], task_type="CAUSAL_LM"))
+    assert not utils.same_adapter(adapter, dict(adapter, r=16))
+    assert not utils.same_adapter(adapter, None)
 
 
 @pytest.mark.parametrize(
@@ -803,7 +905,7 @@ def test_saved_checkpoints_print_a_command_that_serves_the_checkpoint(caplog):
 
     assert (
         "  python -m examples.inference.evaluate config=conn.json source_job_id=job-1 "
-        "model=Qwen/Qwen3.5-4B context=long hardware=h200 lora=true checkpoint_id=cp_1 temperature=1.0"
+        "model=Qwen/Qwen3.5-4B context=standard hardware=h200 lora=true checkpoint_id=cp_1 temperature=1.0"
     ) in caplog.text
     args = _printed_args(caplog.text, "examples.inference.evaluate")
     served, source = endpoint.inference_endpoint_body(
@@ -816,7 +918,7 @@ def test_saved_checkpoints_print_a_command_that_serves_the_checkpoint(caplog):
     )
     (sampling,) = served["sub_job_configs"]
     assert sampling["source_checkpoint_info"] == source
-    assert utils._same_adapter(sampling["inference_config"]["peft_config"], body["sub_job_configs"][0]["training_config"]["peft_config"])
+    assert utils.same_adapter(sampling["inference_config"]["peft_config"], body["sub_job_configs"][0]["training_config"]["peft_config"])
 
 
 def test_saved_checkpoints_print_an_explicit_job_config_when_no_catalog_file_fits(caplog):
@@ -932,17 +1034,34 @@ def test_a_job_config_replaces_the_catalog_file_and_overrides_json(tmp_path, mon
     assert from_file["debug"] == {"job": {"image_tag": "dev_test"}}
 
 
-def test_job_configs_come_from_the_catalog_except_distillation():
+@pytest.mark.parametrize(
+    ("path", "section"),
+    [("examples/api/README.md", "## Create-job bodies"), ("examples/README.md", "## Create a job config from the command line")],
+)
+def test_job_body_docs_submit_with_ct(path, section):
+    text = (REPO_ROOT / path).read_text()
+    start = text.index(section)
+    end = text.find("\n## ", start + len(section))
+    blocks = re.findall(r"```bash\n(.*?)```", text[start : end if end != -1 else None], re.S)
+    submits = [line.strip() for block in blocks for line in block.splitlines() if " submit " in f" {line} "]
+
+    assert any(line.startswith("ct submit --dry-run ") for line in submits)
+    assert all(line.startswith("ct submit ") for line in submits)
+
+
+def test_job_configs_come_from_the_catalog():
     utils = _import_example("examples.utils")
 
     assert not (EXAMPLES / "sft" / "configs").exists()
     assert not (EXAMPLES / "inference" / "configs").exists()
     assert not hasattr(utils, "sampling_job_body")
-    assert sorted(path.name for path in (EXAMPLES / "distillation" / "configs").glob("*.json")) == [
-        "qwen3_0p6b_sampling.json",
-        "qwen3_0p6b_student.json",
-        "qwen3_8b_teacher.json",
-    ]
+    # Distillation builds its student and teacher jobs from the catalog too, via
+    # make_distillation_config and examples/distillation/overrides.json; configs/
+    # is a gitignored per-run output and holds no committed job files.
+    assert hasattr(utils, "make_distillation_config")
+    assert (EXAMPLES / "distillation" / "overrides.json").is_file()
+    distillation_configs = EXAMPLES / "distillation" / "configs"
+    assert not distillation_configs.exists() or not any(distillation_configs.glob("*.json"))
 
 
 def test_examples_keep_task_code_and_metadata_in_their_own_folders():

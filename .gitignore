@@ -10,5 +10,6 @@ dist/
 # filenames the docs tell you to create -- a blanket `*.json` also silently
 # ignored this repo's own examples/api/*.json payloads.
 connection.json
+conn.json
 *-config.json
 config.json

@@ -340,12 +340,12 @@ backend keys such as `context` or `processing`.
 `build_forward_backward_payload(spec)` builds a frame from readable JSON and is
 what the CLI's `fwd-bwd` command uses.
 
-`cortex_training.peft.normalize_lora_peft_config(cfg)` validates and normalizes
+`cortex_training.client.peft.normalize_lora_peft_config(cfg)` validates and normalizes
 the LoRA subset supported by weight sync. It requires `peft_type` to be exactly
 `"Lora"`, so a config copied from a Hugging Face `adapter_config.json` (which
 writes `"LORA"`) must be adjusted.
 
-`cortex_training.optimizer.normalize_optimizer_config(cfg)` does the same for
+`cortex_training.client.optimizer.normalize_optimizer_config(cfg)` does the same for
 the training optimizer block, returning `(canonical_optimizer,
 gradient_clipping)`. It resolves the `type`/`name` and `beta1`/`beta2` aliases,
 flattens a DeepSpeed `params` sub-object, hoists a nested `gradient_clipping`

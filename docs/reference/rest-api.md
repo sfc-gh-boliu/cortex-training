@@ -10,9 +10,9 @@
 > generation, operations, and logs.
 >
 > **Sources used for this snapshot.** The client and wire implementation in
-> `src/cortex_training/client.py` and `src/cortex_training/wire.py`, the
-> command-line interface in `src/cortex_training/_cli.py`, their unit tests,
-> and their unit tests are the local evidence for this document. The service's
+> `src/cortex_training/client/` and `src/cortex_training/wire.py`, the
+> command-line interface in `src/cortex_training/cli/`, and their unit tests
+> are the local evidence for this document. The service's
 > own OpenAPI specification remains the source of truth when it is available.
 > The server-side statements in sections 8.2 and 8.3 about `model_options`
 > and the `prime_rl` block describe server behavior and are not exercised by

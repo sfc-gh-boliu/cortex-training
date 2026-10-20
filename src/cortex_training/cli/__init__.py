@@ -22,7 +22,7 @@ from typing import Any
 from typing import Callable
 from typing import TextIO
 
-import cortex_training._cli as _implementation
+import cortex_training.cli.commands as _implementation
 from cortex_training.tui.__main__ import run as _run_tui
 
 _TUI_FLAG_OPTIONS = {"--no-verify-ssl"}

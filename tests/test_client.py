@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for ``cortex_training.client``.
+"""Unit tests for ``cortex_training.client.core``.
 
 Two suites:
 
@@ -63,7 +63,8 @@ spec = importlib.util.spec_from_file_location(
         __import__("pathlib").Path(__file__).resolve().parent.parent
         / "src"
         / "cortex_training"
-        / "client.py"
+        / "client"
+        / "core.py"
     ),
 )
 nc = importlib.util.module_from_spec(spec)

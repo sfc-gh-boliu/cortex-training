@@ -85,19 +85,19 @@ from tenacity import stop_after_attempt
 from tenacity import wait_exponential_jitter
 from urllib3.exceptions import NewConnectionError
 
-from cortex_training import _account_jobs
 from cortex_training import _artifact_download
-from cortex_training._account_jobs import AccountJobListUnavailable  # noqa: F401 - exported
-from cortex_training._account_jobs import InvalidPageToken  # noqa: F401 - exported
+from cortex_training import wire
 from cortex_training._artifact_download import DownloadCancelled
 from cortex_training._artifact_download import NoChunksError
-from cortex_training import wire
-from cortex_training.optimizer import normalize_optimizer_config
-from cortex_training.peft import normalize_lora_peft_config
-from cortex_training.snowflake_auth import SnowflakeProfileAuth
-from cortex_training.snowflake_auth import SnowflakeTelemetryTokenProvider
-from cortex_training.telemetry import CachedSessionTokenProvider
-from cortex_training.telemetry import OtlpMetricEmitter
+from cortex_training.client import _account_jobs
+from cortex_training.client._account_jobs import AccountJobListUnavailable  # noqa: F401 - exported
+from cortex_training.client._account_jobs import InvalidPageToken  # noqa: F401 - exported
+from cortex_training.client.auth import SnowflakeProfileAuth
+from cortex_training.client.auth import SnowflakeTelemetryTokenProvider
+from cortex_training.client.optimizer import normalize_optimizer_config
+from cortex_training.client.peft import normalize_lora_peft_config
+from cortex_training.client.telemetry import CachedSessionTokenProvider
+from cortex_training.client.telemetry import OtlpMetricEmitter
 
 logger = logging.getLogger(__name__)
 
@@ -1008,7 +1008,7 @@ class TrainingConfig(BaseModel):
     Required fields mirror the server-side validator: ``max_seq_len > 0``,
     ``train_batch_size > 0``, ``n_gpus > 0``, and an ``optimizer`` that carries
     at least one setting. ``optimizer`` is canonicalized on construction (see
-    :func:`cortex_training.optimizer.normalize_optimizer_config`), so a block
+    :func:`cortex_training.client.optimizer.normalize_optimizer_config`), so a block
     holding only ``gradient_clipping`` is hoisted onto the typed field and
     leaves ``optimizer`` empty.
 

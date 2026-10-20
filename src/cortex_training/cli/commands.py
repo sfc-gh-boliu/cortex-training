@@ -113,19 +113,19 @@ _UNSUPPORTED_HARDWARE_CODE = "517604"
 
 
 def _load_cortex_training_client_class():
-    from .client import CortexTrainingClient
+    from cortex_training.client import CortexTrainingClient
 
     return CortexTrainingClient
 
 
 def _load_forward_backward_payload_builder():
-    from .client import build_forward_backward_payload
+    from cortex_training.client import build_forward_backward_payload
 
     return build_forward_backward_payload
 
 
 def _hardware_choices() -> list[str]:
-    from .client import Hardware
+    from cortex_training.client import Hardware
 
     return [member.value for member in Hardware]
 
@@ -251,7 +251,7 @@ def _list_filter(args: argparse.Namespace) -> Callable[[dict], bool]:
     """Build the list filters for the schema's jobs; --all has the server apply them."""
     # Rows can carry an enum name (JOB_STATE_RUNNING) or an alias, so compare
     # on the normalized word rather than the raw field.
-    from .client import CortexTrainingClient
+    from cortex_training.client import CortexTrainingClient
 
     def status_of(job: dict) -> str:
         word = CortexTrainingClient._normalize_job_status(job.get("status"))
@@ -945,7 +945,7 @@ def _read_json_object(path: str, stdin: TextIO) -> dict[str, Any]:
     return parsed
 
 
-# Duplicated from client.py rather than imported: submit --dry-run must stay
+# Duplicated from client/core.py rather than imported: submit --dry-run must stay
 # importable without pulling in the client (and therefore torch).
 _LOG_PROBABILITY_JOB_TYPE_ALIASES = frozenset({"log_probability", "log_prob"})
 _UNSUPPORTED_LOG_PROBABILITY_MESSAGE = (
@@ -969,7 +969,7 @@ def _reject_log_probability_sub_job(job_type: Any, *, location: str) -> None:
 
 
 def _validate_create_job_body(body: dict[str, Any]) -> None:
-    from .client import _validate_raw_sub_job_configs
+    from cortex_training.client.core import _validate_raw_sub_job_configs
 
     sub_job_configs = body.get("sub_job_configs")
     if not isinstance(sub_job_configs, list) or not sub_job_configs:
@@ -1021,7 +1021,7 @@ def _format_error(exc: BaseException) -> str:
             body = body[:4000] + "...<truncated>"
         parts.append(f"response body: {body}")
     if getattr(response, "status_code", None) == 401 and _request_sent_pat(response):
-        from cortex_training.snowflake_auth import credentials_rejected_hint
+        from cortex_training.client.auth import credentials_rejected_hint
 
         parts.append(
             credentials_rejected_hint("Snowflake rejected your credentials (HTTP 401).")

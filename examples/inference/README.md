@@ -49,7 +49,11 @@ cortex-training cancel JOB_ID
 ```
 
 `inference_walkthrough.ipynb` shows the same create → generate → cancel loop
-with the Python client.
+with the Python client. It builds its job with
+`make_config(model="Qwen/Qwen3-8B", context="standard", inference=True)` and a
+demo-only override to one GPU and a 2,048-token context. Start Jupyter inside
+the repository: the first cell puts the repository first on `sys.path` so
+`examples` imports from it.
 
 ## Choose the job
 

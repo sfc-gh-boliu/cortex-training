@@ -342,3 +342,10 @@ python -m examples.inference.evaluate \
 
 - `conversational/qwen3_8b_sft_training.ipynb`
 - `conversational/qwen3_8b_sft_training_multiplex.ipynb`
+
+Both build their job with `make_config(model="Qwen/Qwen3-8B", context="standard")`
+from the model catalog, with a small override that is for the demo only
+(128-token sequences in batches of 8; the multiplex notebook adds
+`multiplex_job_id`). Start Jupyter inside the repository: the first cell puts
+the repository first on `sys.path` so `examples` imports from it, and stops with
+an error if another installed package named `examples` shadows it.

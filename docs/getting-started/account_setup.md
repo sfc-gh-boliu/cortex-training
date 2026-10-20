@@ -109,7 +109,6 @@ confirm the model learned the expected answer:
 ```bash
 python -m examples.inference.generate \
   config=/path/to/your-config.json \
-  job_config=examples/inference/configs/qwen3_8b_full.json \
   source_job_id=<training_job_id> \
   checkpoint_id=<checkpoint_id> \
   temperature=0 \
@@ -133,10 +132,10 @@ cortex-training tui                   # terminal UI for browsing jobs and logs
 
 You have a working setup. From here:
 
-- **Try different training methods**: adjust the job config JSON to use
-  [LoRA](../../examples/sft/README.md)
-  (`job_config=configs/qwen3_8b_lora.json`), a different model, or different
-  hyperparameters
+- **Try different training methods**: pass `lora=true` for
+  [LoRA](../../examples/sft/README.md), `model=` for a different model from the
+  [model catalog](../../model-catalog/README.md), or `lr=`,
+  `train_batch_size=` and `max_seq_len=` for different hyperparameters
 - **Try reinforcement learning**: run the
   [Math GRPO example](../../examples/rl/README.md)
 - **Explore all examples**: browse the [example index](../../examples/README.md)

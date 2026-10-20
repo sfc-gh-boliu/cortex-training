@@ -11,6 +11,17 @@ class Config:
     config: str
     job_id: str | None = None
 
+    # The job comes from model-catalog/models/; job_config= replaces it with a file.
+    model: str = "Qwen/Qwen3-8B"
+    context: str = "standard"
+    hardware: str = "h200"
+    lora: bool = True
+    job_config: str | None = None
+    # None keeps the job's value.
+    lr: float | None = None
+    train_batch_size: int | None = None
+    max_seq_len: int | None = None
+
     problems_per_batch: int = 64
     group_size: int = 16
     max_tokens: int = 4096
@@ -35,8 +46,6 @@ class Config:
     wandb_project: str | None = None
     wandb_name: str | None = None
     sf_tracking: bool = False
-
-    job_config: str = "configs/qwen3_8b_lora.json"
 
 
 def main(config: Config) -> None:

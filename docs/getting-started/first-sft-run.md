@@ -18,14 +18,16 @@ python -m examples.sft.conversational.train \
   max_steps=2
 ```
 
-The default job config, `configs/qwen3_8b_full.json`, requests four GPUs and
-runs full-parameter training, so check capacity first. It omits `hardware`, so
-the job lands on H200. Add `"hardware": "B200"` (or `B300`) at the top level of
-that JSON to use another pool; check
-`cortex-training capacity --hardware B200` first. GPU count, batch shape,
-sequence length and LoRA all live in that JSON rather than on the command line --
-pass a different one with `job_config=`, for example
-`job_config=configs/qwen3_8b_lora.json` for the lighter LoRA path. See
+The default job is `Qwen/Qwen3-8B` at standard context on H200 with
+full-parameter training, taken from that model's training file in the
+[model catalog](../../model-catalog/README.md). It requests four GPUs, so check
+capacity first. Pick another catalog file with `model=`, `context=`,
+`hardware=` and `lora=`, for example
+`lora=true` for the lighter LoRA path; `hardware=b200` (or `b300`) needs B200
+files in the catalog and B200 capacity, so check
+`cortex-training capacity --hardware B200` first. GPU count, parallelism and
+the LoRA adapter come from the catalog file; `lr=`, `train_batch_size=` and
+`max_seq_len=` override it on the command line. See
 [sizing and batching](../concepts/sizing-and-batching.md) and
 [GPU hardware](../concepts/hardware.md).
 

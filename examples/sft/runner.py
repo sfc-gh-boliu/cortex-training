@@ -6,23 +6,21 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Any
 from typing import Protocol
 
 from examples.logging import setup_logging
+from examples.utils import build_job
 from examples.utils import build_renderer
 from examples.utils import collate
 from examples.utils import forward_backward_step
-from examples.utils import load_job_body
+from examples.utils import inference_job_args
 from examples.utils import log_saved_checkpoints
 from examples.utils import make_client
 from examples.utils import running_job
 from examples.utils import save_example_checkpoints
-
-from cortex_training.client import DEBUG_OPTIONS_ENV
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARN)
@@ -30,18 +28,24 @@ logging.getLogger("urllib3").setLevel(logging.WARN)
 logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
 
 _EXAMPLE_DIR = Path(__file__).resolve().parent
-_CONFIG_SEARCH_DIRS = (_EXAMPLE_DIR, _EXAMPLE_DIR / "configs")
 
 
 class Config(Protocol):
     config: str
     job_id: str | None
+    model: str
+    context: str
+    hardware: str
+    lora: bool
+    job_config: str | None
+    lr: float | None
+    train_batch_size: int | None
+    max_seq_len: int | None
     pad_to_max_length: bool
     max_steps: int
     debug_image_tag: str | None
     enable_thinking: bool
     renderer_name: str | None
-    job_config: str
 
 
 class Task(Protocol):
@@ -61,10 +65,21 @@ class Task(Protocol):
 
 
 def job_body(config: Config) -> dict:
-    body = load_job_body(config.job_config, search_dirs=_CONFIG_SEARCH_DIRS)
-    if config.debug_image_tag:
-        body["debug"] = {"job": {"image_tag": config.debug_image_tag}}
-    return body
+    """The training job: the catalog file, sft/overrides.json, then ``config``."""
+    return build_job(
+        "training",
+        model=config.model,
+        context=config.context,
+        hardware=config.hardware,
+        lora=config.lora,
+        job_config=config.job_config,
+        example_dir=_EXAMPLE_DIR,
+        search_dirs=(_EXAMPLE_DIR,),
+        lr=config.lr,
+        train_batch_size=config.train_batch_size,
+        max_seq_len=config.max_seq_len,
+        debug_image_tag=config.debug_image_tag,
+    )
 
 
 def causal_cross_entropy_processing() -> dict[str, Any]:
@@ -76,10 +91,6 @@ def causal_cross_entropy_processing() -> dict[str, Any]:
 
 
 def train(config: Config, task: Task) -> dict[str, Any]:
-    if config.debug_image_tag:
-        os.environ[DEBUG_OPTIONS_ENV] = "1"
-        logger.info("Using debug image_tag=%s", config.debug_image_tag)
-
     body = job_body(config)
     training_sub = next(
         (
@@ -182,7 +193,10 @@ def train(config: Config, task: Task) -> dict[str, Any]:
             job_id=job_id,
             saved=saved,
             sampling_command="sample",
-            job_config=Path(config.job_config).name,
+            job_args=inference_job_args(
+                body,
+                context=config.context if config.job_config is None else None,
+            ),
             sample_prompt=sample_prompt,
             enable_thinking=config.enable_thinking,
             renderer_name=config.renderer_name,

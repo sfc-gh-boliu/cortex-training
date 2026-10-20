@@ -10,9 +10,9 @@ prompting, scoring and evaluation in `task.py`, and its metadata in
 
 ## Hardware
 
-The default configuration requests four training GPUs and four sampling GPUs.
-Reduce or increase these values together with batch settings, and verify
-capacity before submission:
+The default job requests four training GPUs and two sampling GPUs (Qwen3-8B
+LoRA at standard context on H200). Other models and contexts take the GPU
+counts of their catalog files; verify capacity before submission:
 
 ```bash
 cortex-training capacity
@@ -28,24 +28,24 @@ python -m examples.rl.math_grpo.train \
 # Qwen3-8B full-parameter
 python -m examples.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/qwen3_8b_full.json
+  lora=false
 
 # Qwen3.6-35B-A3B LoRA
 python -m examples.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/qwen36_35b_a3b_lora.json \
+  model=Qwen/Qwen3.6-35B-A3B context=long lora=true \
   max_tokens=2048
 
 # Qwen3.6-35B-A3B full-parameter
 python -m examples.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/qwen36_35b_a3b_full.json \
+  model=Qwen/Qwen3.6-35B-A3B context=long lora=false \
   max_tokens=2048
 
 # Qwen3.8-27B full-parameter
 python -m examples.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=configs/qwen38_27b_full.json \
+  model=Qwen/Qwen3.8-27B context=long lora=false \
   weight_sync_bucket_size=3221225472 \
   max_tokens=2048
 ```
@@ -53,14 +53,45 @@ python -m examples.rl.math_grpo.train \
 `config=` is the Snowflake connection file. Adapt from
 `docs/getting-started/connection.json.template`.
 
-The default job body is `configs/qwen3_8b_lora.json`. The default run will be finished within 1h.
+The default job is `Qwen/Qwen3-8B` LoRA at standard context on H200. The
+default run will be finished within 1h.
+
+## Choose the job
+
+The example builds its job on every run, from the
+[model catalog](../../model-catalog/README.md), in three layers, each
+overriding the one before:
+
+1. The model's training and inference files for `model=` (the exact model ID),
+   `context=` (`standard` or `long`), `hardware=` (`h200`, `b200` or `b300`;
+   default `h200`) and `lora=` (default `true`), combined into one job with a
+   training and a sampling sub-job. Both come from the same hardware prefix.
+2. `rl/overrides.json`, if you create one: changes for every RL run, in any
+   model.
+3. The command line: `lr=`, `train_batch_size=` and `max_seq_len=` (the last
+   applies to both sub-jobs). Each defaults to `None`, which keeps the value
+   from the layers below.
+
+The job is logged before it is submitted. A combination the catalog does not
+have fails with the list of files that exist for that model: an RL job needs a
+training and an inference file of the same context, hardware and mode.
+
+Each run writes the job it built to
+`examples/rl/configs/<slug>-<context>-<hw>-<lora|full>.json`, replacing the
+file of the previous run with the same selection. To change one run, copy that
+file, edit it, and pass it back with `job_config=JOB_CONFIG`: the example then
+uses the file as is, plus `lr=`, `train_batch_size=` and `max_seq_len=`, and
+writes nothing.
 
 ## Customizability
 
 ```bash
 python -m examples.rl.math_grpo.train \
   config=/path/to/config.json \
-  job_config=JOB_CONFIG \
+  model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA \
+  lr=LEARNING_RATE \
+  train_batch_size=TRAIN_BATCH_SIZE \
+  max_seq_len=MAX_SEQ_LEN \
   max_tokens=MAX_TOKENS \
   problems_per_batch=PROBLEMS_PER_BATCH \
   group_size=GROUP_SIZE \
@@ -71,7 +102,8 @@ python -m examples.rl.math_grpo.train \
   sf_tracking=SF_TRACKING
 ```
 
-LoRA, GPU counts, sequence length, and MoE live in the job-config JSON. Set
+LoRA, GPU counts, sequence length, and MoE come from the job (see
+[Choose the job](#choose-the-job)). Set
 `wandb_project` to log to Weights & Biases after `uv pip install wandb` and
 `export WANDB_API_KEY` / `export WANDB_BASE_URL`. Set `sf_tracking=True` to log
 to Snowflake experiment tracking after
@@ -81,12 +113,71 @@ to Snowflake experiment tracking after
 bytes. When omitted, the example leaves the field out and uses the server
 default. Set it above the largest individual model tensor.
 
-The example loads one create-job body with colocated sampling and training
-sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
+The example submits one create-job body with colocated training and sampling
+sub-jobs, which is also the shape of a file you pass with
+`job_config=JOB_CONFIG`.
 
 ```json
 {
+  "hardware": HARDWARE,
   "sub_job_configs": [
+    {
+      "job_type": "training",
+      "model_name": MODEL_NAME,
+      "dtype": DTYPE,
+      "seed": SEED,
+      "training_config": {
+        "n_gpus": NUM_TRAINING_GPUS,
+        "max_seq_len": MAX_SEQ_LEN,
+        "train_batch_size": TRAIN_BATCH_SIZE,
+        "sp_size": SEQUENCE_PARALLEL_SIZE,
+        "gradient_clipping": GRADIENT_CLIPPING,
+        "model_provider": MODEL_PROVIDER, // Use prime_rl for MoE
+        "attn_implementation": "flash_attention_3",
+        "optimizer": {
+          "name": "AdamW",
+          "lr": LEARNING_RATE,
+          "weight_decay": WEIGHT_DECAY,
+          "betas": [ADAM_BETA1, ADAM_BETA2],
+          "eps": ADAM_EPS
+        },
+        "ds_config": {
+          "zero_optimization": {
+            "stage": ZERO_STAGE
+          },
+          "bf16": {
+            "enabled": true
+          }
+        },
+
+        // Optional packing: the most real tokens per model call (server default 10240).
+        "mb_spec": {"max_tokens_per_mb": MAX_TOKENS_PER_MB},
+
+        // Optional LoRA. Omit for full-parameter.
+        "peft_config": {
+          "peft_type": "Lora",
+          "r": LORA_RANK,
+          "lora_alpha": LORA_RANK,
+          "lora_dropout": 0.0,
+          "bias": "none",
+          "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        },
+
+        // Optional expert parallelism for MoE. NUM_TRAINING_GPUS must be a multiple of EP_SIZE.
+        "ac_config": {"mode": "full", "freq": 1},
+        "prime_rl": {
+          "fused_lm_head_token_chunk_size": 8192,
+          "fused_cross_entropy": false
+        },
+        "ep_size": EP_SIZE,
+
+        // Router replay for MoE training, filled in for MoE models. Set
+        // "mode": "best_effort" to route rows the sampler no longer holds (e.g.
+        // after a sampler restart) with the trainer's own gate instead of
+        // failing the step.
+        "router_replay": {"enabled": true, "mode": "strict", "max_cache_bytes": TRAINING_CACHE_BYTES}
+      }
+    },
     {
       "job_type": "sampling",
       "model_name": MODEL_NAME,
@@ -110,68 +201,9 @@ sub-jobs. Pass a shipped example or a copy with `job_config=JOB_CONFIG`.
           "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         },
 
-        // Optional router replay for MoE training.
-        "router_replay": {"enabled": true, "max_cache_bytes": 17179869184}
-      }
-    },
-    {
-      "job_type": "training",
-      "model_name": MODEL_NAME,
-      "dtype": DTYPE,
-      "seed": SEED,
-      "training_config": {
-        "n_gpus": NUM_TRAINING_GPUS,
-        "max_seq_len": MAX_SEQ_LEN,
-        "train_batch_size": TRAIN_BATCH_SIZE,
-        "sp_size": SEQUENCE_PARALLEL_SIZE,
-        "gradient_clipping": GRADIENT_CLIPPING,
-        "model_provider": MODEL_PROVIDER, // Use prime_rl for MoE
-        "attn_implementation": "flash_attention_3",
-        "mb_spec": {
-          "max_tokens_per_mb": MAX_TOKENS_PER_MB
-        },
-        "optimizer": {
-          "name": "AdamW",
-          "lr": LEARNING_RATE,
-          "weight_decay": WEIGHT_DECAY,
-          "betas": [ADAM_BETA1, ADAM_BETA2],
-          "eps": ADAM_EPS
-        },
-        "ds_config": {
-          "train_batch_size": TRAIN_BATCH_SIZE,
-          "train_micro_batch_size_per_gpu": MICRO_BATCH_SIZE,
-          "gradient_accumulation_steps": TRAIN_BATCH_SIZE / (MICRO_BATCH_SIZE * NUM_TRAINING_GPUS),
-          "zero_optimization": {
-            "stage": ZERO_STAGE,
-            "reduce_scatter": true
-          },
-          "bf16": {
-            "enabled": true
-          }
-        },
-
-        // Optional LoRA. Omit for full-parameter.
-        "peft_config": {
-          "peft_type": "Lora",
-          "r": LORA_RANK,
-          "lora_alpha": LORA_RANK,
-          "lora_dropout": 0.0,
-          "bias": "none",
-          "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-        },
-
-        // Optional expert parallelism for MoE. NUM_TRAINING_GPUS must be a multiple of EP_SIZE.
-        "ac_config": {"mode": "full", "freq": 1},
-        "prime_rl": {
-          "fused_lm_head_token_chunk_size": 8192,
-          "fused_cross_entropy": false
-        },
-        "ep_size": EP_SIZE,
-
-        // Optional router replay for MoE training. Add "mode": "best_effort" to
-        // route rows the sampler no longer holds (e.g. after a sampler restart)
-        // with the trainer's own gate instead of failing the step.
-        "router_replay": {"enabled": true, "max_cache_bytes": 2147483648}
+        // Router replay for MoE training, filled in for MoE models. A sampling
+        // sub-job takes no "mode".
+        "router_replay": {"enabled": true, "max_cache_bytes": SAMPLING_CACHE_BYTES}
       }
     }
   ]
@@ -188,16 +220,15 @@ same settings can be written inside `training_config`, in place of the
 "model_options": {"lm_head": {"token_chunk_size": 8192, "cross_entropy": false}}
 ```
 
-The Qwen3.6-35B-A3B RL and SFT example configs, the Qwen3.6-35B-A3B
-long-context training files in the model catalog, `examples/api/training.json`
-and `examples/api/rl.json` still use the `prime_rl` block, which older servers
-need.
+The Qwen3.6-35B-A3B long-context training files in the model catalog,
+`examples/api/training.json` and `examples/api/rl.json` still use the
+`prime_rl` block, which older servers need.
 
 On server versions that have `numerics.fp32_parity`, Qwen3.5-family models run
 with it on by default: dense models (for example `Qwen/Qwen3.8-27B`) and
 Qwen3.5-MoE models with `EP_SIZE` > 1 (the Qwen3.6-35B-A3B configs). It raises
 GPU memory. Memory was not measured for rows near `max_seq_len` with the
-shipped Qwen3.8-27B configs. If a job runs out of memory, raise `sp_size`
+Qwen3.8-27B catalog files. If a job runs out of memory, raise `sp_size`
 (at most 8 for Qwen3.8-27B) or turn the option off by adding
 `"numerics": {"fp32_parity": false}` to the `model_options` entry of
 `training_config`, inside the same object if the config already has one (two
@@ -208,7 +239,7 @@ log-probabilities, which matters for RL. A server that has the option but not
 [the REST API reference](../../docs/reference/rest-api.md#model_options).
 
 The target list above is for dense Qwen models. For
-`Qwen/Qwen3.6-35B-A3B`, use the shipped LoRA config with
+`Qwen/Qwen3.6-35B-A3B`, the catalog's LoRA files use
 `model_provider: "prime_rl"` and attention-only targets (`q_proj`, `k_proj`,
 `v_proj`, and `o_proj`). PrimeRL does not yet support LoRA on routed experts;
 `gate_proj`, `up_proj`, and `down_proj` do not select those parameters.
@@ -327,14 +358,19 @@ a Snowflake experiment; results are viewable in Snowsight under
 **AI & ML > Experiments**. See the
 [Snowflake ML Experiments docs](https://docs.snowflake.com/en/developer-guide/snowflake-ml/experiments).
 
-After save, the example prints one eval command.
+After save, the example prints one eval command whose `model=`, `context=`,
+`hardware=` and `lora=` pick the catalog inference file that serves the
+checkpoint: the run's model, hardware and mode, with the same adapter for LoRA,
+at the run's context or, when the model has no such file there, at the other
+one. When no catalog file fits, the command has `job_config=INFERENCE_JOB_CONFIG`
+instead, and a warning says what that inference job needs.
 `examples.inference.evaluate` uses the same few-shot prompt, grader, and
 decoding settings.
 
 ```bash
 python -m examples.inference.evaluate \
   config=/path/to/config.json \
-  job_config=JOB_CONFIG \
+  model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID \
   temperature=1.0 \

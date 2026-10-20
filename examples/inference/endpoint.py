@@ -17,45 +17,60 @@
 
 An inference endpoint is a running job that serves generations. On the wire the
 worker is still ``job_type=sampling`` — the same generation runtime RL uses for
-rollouts. Serve, generate, and eval start that job with ``running_job``.
+rollouts. Serve, generate, and eval build that job with ``build_job`` from the
+model catalog's inference file and start it with ``running_job``.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+import shlex
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from examples.utils import load_job_body
+from examples.utils import build_job
 from examples.utils import source_checkpoint_info
 
 logger = logging.getLogger(__name__)
 
 _EXAMPLE_DIR = Path(__file__).resolve().parent
-CONFIG_SEARCH_DIRS: tuple[Path, ...] = (_EXAMPLE_DIR, _EXAMPLE_DIR / "configs")
 
 
 def inference_endpoint_body(
-    job_config: str,
     *,
+    model: str,
+    context: str,
+    hardware: str = "h200",
+    lora: bool = False,
+    job_config: str | None = None,
+    max_seq_len: int | None = None,
     source_job_id: str | None = None,
     checkpoint_id: str | None = None,
     debug_image_tag: str | None = None,
-    search_dirs: Sequence[Path] = CONFIG_SEARCH_DIRS,
 ) -> tuple[dict[str, Any], dict[str, str] | None]:
-    """Return ``(create-job body, source checkpoint info or None)``."""
-    body = load_job_body(job_config, search_dirs=search_dirs)
+    """Return ``(create-job body, source checkpoint info or None)``.
+
+    The job is the catalog's inference file for ``model``, ``context``,
+    ``hardware`` and ``lora``, then inference/overrides.json when it exists.
+    A ``job_config`` file replaces both of those layers and is used as is.
+    Either way ``max_seq_len`` applies, a checkpoint goes on the sampling
+    sub-job, and ``debug_image_tag`` adds the debug block.
+    """
     source = source_checkpoint_info(source_job_id, checkpoint_id)
-    if source is not None:
-        sampling_sub = next(
-            (sub for sub in body.get("sub_job_configs") or () if sub.get("job_type") == "sampling"),
-            None,
-        )
-        if sampling_sub is not None:
-            sampling_sub["source_checkpoint_info"] = dict(source)
-    if debug_image_tag:
-        body["debug"] = {"job": {"image_tag": debug_image_tag}}
+    body = build_job(
+        "inference",
+        model=model,
+        context=context,
+        hardware=hardware,
+        lora=lora,
+        job_config=job_config,
+        example_dir=_EXAMPLE_DIR,
+        search_dirs=(_EXAMPLE_DIR,),
+        max_seq_len=max_seq_len,
+        debug_image_tag=debug_image_tag,
+        source_checkpoint=source,
+    )
     return body, source
 
 
@@ -85,15 +100,28 @@ def generate_results(
     return results
 
 
-def log_endpoint_ready(config_path: str, job_id: str) -> None:
+def log_endpoint_ready(config_path: str, job_id: str, job_args: Mapping[str, Any]) -> None:
+    """Log the endpoint's id and the generate and evaluate commands that use it.
+
+    ``job_args`` are the arguments that built the endpoint's job (``model=``,
+    ``context=``, ``hardware=``, ``lora=``, or ``job_config=``, and
+    ``max_seq_len=`` when set). The commands repeat them, so they pick the
+    endpoint's model, and with it its renderer, rather than their defaults.
+    """
+    extra = "".join(
+        f" {name}={str(value).lower() if isinstance(value, bool) else shlex.quote(str(value))}"
+        for name, value in job_args.items()
+    )
     logger.info("Inference endpoint is ready: job_id=%s", job_id)
     logger.info(
         "Examples against this endpoint:\n"
-        "  python -m examples.inference.generate config=%s job_id=%s\n"
-        "  python -m examples.inference.evaluate config=%s job_id=%s",
+        "  python -m examples.inference.generate config=%s job_id=%s%s\n"
+        "  python -m examples.inference.evaluate config=%s job_id=%s%s",
         config_path,
         job_id,
+        extra,
         config_path,
         job_id,
+        extra,
     )
     logger.info("Tear down with: cortex-training cancel %s", job_id)

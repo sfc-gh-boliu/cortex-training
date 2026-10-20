@@ -12,9 +12,10 @@ point `train.py`, its dataset helpers in `task.py`, its identity evaluation in
 
 ## Hardware
 
-Training GPUs are `n_gpus` in the JSON you pass (`NUM_TRAINING_GPUS`). Actual
-requirements depend on model size, sequence length, precision, and whether LoRA
-or dense training is used. Check the account capacity before submitting:
+Training GPUs are `n_gpus` in the job's training file (`NUM_TRAINING_GPUS`).
+Actual requirements depend on model size, sequence length, precision, and
+whether LoRA or dense training is used. Check the account capacity before
+submitting:
 
 ```bash
 cortex-training capacity
@@ -30,9 +31,70 @@ python -m examples.sft.conversational.train \
 `config=` is the Snowflake connection file only. Copy
 `docs/getting-started/connection.json.template` and adjust it.
 
-Defaults are Qwen3-8B full-parameter, thinking off, and 100 steps. It uses the
-builtin `who_trained_you` dataset as default.
-The default run will be finished within few minutes.
+Defaults are `Qwen/Qwen3-8B` at standard context on H200, full-parameter,
+thinking off, and 100 steps. It uses the builtin `who_trained_you` dataset as
+default. The default run will be finished within few minutes.
+
+## Choose the job
+
+The example builds its job from the
+[model catalog](../../model-catalog/README.md) in three layers, each
+overriding the one before:
+
+1. The model's training file for `model=` (the exact model ID), `context=`
+   (`standard` or `long`), `hardware=` (`h200`, `b200` or `b300`; default
+   `h200`) and `lora=` (`true` or `false`):
+   `model-catalog/models/<slug>/<context>/<hw>-training-<lora|full>.json`.
+2. `sft/overrides.json`, if you create one: changes for every SFT run, in any
+   model.
+3. The command line: `lr=`, `train_batch_size=` and `max_seq_len=`. Each
+   defaults to `None`, which keeps the value from the layers below.
+
+The job is logged before it is submitted. A combination the catalog does not
+have fails with the list of files that exist for that model.
+
+`job_config=JOB_CONFIG` replaces the first two layers with your own create-job
+JSON file, used as is; `lr=`, `train_batch_size=` and `max_seq_len=` still
+apply. Write one with `python -m examples.utils` and edit it.
+
+```bash
+# Qwen3-8B LoRA
+python -m examples.sft.conversational.train \
+  config=/path/to/config.json \
+  lora=true
+
+# Qwen3.5-9B LoRA / full, 64K context
+python -m examples.sft.conversational.train \
+  config=/path/to/config.json \
+  model=Qwen/Qwen3.5-9B context=long lora=true
+
+python -m examples.sft.conversational.train \
+  config=/path/to/config.json \
+  model=Qwen/Qwen3.5-9B context=long
+
+# Qwen3.8-27B LoRA / full, 32K or 64K context
+python -m examples.sft.conversational.train \
+  config=/path/to/config.json \
+  model=Qwen/Qwen3.8-27B context=standard lora=true
+
+python -m examples.sft.conversational.train \
+  config=/path/to/config.json \
+  model=Qwen/Qwen3.8-27B context=long
+
+# Qwen3.6-35B-A3B LoRA / full, 262K context
+python -m examples.sft.conversational.train \
+  config=/path/to/config.json \
+  model=Qwen/Qwen3.6-35B-A3B context=long lora=true
+
+python -m examples.sft.conversational.train \
+  config=/path/to/config.json \
+  model=Qwen/Qwen3.6-35B-A3B context=long
+
+# A smaller batch and a shorter sequence than the catalog file
+python -m examples.sft.conversational.train \
+  config=/path/to/config.json \
+  train_batch_size=2 max_seq_len=8192 lr=1e-5
+```
 
 ## Common Variations
 
@@ -52,13 +114,14 @@ python -m examples.sft.conversational.train \
   dataset=HuggingFaceH4/ultrachat_200k dataset_split=train_sft
 
 # Grade-school math (openai/gsm8k). The example maps question/answer → messages.
-# Train split has 7473 rows. With the 8B configs (batch 8) one epoch is 934 steps.
+# Train split has 7473 rows. With the Qwen3-8B LoRA file (batch 4) one epoch is
+# 1868 steps.
 python -m examples.sft.conversational.train \
   config=/path/to/config.json \
-  job_config=configs/qwen3_8b_lora.json \
+  lora=true \
   dataset=openai/gsm8k \
   dataset_split=train \
-  max_steps=934
+  max_steps=1868
 
 # Builtin identity JSONL: paraphrases of Who trained you? → Snowflake AI Research
 python -m examples.sft.conversational.train \
@@ -74,19 +137,23 @@ Dataset loading lives in `conversational/task.py`, not `train.py`. To add a sour
 
 Then list the dataset in `conversational/example.yaml` if it should show up in the catalog.
 
-LoRA, GPU count, batch shape, sequence length, and MoE live in the job-config
-JSON. Set `wandb_project` to log to Weights & Biases after
+LoRA, GPU count, batch shape, sequence length, and MoE come from the job (see
+[Choose the job](#choose-the-job)). Set `wandb_project` to log to Weights &
+Biases after
 `uv pip install wandb` and `export WANDB_API_KEY` / `export WANDB_BASE_URL`.
 Set `sf_tracking=True` to log to Snowflake experiment tracking after
 `uv pip install "snowflake-ml-python>=1.19.0"`.
 
 ## Job config JSON
 
-The example loads one create-job body with a single training sub-job. Pass a
-shipped example or a copy with `job_config=JOB_CONFIG`.
+The example submits one create-job body with a single training sub-job. Every
+training file in the model catalog has this shape, with the job-level
+`hardware` field set to the file's prefix, and so must a file you pass with
+`job_config=JOB_CONFIG`.
 
 ```json
 {
+  "hardware": HARDWARE,
   "sub_job_configs": [
     {
       "job_type": "training",
@@ -144,11 +211,11 @@ shipped example or a copy with `job_config=JOB_CONFIG`.
 ```
 
 The target list above is for dense Qwen models. For
-`Qwen/Qwen3.6-35B-A3B`, use the shipped LoRA config with
+`Qwen/Qwen3.6-35B-A3B`, the catalog's LoRA files use
 `model_provider: "prime_rl"` and attention-only targets (`q_proj`, `k_proj`,
 `v_proj`, and `o_proj`). PrimeRL does not yet support LoRA on routed experts;
 `gate_proj`, `up_proj`, and `down_proj` do not select those parameters.
-The shipped Qwen3.6 configs use sequence parallel size 8 and logical batch 1
+The Qwen3.6 long-context files use sequence parallel size 8 and logical batch 1
 to run at the model's 262K context limit.
 
 The `prime_rl` entries in the template above are deprecated but keep working.
@@ -156,7 +223,8 @@ On server versions that support `model_options`, with `EP_SIZE` > 1, the same
 settings can be written inside `training_config` in place of the `prime_rl`
 block, as the entry below; see
 [the REST API reference](../../docs/reference/rest-api.md#model_options). The
-shipped Qwen3.6 SFT configs still use the block, which older servers need.
+Qwen3.6 long-context training files still use the block, which older servers
+need.
 
 ```json
 "model_options": {"lm_head": {"token_chunk_size": 8192, "cross_entropy": false}}
@@ -166,7 +234,7 @@ On server versions that have `numerics.fp32_parity`, Qwen3.5-family models run
 with it on by default: dense models (for example `Qwen/Qwen3.8-27B`) and
 Qwen3.5-MoE models with `EP_SIZE` > 1 (the Qwen3.6-35B-A3B configs). It raises
 GPU memory. Memory was not measured for rows near `max_seq_len` with the
-shipped Qwen3.8-27B configs. If a job runs out of memory, raise `sp_size`
+Qwen3.8-27B catalog files. If a job runs out of memory, raise `sp_size`
 (at most 8 for Qwen3.8-27B) or turn the option off by adding
 `"numerics": {"fp32_parity": false}` to the `model_options` entry of
 `training_config`, inside the same object if the config already has one (two
@@ -183,46 +251,15 @@ change the loss.
 ```bash
 python -m examples.sft.conversational.train \
   config=/path/to/config.json \
-  job_config=JOB_CONFIG \
+  model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA \
+  lr=LEARNING_RATE \
+  train_batch_size=TRAIN_BATCH_SIZE \
+  max_seq_len=MAX_SEQ_LEN \
   dataset=DATASET \
   max_steps=MAX_STEPS \
   enable_thinking=ENABLE_THINKING \
   wandb_project=WANDB_PROJECT \
   sf_tracking=SF_TRACKING
-```
-
-```bash
-# Qwen3-8B LoRA
-python -m examples.sft.conversational.train \
-  config=/path/to/config.json \
-  job_config=configs/qwen3_8b_lora.json
-
-# Qwen3.5-9B LoRA / full
-python -m examples.sft.conversational.train \
-  config=/path/to/config.json \
-  job_config=configs/qwen35_9b_lora.json
-
-python -m examples.sft.conversational.train \
-  config=/path/to/config.json \
-  job_config=configs/qwen35_9b_full.json
-
-# Qwen3.8-27B LoRA / full
-python -m examples.sft.conversational.train \
-  config=/path/to/config.json \
-  job_config=configs/qwen38_27b_lora.json
-
-python -m examples.sft.conversational.train \
-  config=/path/to/config.json \
-  job_config=configs/qwen38_27b_full.json
-
-# Qwen3.6-35B-A3B LoRA / full
-python -m examples.sft.conversational.train \
-  config=/path/to/config.json \
-  job_config=configs/qwen36_35b_a3b_lora.json
-
-python -m examples.sft.conversational.train \
-  config=/path/to/config.json \
-  job_config=configs/qwen36_35b_a3b_full.json
 ```
 
 ## Logs and Expected Results
@@ -252,15 +289,22 @@ a Snowflake experiment; results are viewable in Snowsight under
 Each step logs `train_nll` (the server's `avg_loss`) and `loss_weight_sum`, the
 sum of `loss_mask` over the batch. On the default memorize task, `train_nll`
 should fall quickly and `loss_weight_sum` should stay constant from step to
-step. After save, the example prints one generate command. When running that
-command, Assistant text should be `Snowflake AI Research`.
+step. After save, the example prints one generate command whose `model=`,
+`context=`, `hardware=` and `lora=` pick the catalog inference file that serves
+the checkpoint: the run's model, hardware and mode, with the same adapter for
+LoRA, at the run's context or, when the model has no such file there, at the
+other one (some models have standard training files but only long inference
+files). When no catalog file fits, the command has
+`job_config=INFERENCE_JOB_CONFIG` instead, and a warning says what that
+inference job needs. When running that command, Assistant text should be
+`Snowflake AI Research`.
 
 ```bash
 python -m examples.inference.generate \
   config=/path/to/config.json \
-  job_config=examples/inference/configs/JOB_CONFIG \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID \
+  model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA \
   temperature=0 \
   prompt="Who trained you?"
 ```
@@ -272,7 +316,7 @@ on contest math, run MATH-500 against the same checkpoint (harder than GSM8K):
 ```bash
 python -m examples.inference.evaluate \
   config=/path/to/config.json \
-  job_config=configs/qwen3_8b_lora.json \
+  lora=true \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID \
   task=gsm8k \
@@ -286,7 +330,7 @@ After identity SFT, score the percent of completions that contain
 ```bash
 python -m examples.inference.evaluate \
   config=/path/to/config.json \
-  job_config=configs/qwen3_8b_lora.json \
+  lora=true \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID \
   task=identity \

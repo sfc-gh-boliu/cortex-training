@@ -18,11 +18,19 @@
 The helpers are grouped by section: the connection, job configs, checkpoints,
 rendering, router replay operations, batching, training and sampling
 operations, the job lifecycle, router replay capacity planning, the model
-catalog, and ``make_config``, which builds a job from the catalog.
+catalog, ``make_config``, which builds a job from the catalog, and
+``build_job``, which builds the job each example submits.
 
 Run this module to write a job config from the command line::
 
     python -m examples.utils --model Qwen/Qwen3-8B --context standard -o job.json
+
+Or the two on-policy distillation jobs, which write ``job.json`` (student) and
+``job.teacher.json`` (teacher) side by side::
+
+    python -m examples.utils --distillation --student Qwen/Qwen3-0.6B \\
+        --teacher Qwen/Qwen3-8B --context standard \\
+        --student-max-seq-len 2048 --teacher-max-seq-len 4096 -o job.json
 """
 
 from __future__ import annotations
@@ -36,6 +44,7 @@ import os
 import re
 import struct
 import sys
+from collections import Counter
 from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import Sequence
@@ -54,19 +63,10 @@ import torch
 
 from cortex_training import CortexTrainingClient
 from cortex_training import wire
+from cortex_training.client import DEBUG_OPTIONS_ENV
+from cortex_training.client.peft import normalize_lora_peft_config
 
 logger = logging.getLogger(__name__)
-
-
-LORA_TARGET_MODULES = (
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-)
 
 
 # ─── Connection ──────────────────────────────────────────────────────────────
@@ -144,19 +144,6 @@ def load_job_body(
     return deepcopy(parsed)
 
 
-def lora_peft_config(rank: int) -> dict[str, Any] | None:
-    if rank <= 0:
-        return None
-    return {
-        "peft_type": "Lora",
-        "r": rank,
-        "lora_alpha": rank,
-        "lora_dropout": 0.0,
-        "bias": "none",
-        "target_modules": list(LORA_TARGET_MODULES),
-    }
-
-
 # ─── Checkpoints ─────────────────────────────────────────────────────────────
 
 
@@ -209,48 +196,6 @@ def source_checkpoint_info(
     }
 
 
-def sampling_job_body(
-    *,
-    model_name: str,
-    max_seq_len: int,
-    n_gpus: int,
-    dtype: str = "bfloat16",
-    seed: int = 42,
-    gpu_memory_utilization: float = 0.8,
-    lora_rank: int = 0,
-    source_checkpoint_info: dict[str, str] | None = None,
-    debug_image_tag: str | None = None,
-) -> dict[str, Any]:
-    """Standalone sampling job from original HF weights or a weights-only checkpoint."""
-    inference_config: dict[str, Any] = {
-        "max_seq_len": max_seq_len,
-        "n_gpus": n_gpus,
-        "vllm_config": {
-            "max_model_len": max_seq_len,
-            "gpu_memory_utilization": gpu_memory_utilization,
-            "trust_remote_code": True,
-        },
-    }
-    peft = lora_peft_config(lora_rank)
-    if peft is not None:
-        inference_config["peft_config"] = peft
-
-    sub_job: dict[str, Any] = {
-        "job_type": "sampling",
-        "model_name": model_name,
-        "dtype": dtype,
-        "seed": seed,
-        "inference_config": inference_config,
-    }
-    if source_checkpoint_info is not None:
-        sub_job["source_checkpoint_info"] = dict(source_checkpoint_info)
-
-    body: dict[str, Any] = {"sub_job_configs": [sub_job]}
-    if debug_image_tag:
-        body["debug"] = {"job": {"image_tag": debug_image_tag}}
-    return body
-
-
 def _sampling_cli(
     *,
     module: str,
@@ -270,7 +215,7 @@ def log_saved_checkpoints(
     job_id: str,
     saved: Mapping[str, Mapping[str, Any]],
     sampling_command: str | None = None,
-    job_config: str | None = None,
+    job_args: Mapping[str, Any] | None = None,
     sample_prompt: str | None = None,
     enable_thinking: bool = False,
     renderer_name: str | None = None,
@@ -297,8 +242,8 @@ def log_saved_checkpoints(
         return
 
     extra = ""
-    if job_config:
-        extra += f" job_config={job_config}"
+    for name, value in (job_args or {}).items():
+        extra += f" {name}={str(value).lower() if isinstance(value, bool) else value}"
     if checkpoint_id:
         extra += f" checkpoint_id={checkpoint_id}"
     if sampling_command == "evaluate":
@@ -349,27 +294,38 @@ def recommended_renderer_name(
       ``qwen3_disable_thinking``).
     - ``True``: thinking-on renderer (Qwen3-8B → ``qwen3``).
     - ``None``: tinker's top recommendation (thinking on for hybrid Qwen3).
+
+    When tinker lists renderers for the model but none matches the requested
+    thinking mode (for example a model with no ``*_disable_thinking`` variant
+    and ``enable_thinking=False``), this raises the same kind of clear
+    ``ValueError`` as a model tinker does not know, rather than failing with an
+    ``IndexError``. Pass ``renderer_name`` to choose explicitly.
     """
     if renderer_name:
         return renderer_name
     from tinker_cookbook import model_info
 
+    _renderer_docs = "https://tinker-docs.thinkingmachines.ai/tutorials/core-concepts/rendering/#available-renderers"
     try:
         recommended = list(model_info.get_recommended_renderer_names(model_name))
     except KeyError as exc:
         raise ValueError(
-            f"tinker_cookbook has no recommended renderer for {model_name!r}; "
-            "see https://tinker-docs.thinkingmachines.ai/tutorials/core-concepts/rendering/#available-renderers"
+            f"tinker_cookbook has no recommended renderer for {model_name!r}; see {_renderer_docs}"
         ) from exc
     if not recommended:
         raise ValueError(f"tinker_cookbook listed no renderers for {model_name!r}")
-    if enable_thinking is False:
-        disabled = [name for name in recommended if name.endswith("_disable_thinking")]
-        return disabled[0]
-    if enable_thinking is True:
-        enabled = [name for name in recommended if not name.endswith("_disable_thinking")]
-        return enabled[0]
-    return recommended[0]
+    if enable_thinking is None:
+        return recommended[0]
+    disabled = [name for name in recommended if name.endswith("_disable_thinking")]
+    matches = disabled if enable_thinking is False else [name for name in recommended if name not in disabled]
+    if not matches:
+        mode = "disable-thinking" if enable_thinking is False else "thinking-on"
+        raise ValueError(
+            f"tinker_cookbook has no {mode} renderer for {model_name!r} "
+            f"(its renderers are {recommended}); set renderer_name=, or use the other enable_thinking value. "
+            f"See {_renderer_docs}"
+        )
+    return matches[0]
 
 
 def build_renderer(
@@ -1389,6 +1345,8 @@ CATALOG_FILE_PATTERN = re.compile(r"^(h200|b200|b300)-(training|inference)-(lora
 # The sub-job each catalog file kind holds, and its config block.
 CATALOG_JOB_TYPES = {"training": "training", "inference": "sampling"}
 CATALOG_CONFIG_KEYS = {"training": "training_config", "inference": "inference_config"}
+# Files with a max_seq_len up to this go under standard/, longer ones under long/.
+STANDARD_CONTEXT_MAX_SEQ_LEN = 32768
 
 
 def model_slug(model_id: str) -> str:
@@ -1522,9 +1480,25 @@ def merge_job_config(base: Mapping[str, Any], override: Mapping[str, Any]) -> di
     return merged
 
 
+def _strip_comments(value: Any) -> Any:
+    """Return ``value`` with every ``"_comment"`` key dropped, at any depth.
+
+    ``overrides.json`` is merged into the job body, and JSON has no comments, so
+    a reserved ``"_comment"`` key (a free-text string or list of strings) carries
+    a human note that must never reach the built job. It is dropped, not merged;
+    it may sit at the top level or inside a ``sub_job_configs`` entry. Returns a
+    new structure, so the caller's override dict is left unchanged.
+    """
+    if isinstance(value, Mapping):
+        return {key: _strip_comments(item) for key, item in value.items() if key != "_comment"}
+    if isinstance(value, list):
+        return [_strip_comments(item) for item in value]
+    return value
+
+
 def _load_override(source: str | os.PathLike | Mapping[str, Any]) -> Mapping[str, Any]:
     if isinstance(source, Mapping):
-        return source
+        return _strip_comments(source)
     path = Path(source).expanduser()
     try:
         parsed = json.loads(path.read_text(encoding="utf-8"))
@@ -1534,7 +1508,7 @@ def _load_override(source: str | os.PathLike | Mapping[str, Any]) -> Mapping[str
         raise ValueError(f"override {path} is not valid JSON: {exc}") from exc
     if not isinstance(parsed, dict):
         raise ValueError(f"override {path} must be a JSON object")
-    return parsed
+    return _strip_comments(parsed)
 
 
 def _only_sub_job(body: Mapping[str, Any], job_type: str, label: str) -> dict[str, Any]:
@@ -1660,7 +1634,23 @@ def _apply_router_replay_defaults(
     for name, value in settings.items():
         if value is not None and not isinstance(value, Mapping):
             raise ValueError(f"the {name} sub-job's router_replay must be an object, got {value!r}")
-    if any(value is not None and "enabled" in value and not value["enabled"] for value in settings.values()):
+    # enabled is set once per job: router replay runs (or not) across both sub-jobs
+    # together. enabled:false on either sub-job turns it off; a pair that sets one
+    # side true and the other false is contradictory and is rejected, rather than
+    # silently leaving the true side on while the runner treats the job as replaying.
+    explicit = {
+        name: value["enabled"]
+        for name, value in settings.items()
+        if isinstance(value, Mapping) and "enabled" in value
+    }
+    if any(enabled is False for enabled in explicit.values()) and any(
+        enabled is True for enabled in explicit.values()
+    ):
+        raise ValueError(
+            "router replay is enabled on one sub-job and disabled on the other; set the same "
+            "enabled value on both sub-jobs (enabled:false on either turns router replay off)"
+        )
+    if any(enabled is False for enabled in explicit.values()):
         logger.info("router replay is turned off by an override; leaving router_replay unset")
         return
     # Only an MoE model has routing to replay, so resolve its geometry even when
@@ -1678,6 +1668,15 @@ def _apply_router_replay_defaults(
     )
     training_replay = dict(settings["training"] or {})
     sampling_replay = dict(settings["sampling"] or {})
+    # A sampling sub-job's router_replay carries no mode -- the service rejects a
+    # non-strict sampling mode -- so an override that sets one is rejected here
+    # rather than passing a dry-run and failing on real submit. A training-side
+    # mode (strict, best_effort) is still honored below.
+    if "mode" in sampling_replay:
+        raise ValueError(
+            f"the sampling sub-job's router_replay must not set a mode (got {sampling_replay['mode']!r}); "
+            "mode applies only to the training sub-job"
+        )
     training_replay.setdefault("enabled", True)
     training_replay.setdefault("mode", "strict")
     sampling_replay.setdefault("enabled", True)
@@ -1714,6 +1713,38 @@ def _rl_model_name(body: Mapping[str, Any]) -> str:
             f"{training!r} and sampling {sampling!r}"
         )
     return training
+
+
+def _check_rl_windows(body: Mapping[str, Any]) -> None:
+    """Reject an RL job whose sampling window exceeds its training window.
+
+    The runner collates each rollout at the training ``max_seq_len``, so a
+    sampling window above it admits a rollout that overflows training and fails
+    at collation after GPUs are allocated and generation has run. A sampling
+    window at or below the training window is safe -- the sampler just caps
+    shorter -- so only sampling > training is rejected.
+    """
+    windows: dict[str, Any] = {}
+    for sub_job in body.get("sub_job_configs") or ():
+        if not isinstance(sub_job, Mapping):
+            continue
+        config_key = {"training": "training_config", "sampling": "inference_config"}.get(sub_job.get("job_type"))
+        config = sub_job.get(config_key) if config_key else None
+        if isinstance(config, Mapping):
+            windows[sub_job["job_type"]] = config.get("max_seq_len")
+    training, sampling = windows.get("training"), windows.get("sampling")
+    if (
+        isinstance(training, int)
+        and not isinstance(training, bool)
+        and isinstance(sampling, int)
+        and not isinstance(sampling, bool)
+        and sampling > training
+    ):
+        raise ValueError(
+            f"the RL job's sampling max_seq_len {sampling} exceeds its training max_seq_len {training}; "
+            "the rollout is collated at the training window, so a larger sampling window overflows it. "
+            "Lower the sampling max_seq_len to at most the training window."
+        )
 
 
 def _catalog_architecture(model_name: str, catalog_dir: str | os.PathLike | None) -> str | None:
@@ -1845,6 +1876,7 @@ def make_config(
     if rl:
         # Plan for the model the final job names, which an override may have changed.
         model_name = _rl_model_name(body)
+        _check_rl_windows(body)
 
         def geometry() -> MoEGeometry:
             return _model_geometry(model_name, catalog_dir)
@@ -1859,6 +1891,360 @@ def make_config(
             # An override turned router replay on; a dense catalog model raises.
             geometry()
     return body
+
+
+# ─── make_distillation_config: student + teacher from the catalog ─────────────
+
+# The small, runnable on-policy distillation default: a dense student and a
+# larger teacher from the same tokenizer family, sized so the teacher's context
+# window strictly exceeds the student's, as the teacher-scoring step requires
+# (the teacher scores the prompt and completion together). The distillation
+# runner and the catalog's distillation check share these, so they never drift.
+DEFAULT_DISTILLATION_STUDENT = "Qwen/Qwen3-0.6B"
+DEFAULT_DISTILLATION_TEACHER = "Qwen/Qwen3-8B"
+DEFAULT_DISTILLATION_CONTEXT = "standard"
+DEFAULT_DISTILLATION_STUDENT_MAX_SEQ_LEN = 2048
+DEFAULT_DISTILLATION_TEACHER_MAX_SEQ_LEN = 4096
+
+
+def parallelism_errors(training_config: Mapping[str, Any]) -> list[str]:
+    """Why a training config's parallel sizes don't fit its ``n_gpus`` (empty when they do).
+
+    ``sp_size`` (sequence parallel) and ``ep_size`` (MoE expert parallel) must each
+    be a positive divisor of ``n_gpus``; a single-GPU footprint that still carries
+    a catalog ``sp_size``/``ep_size`` above 1 is not runnable even though a local
+    dry-run accepts it.
+    """
+    n_gpus = training_config.get("n_gpus")
+    if isinstance(n_gpus, bool) or not isinstance(n_gpus, int) or n_gpus <= 0:
+        return []
+    errors = []
+    for key in ("sp_size", "ep_size"):
+        size = training_config.get(key)
+        if size is None:
+            continue
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0 or n_gpus % size:
+            errors.append(f"{key} {size!r} must be a positive divisor of n_gpus {n_gpus}")
+    return errors
+
+
+def _body_max_seq_len(body: Mapping[str, Any], job_type: str, config_key: str) -> int:
+    config = _sub_job_config(body, job_type, config_key)
+    value = config.get("max_seq_len")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"the {job_type} sub-job needs a positive max_seq_len, got {value!r}")
+    return value
+
+
+def make_distillation_config(
+    student: str,
+    teacher: str,
+    context: str,
+    *,
+    hardware: str = "h200",
+    lora: bool = False,
+    teacher_context: str | None = None,
+    student_max_seq_len: int | None = None,
+    teacher_max_seq_len: int | None = None,
+    overrides: Sequence[str | os.PathLike | Mapping[str, Any]] = (),
+    teacher_overrides: Sequence[str | os.PathLike | Mapping[str, Any]] = (),
+    catalog_dir: str | os.PathLike | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build the ``(student, teacher)`` job bodies for on-policy distillation.
+
+    The student is one job with a training and a sampling sub-job of the same
+    model, composed from the catalog exactly as an RL job is (the ``rl=True``
+    path of :func:`make_config`) but with no router replay: on-policy
+    distillation replays nothing. The teacher is a separate, full-weights,
+    sampling-only job from the teacher's ``<hw>-inference-full.json`` in
+    ``teacher_context`` (defaulting to ``context``).
+
+    ``student_max_seq_len`` sizes both of the student's sub-jobs and
+    ``teacher_max_seq_len`` the teacher's, so a caller can shrink the catalog
+    files to a small, runnable job; the existing ``overrides`` / GPU override
+    mechanisms (``overrides`` and ``teacher_overrides``, JSON files or dicts
+    applied in order) still apply to anything else. The teacher's window must
+    strictly exceed the student's -- the teacher scores the prompt and
+    completion together, and ``generate`` rejects a prompt at ``max_seq_len`` --
+    so this raises a clear ``ValueError`` naming both windows when it does not.
+    """
+    if isinstance(overrides, (str, os.PathLike, Mapping)):
+        raise TypeError("overrides must be a list of JSON files or dicts")
+    if isinstance(teacher_overrides, (str, os.PathLike, Mapping)):
+        raise TypeError("teacher_overrides must be a list of JSON files or dicts")
+
+    student_overrides = list(overrides)
+    if student_max_seq_len is not None:
+        student_overrides.append(
+            _settings_override(
+                {"training", "sampling"},
+                lr=None,
+                train_batch_size=None,
+                max_seq_len=student_max_seq_len,
+            )
+        )
+    student_body = make_config(
+        student,
+        context,
+        hardware=hardware,
+        lora=lora,
+        rl=True,
+        overrides=student_overrides,
+        router_replay=False,
+        catalog_dir=catalog_dir,
+    )
+
+    # The shipped overrides force a single-GPU student, but a non-default student's
+    # catalog file may still carry sp_size/ep_size above 1, which cannot run on one
+    # GPU. Reject that here rather than emit a body a dry-run accepts but no run can.
+    student_training = _sub_job_config(student_body, "training", "training_config")
+    topology = parallelism_errors(student_training)
+    if topology:
+        raise ValueError(
+            "the student job's parallelism does not fit its GPU count after overrides: "
+            + "; ".join(topology)
+            + ". Size the student selection down to a single-GPU footprint, or override "
+            "sp_size/ep_size to divide its n_gpus."
+        )
+
+    all_teacher_overrides = list(teacher_overrides)
+    if teacher_max_seq_len is not None:
+        all_teacher_overrides.append(
+            {"sub_job_configs": [{"job_type": "sampling", "inference_config": {"max_seq_len": teacher_max_seq_len}}]}
+        )
+    teacher_body = make_config(
+        teacher,
+        teacher_context or context,
+        hardware=hardware,
+        inference=True,
+        overrides=all_teacher_overrides,
+        catalog_dir=catalog_dir,
+    )
+
+    teacher_job_types = [sub.get("job_type") for sub in teacher_body.get("sub_job_configs") or ()]
+    if teacher_job_types != ["sampling"]:
+        raise ValueError(f"the teacher job must hold exactly one sampling sub-job, got {teacher_job_types}")
+
+    # The student trains and samples the same model, so its two windows must match
+    # (overrides could set them apart); the runner rolls out at the sampling window
+    # and trains at the training window, and the teacher scores both together.
+    student_train_window = _body_max_seq_len(student_body, "training", "training_config")
+    student_sample_window = _body_max_seq_len(student_body, "sampling", "inference_config")
+    if student_train_window != student_sample_window:
+        raise ValueError(
+            f"the student's training max_seq_len {student_train_window} and sampling max_seq_len "
+            f"{student_sample_window} must match; set student_max_seq_len, or align the overrides"
+        )
+    teacher_window = _body_max_seq_len(teacher_body, "sampling", "inference_config")
+    if teacher_window <= student_train_window:
+        raise ValueError(
+            f"teacher max_seq_len {teacher_window} must exceed the student's {student_train_window}: "
+            "the teacher scores the prompt and completion together, and generate rejects a "
+            "prompt at max_seq_len"
+        )
+    return student_body, teacher_body
+
+
+# ─── build_job: the jobs the examples submit ─────────────────────────────────
+
+
+_JOB_KIND_SUB_JOBS = {"training": {"training"}, "inference": {"sampling"}, "rl": {"training", "sampling"}}
+
+
+def _settings_override(
+    job_types: set[str],
+    *,
+    lr: float | None,
+    train_batch_size: int | None,
+    max_seq_len: int | None,
+) -> dict[str, Any]:
+    """The command-line layer: ``None`` keeps the value from the layers below."""
+    entries = []
+    training: dict[str, Any] = {}
+    if lr is not None:
+        training["optimizer"] = {"lr": lr}
+    if train_batch_size is not None:
+        training["train_batch_size"] = train_batch_size
+    if max_seq_len is not None:
+        training["max_seq_len"] = max_seq_len
+    if (lr is not None or train_batch_size is not None) and "training" not in job_types:
+        raise ValueError("lr and train_batch_size apply to a training sub-job, and this job has none")
+    if training and "training" in job_types:
+        entries.append({"job_type": "training", "training_config": training})
+    if max_seq_len is not None and "sampling" in job_types:
+        entries.append({"job_type": "sampling", "inference_config": {"max_seq_len": max_seq_len}})
+    return {"sub_job_configs": entries} if entries else {}
+
+
+def build_job(
+    kind: str,
+    *,
+    model: str,
+    context: str,
+    hardware: str = "h200",
+    lora: bool = False,
+    job_config: str | None = None,
+    example_dir: str | os.PathLike | None = None,
+    search_dirs: Sequence[Path] = (),
+    lr: float | None = None,
+    train_batch_size: int | None = None,
+    max_seq_len: int | None = None,
+    rollout_batch_size: int | None = None,
+    debug_image_tag: str | None = None,
+    source_checkpoint: Mapping[str, str] | None = None,
+    catalog_dir: str | os.PathLike | None = None,
+) -> dict[str, Any]:
+    """The create-job body an example submits: ``kind`` is training, inference or rl.
+
+    The job is built in three layers, each overriding the one before it:
+
+    1. The model catalog file for ``model``, ``context``, ``hardware`` and
+       ``lora`` (for ``rl``, the training and inference files combined).
+    2. ``overrides.json`` in ``example_dir``, when that file exists.
+    3. The command-line settings ``lr``, ``train_batch_size`` and
+       ``max_seq_len``; ``None`` keeps the value from the layers below.
+
+    The layers are merged by :func:`make_config`, which then fills in router
+    replay for an MoE RL job with the fixed default caps. A
+    ``job_config`` file replaces the first two layers and is used as is: the
+    command-line settings still apply, and nothing is planned. The source
+    checkpoint (inference jobs) and the debug image tag are added last, and
+    the final job is logged.
+    """
+    if kind not in _JOB_KIND_SUB_JOBS:
+        raise ValueError(f"kind must be one of {sorted(_JOB_KIND_SUB_JOBS)}, got {kind!r}")
+    needed = _JOB_KIND_SUB_JOBS[kind]
+    if job_config is not None:
+        body = load_job_body(job_config, search_dirs=search_dirs)
+        found = [sub.get("job_type") for sub in body.get("sub_job_configs") or () if isinstance(sub, Mapping)]
+        # Require the exact composition for the mode -- one sub-job of each needed
+        # type and nothing else -- so an RL body (training + sampling) is not
+        # accepted for a training-only or inference-only example, which would
+        # create unused workers.
+        if Counter(found) != Counter(needed):
+            raise ValueError(
+                f"job_config {job_config} has sub-jobs {sorted(map(str, found))}; "
+                f"a {kind} job needs exactly {sorted(needed)}"
+            )
+        if kind == "rl":
+            # An RL job trains and samples one model; reject a supplied body that
+            # pairs different models (it passes a dry-run and breaks at run time).
+            _rl_model_name(body)
+        settings = _settings_override(needed, lr=lr, train_batch_size=train_batch_size, max_seq_len=max_seq_len)
+        if settings:
+            body = merge_job_config(body, settings)
+        if kind == "rl":
+            # Check the windows on the final body: the command-line max_seq_len
+            # applies to both sub-jobs, so it can bring a supplied sampling window
+            # back in line, exactly as the override path checks post-merge.
+            _check_rl_windows(body)
+        logger.info("Using job_config %s as is; the model catalog and overrides.json are skipped", job_config)
+    else:
+        overrides: list[Any] = []
+        if example_dir is not None and (Path(example_dir) / "overrides.json").is_file():
+            overrides.append(Path(example_dir) / "overrides.json")
+        settings = _settings_override(needed, lr=lr, train_batch_size=train_batch_size, max_seq_len=max_seq_len)
+        if settings:
+            overrides.append(settings)
+        body = make_config(
+            model,
+            context,
+            hardware=hardware,
+            lora=lora,
+            inference=kind == "inference",
+            rl=kind == "rl",
+            overrides=overrides,
+            rollout_batch_size=rollout_batch_size if kind == "rl" else None,
+            catalog_dir=catalog_dir,
+        )
+    if source_checkpoint is not None:
+        if kind != "inference":
+            raise ValueError("a source checkpoint starts an inference job")
+        sampling = next(sub for sub in body["sub_job_configs"] if sub.get("job_type") == "sampling")
+        sampling["source_checkpoint_info"] = dict(source_checkpoint)
+    if debug_image_tag:
+        body["debug"] = {"job": {"image_tag": debug_image_tag}}
+        logger.info("Using debug image_tag=%s", debug_image_tag)
+        # debug_image_tag is the caller's explicit opt-in, so authorize the
+        # internal-only create-job debug options for it. A body that merely
+        # carries a debug block -- for example a saved record replayed with
+        # job_config= -- does NOT elevate on its own: the caller re-authorizes by
+        # passing debug_image_tag= again, or by setting the env var themselves, so
+        # loading a body never silently opens the gate for later submissions.
+        os.environ[DEBUG_OPTIONS_ENV] = "1"
+        logger.info("Enabling create-job debug options for this run's debug image tag")
+    logger.info("Job config:\n%s", json.dumps(body, indent=2))
+    return body
+
+
+# The follow-up command's job_config= when no catalog inference file serves a
+# checkpoint; the user replaces it with an inference job file of their own.
+INFERENCE_JOB_CONFIG_PLACEHOLDER = "INFERENCE_JOB_CONFIG"
+
+
+def same_adapter(first: Any, second: Any) -> bool:
+    """Whether two LoRA ``peft_config`` blocks describe the same adapter."""
+    try:
+        first, second = normalize_lora_peft_config(first), normalize_lora_peft_config(second)
+    except ValueError:
+        return False
+    for config in (first, second):
+        for key in ("target_modules", "target_parameters"):
+            if isinstance(config[key], list):
+                config[key] = sorted(config[key])
+    return first == second
+
+
+def inference_job_args(
+    body: Mapping[str, Any],
+    *,
+    context: str | None = None,
+    catalog_dir: str | os.PathLike | None = None,
+) -> dict[str, Any]:
+    """Arguments for an inference example command that serves this run's checkpoint.
+
+    The checkpoint comes from the training sub-job in ``body``. It needs an
+    inference job for that sub-job's model and mode on the job's hardware, and
+    for LoRA the same adapter (``peft_config``). Returns ``model=``,
+    ``context=``, ``hardware=`` and ``lora=`` for the catalog inference file
+    that fits: in ``context`` when there is one there (by default the context
+    the training ``max_seq_len`` falls in), otherwise in the other context.
+    Some models have standard training files but only long inference files.
+
+    When no catalog file fits, it logs what the job needs and returns
+    ``job_config=INFERENCE_JOB_CONFIG``, to be replaced with such a job's file.
+    """
+    sub_job = next(sub for sub in body["sub_job_configs"] if sub.get("job_type") == "training")
+    config = sub_job.get("training_config") or {}
+    model = sub_job.get("model_name")
+    hardware = str(body.get("hardware") or "H200").lower()
+    adapter = config.get("peft_config")
+    lora = adapter is not None
+    if context is None:
+        context = "standard" if (config.get("max_seq_len") or 0) <= STANDARD_CONTEXT_MAX_SEQ_LEN else "long"
+    try:
+        folder = load_catalog_model(model, catalog_dir)[0] if isinstance(model, str) else None
+    except FileNotFoundError:
+        folder = None
+    if folder is not None:
+        for candidate in (context, *(name for name in CATALOG_CONTEXTS if name != context)):
+            path = folder / candidate / catalog_file_name(hardware, "inference", lora)
+            if not path.is_file():
+                continue
+            if lora:
+                sampling = _sub_job_config(load_job_body(str(path)), "sampling", "inference_config")
+                if not same_adapter(sampling.get("peft_config"), adapter):
+                    continue
+            return {"model": model, "context": candidate, "hardware": hardware, "lora": lora}
+    logger.warning(
+        "No inference file in the model catalog serves this checkpoint. It needs a sampling sub-job for %s on %s%s. "
+        "Write that job to a file and put its path in place of %s in the command below.",
+        model,
+        hardware,
+        f" with peft_config {json.dumps(adapter, sort_keys=True)}" if lora else " with full weights",
+        INFERENCE_JOB_CONFIG_PLACEHOLDER,
+    )
+    return {"job_config": INFERENCE_JOB_CONFIG_PLACEHOLDER}
 
 
 def _make_config_parser() -> argparse.ArgumentParser:
@@ -1888,6 +2274,27 @@ def _make_config_parser() -> argparse.ArgumentParser:
     kinds = job.add_mutually_exclusive_group()
     kinds.add_argument("--inference", action="store_true", help="build the inference job instead of the training job")
     kinds.add_argument("--rl", action="store_true", help="build one job with the training and sampling sub-jobs")
+    kinds.add_argument(
+        "--distillation",
+        action="store_true",
+        help="build the on-policy distillation student and teacher jobs (needs --student and --teacher)",
+    )
+    distill = parser.add_argument_group("on-policy distillation (with --distillation)")
+    distill.add_argument("--student", help="student model ID (training + sampling), for example Qwen/Qwen3-0.6B")
+    distill.add_argument("--teacher", help="teacher model ID (sampling only), for example Qwen/Qwen3-8B")
+    distill.add_argument("--teacher-context", choices=CATALOG_CONTEXTS, help="teacher context (default: --context)")
+    distill.add_argument("--student-max-seq-len", type=int, metavar="N", help="student context window")
+    distill.add_argument(
+        "--teacher-max-seq-len", type=int, metavar="N", help="teacher context window (must exceed the student's)"
+    )
+    distill.add_argument(
+        "--teacher-override",
+        action="extend",
+        nargs="+",
+        default=[],
+        metavar="FILE",
+        help="JSON override files for the teacher job, applied in order",
+    )
     job.add_argument(
         "--rollout-batch-size",
         type=int,
@@ -1910,6 +2317,55 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Command line for :func:`make_config`."""
     parser = _make_config_parser()
     args = parser.parse_args(argv)
+    # Presence, not truthiness: --student-max-seq-len 0 is still a misplaced flag.
+    distillation_args_given = (
+        args.student is not None
+        or args.teacher is not None
+        or args.teacher_context is not None
+        or args.student_max_seq_len is not None
+        or args.teacher_max_seq_len is not None
+        or bool(args.teacher_override)
+    )
+    if args.distillation:
+        if args.student is None or args.teacher is None:
+            parser.error("--distillation needs --student and --teacher model IDs")
+        if args.context is None:
+            parser.error("--distillation needs --context standard or --context long")
+        if args.model or args.training_config or args.inference_config or args.router_replay or args.rollout_batch_size:
+            parser.error(
+                "--distillation picks its jobs with --student and --teacher; it cannot be combined with "
+                "--model, --training-config, --inference-config, --router-replay or --rollout-batch-size"
+            )
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+        try:
+            student_body, teacher_body = make_distillation_config(
+                args.student,
+                args.teacher,
+                args.context,
+                hardware=args.hardware or "h200",
+                lora=args.lora,
+                teacher_context=args.teacher_context,
+                student_max_seq_len=args.student_max_seq_len,
+                teacher_max_seq_len=args.teacher_max_seq_len,
+                overrides=args.override,
+                teacher_overrides=args.teacher_override,
+            )
+        except (FileNotFoundError, ImportError, TypeError, ValueError) as exc:
+            sys.stderr.write(f"error: {exc}\n")
+            return 1
+        if args.output == "-":
+            sys.stdout.write(json.dumps({"student": student_body, "teacher": teacher_body}, indent=2) + "\n")
+        else:
+            student_path = Path(args.output).expanduser()
+            suffix = student_path.suffix or ".json"
+            teacher_path = student_path.with_name(f"{student_path.stem}.teacher{suffix}")
+            for path, body in ((student_path, student_body), (teacher_path, teacher_body)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+            logger.info("wrote student %s and teacher %s", student_path, teacher_path)
+        return 0
+    if distillation_args_given:
+        parser.error("--student, --teacher, --teacher-context, --*-max-seq-len and --teacher-override need --distillation")
     if args.model is not None:
         if args.training_config or args.inference_config or args.router_replay:
             parser.error("--model picks catalog files; it cannot be combined with --training-config, "

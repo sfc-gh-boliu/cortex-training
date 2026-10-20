@@ -2,34 +2,27 @@
 
 LoRA training is implemented by the
 [conversational SFT example](../../../examples/sft/README.md).
-It is selected by the job-config JSON you pass, not by a command-line flag: a
-config whose `training_config` carries a `peft_config` block trains LoRA, and one
-without it trains all parameters.
+`lora=true` picks the model's LoRA file in the
+[model catalog](../../../model-catalog/README.md): a training file whose
+`training_config` carries a `peft_config` block trains LoRA, and one without it
+trains all parameters.
 
-The example defaults to `configs/qwen3_8b_full.json` (full-parameter), so LoRA is
-opt-in:
+The example defaults to full-parameter training, so LoRA is opt-in:
 
 ```bash
 python -m examples.sft.conversational.train \
   config=/path/to/config.json \
-  job_config=configs/qwen3_8b_lora.json
+  lora=true
 ```
 
-Shipped SFT configs:
+Every model the catalog can train has LoRA files; each model's folder under
+[`model-catalog/models/`](../../../model-catalog/models/) lists them, with the
+adapter rank and learning rate in each file.
 
-| Job config | Model | Method |
-|---|---|---|
-| `configs/qwen3_8b_full.json` | `Qwen/Qwen3-8B` | full-parameter (default) |
-| `configs/qwen3_8b_lora.json` | `Qwen/Qwen3-8B` | LoRA, rank 32 |
-| `configs/qwen35_9b_full.json` | `Qwen/Qwen3.5-9B` | full-parameter, lr 5e-6 |
-| `configs/qwen35_9b_lora.json` | `Qwen/Qwen3.5-9B` | LoRA, rank 32, lr 1e-4 |
-| `configs/qwen38_27b_full.json` | `Qwen/Qwen3.8-27B` | full-parameter, lr 5e-6 |
-| `configs/qwen38_27b_lora.json` | `Qwen/Qwen3.8-27B` | LoRA, rank 32, lr 1e-4 |
-| `configs/qwen36_35b_a3b_full.json` | `Qwen/Qwen3.6-35B-A3B` | full-parameter, lr 5e-6 |
-| `configs/qwen36_35b_a3b_lora.json` | `Qwen/Qwen3.6-35B-A3B` | LoRA, lr 1e-4 |
-
-Copy one and edit `peft_config.r` and `lora_alpha` to change the adapter. For
-dense Qwen models, you can also adjust `target_modules`. Keep the shipped
+To change the adapter, set `peft_config.r`, `lora_alpha` or, for dense Qwen
+models, `target_modules` in an override file, or write the job to a file with
+`python -m examples.utils`, edit it, and pass it back with `job_config=`; see
+the [example index](../../../examples/README.md). Keep the shipped
 attention-only target list for `Qwen/Qwen3.6-35B-A3B`: its PrimeRL backend does
 not yet support LoRA on routed experts, and Hugging Face MLP target names are
 no-ops. The example README documents the whole

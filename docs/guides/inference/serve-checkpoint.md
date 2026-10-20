@@ -15,8 +15,14 @@ Sampling requires a `weights-only` checkpoint; resumable checkpoints carry
 optimizer state and are not loadable by the sampling runtime. The sampling job is
 independent, so the training job can be cancelled once the checkpoint is saved.
 
-GPU count and vLLM settings live in the job-config JSON under
-`examples/inference/configs/`. For the equivalent raw client calls, see
+GPU count and vLLM settings come from the model's inference file in the
+[model catalog](../../../model-catalog/README.md). Pick it with `model=` and
+`hardware=` as for the training run, `lora=true` for a LoRA checkpoint so the
+sampler's adapter matches it, and a `context=` the model has an inference file
+in. That need not be the training run's context: some models have standard
+training files but only long inference files. The training examples print a
+generate or evaluate command with these arguments after they save. For the
+equivalent raw client calls, see
 [Start sampling from saved weights](../../reference/rest-api.md#134-start-sampling-from-saved-weights).
 
 Readiness checks, scaling and teardown are not yet documented.

@@ -4,11 +4,15 @@ The examples take two separate things:
 
 - `config=` — the Snowflake connection file (account host, PAT, database,
   schema). See [Set up the client](../../getting-started/setup.md).
-- `job_config=` — a JSON create-job body holding the whole training
-  configuration. Each example ships job configs under its own `configs/`
-  directory.
+- The job — a create-job body holding the whole training configuration. The
+  example builds it from the [model catalog](../../../model-catalog/README.md)
+  file for `model=`, `context=`, `hardware=` and `lora=`, then applies the
+  example's optional `overrides.json` and the command-line `lr=`,
+  `train_batch_size=` and `max_seq_len=`, each layer overriding the one before.
+  `job_config=` passes your own JSON file instead; it skips the catalog and
+  `overrides.json`, and the command-line values still apply.
 
-Everything that shapes the run lives in the job-config JSON:
+Everything that shapes the run lives in that job:
 
 - Model, precision, and provider (`model_name`, `dtype`, `model_provider`)
 - GPU count and parallelism (`n_gpus`, `ep_size`)
@@ -16,9 +20,10 @@ Everything that shapes the run lives in the job-config JSON:
 - Optimizer and gradient clipping (`optimizer`, `gradient_clipping`)
 - LoRA or full-parameter method (presence of `peft_config`)
 
-The remaining `name=value` command-line overrides are example-loop settings only
--- dataset, step count, evaluation cadence, logging and Weights & Biases. Run an
-example module with no arguments to see its full list, or read its `Config` class.
+Apart from those, the `name=value` command-line overrides are example-loop
+settings -- dataset, step count, evaluation cadence, logging and Weights &
+Biases. Run an example module with no arguments to see its full list, or read
+its `Config` class.
 
 The job-config object is posted as the create-job body with one exception: each
 `peft_config` it carries is validated and rewritten into its canonical form

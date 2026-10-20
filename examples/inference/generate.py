@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 
 import chz
@@ -31,8 +30,6 @@ from examples.inference.endpoint import generate_results
 from examples.inference.endpoint import inference_endpoint_body
 from examples.inference.prompts import completion_text
 from examples.inference.prompts import render_user_prompt
-
-from cortex_training.client import DEBUG_OPTIONS_ENV
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +66,13 @@ class Config:
     config: str
     job_id: str | None = None  # attach to a running inference endpoint
 
-    job_config: str = "configs/qwen3_8b_full.json"
+    # The job comes from model-catalog/models/; job_config= replaces it with a file.
+    model: str = "Qwen/Qwen3-8B"
+    context: str = "standard"
+    hardware: str = "h200"
+    lora: bool = False
+    job_config: str | None = None
+    max_seq_len: int | None = None  # None keeps the job's value
     debug_image_tag: str | None = None
     keep_job: bool | None = None
 
@@ -93,11 +96,13 @@ class Config:
 
 def main(config: Config):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    if config.debug_image_tag:
-        os.environ[DEBUG_OPTIONS_ENV] = "1"
-
     body, source = inference_endpoint_body(
-        config.job_config,
+        model=config.model,
+        context=config.context,
+        hardware=config.hardware,
+        lora=config.lora,
+        job_config=config.job_config,
+        max_seq_len=config.max_seq_len,
         source_job_id=config.source_job_id,
         checkpoint_id=config.checkpoint_id,
         debug_image_tag=config.debug_image_tag,

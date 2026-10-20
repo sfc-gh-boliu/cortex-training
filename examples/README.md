@@ -1,8 +1,8 @@
 # Cortex Training Examples
 
 Examples are runnable, end-to-end workflows organized by task. Each example owns
-its code, documentation, metadata, optional notebooks, and the JSON job configs
-under its `configs/` directory.
+its code, documentation, metadata, and optional notebooks. Its job config comes
+from the [model catalog](../model-catalog/README.md).
 
 ## Available Examples
 
@@ -61,10 +61,10 @@ python -m examples.distillation.on_policy.train config=/path/to/config.json
 python -m examples.inference.serve config=/path/to/config.json
 ```
 
-`config=` is the Snowflake PAT/connection file. See each example README for
-hardware, expected metrics, common variations, and the JSON job configs
-loaded from `configs/` (SFT and GRPO examples, plus inference configs for
-every catalog model).
+`config=` is the Snowflake PAT/connection file. `model=`, `context=`,
+`hardware=` and `lora=` pick the job from the model catalog. See each example
+README for hardware, expected metrics, common variations, and how its job is
+built.
 
 ## Example Contract
 

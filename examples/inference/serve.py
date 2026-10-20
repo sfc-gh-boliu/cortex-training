@@ -18,15 +18,12 @@
 from __future__ import annotations
 
 import logging
-import os
 
 import chz
 from examples.utils import make_client
 from examples.utils import running_job
 from examples.inference.endpoint import inference_endpoint_body
 from examples.inference.endpoint import log_endpoint_ready
-
-from cortex_training.client import DEBUG_OPTIONS_ENV
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARN)
@@ -38,7 +35,13 @@ class Config:
     config: str
     job_id: str | None = None  # attach to a running inference endpoint
 
-    job_config: str = "configs/qwen3_8b_full.json"
+    # The job comes from model-catalog/models/; job_config= replaces it with a file.
+    model: str = "Qwen/Qwen3-8B"
+    context: str = "standard"
+    hardware: str = "h200"
+    lora: bool = False
+    job_config: str | None = None
+    max_seq_len: int | None = None  # None keeps the job's value
     debug_image_tag: str | None = None
     keep_job: bool = True
 
@@ -49,12 +52,14 @@ class Config:
 
 def main(config: Config):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    if config.debug_image_tag:
-        os.environ[DEBUG_OPTIONS_ENV] = "1"
-
     client = make_client(config.config)
     body, source = inference_endpoint_body(
-        config.job_config,
+        model=config.model,
+        context=config.context,
+        hardware=config.hardware,
+        lora=config.lora,
+        job_config=config.job_config,
+        max_seq_len=config.max_seq_len,
         source_job_id=config.source_job_id,
         checkpoint_id=config.checkpoint_id,
         debug_image_tag=config.debug_image_tag,
@@ -76,8 +81,14 @@ def main(config: Config):
             ),
         )
 
+    if config.job_config is not None:
+        job_args: dict = {"job_config": config.job_config}
+    else:
+        job_args = {"model": config.model, "context": config.context, "hardware": config.hardware, "lora": config.lora}
+    if config.max_seq_len is not None:
+        job_args["max_seq_len"] = config.max_seq_len
     with running_job(client, body, job_id=config.job_id, keep_job=config.keep_job) as job_id:
-        log_endpoint_ready(config.config, job_id)
+        log_endpoint_ready(config.config, job_id, job_args)
 
 
 if __name__ == "__main__":

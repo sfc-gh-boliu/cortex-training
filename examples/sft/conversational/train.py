@@ -13,6 +13,17 @@ class Config:
     config: str
     job_id: str | None = None
 
+    # The job comes from model-catalog/models/; job_config= replaces it with a file.
+    model: str = "Qwen/Qwen3-8B"
+    context: str = "standard"
+    hardware: str = "h200"
+    lora: bool = False
+    job_config: str | None = None
+    # None keeps the job's value.
+    lr: float | None = None
+    train_batch_size: int | None = None
+    max_seq_len: int | None = None
+
     dataset: str = "who_trained_you"
     dataset_split: str = "train"
     train_on_what: renderers.TrainOnWhat = renderers.TrainOnWhat.ALL_ASSISTANT_MESSAGES
@@ -27,8 +38,6 @@ class Config:
     wandb_project: str | None = None
     wandb_name: str | None = None
     sf_tracking: bool = False
-
-    job_config: str = "configs/qwen3_8b_full.json"
 
 
 def main(config: Config) -> dict[str, Any]:

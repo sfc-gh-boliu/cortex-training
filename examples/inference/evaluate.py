@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -37,8 +36,6 @@ from examples.utils import build_renderer
 from examples.utils import make_client
 from examples.utils import running_job
 from examples.utils import stop_params_for
-
-from cortex_training.client import DEBUG_OPTIONS_ENV
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARN)
@@ -247,7 +244,13 @@ class Config:
     config: str
     job_id: str | None = None  # attach to a running inference endpoint
 
-    job_config: str = "configs/qwen3_8b_full.json"
+    # The job comes from model-catalog/models/; job_config= replaces it with a file.
+    model: str = "Qwen/Qwen3-8B"
+    context: str = "standard"
+    hardware: str = "h200"
+    lora: bool = False
+    job_config: str | None = None
+    max_seq_len: int | None = None  # None keeps the job's value
     debug_image_tag: str | None = None
     keep_job: bool | None = None
 
@@ -271,7 +274,12 @@ class Config:
 def run_evaluation(
     *,
     config_path: str,
-    job_config: str = "configs/qwen3_8b_full.json",
+    model: str = "Qwen/Qwen3-8B",
+    context: str = "standard",
+    hardware: str = "h200",
+    lora: bool = False,
+    job_config: str | None = None,
+    max_seq_len: int | None = None,
     source_job_id: str | None = None,
     checkpoint_id: str | None = None,
     job_id: str | None = None,
@@ -288,12 +296,13 @@ def run_evaluation(
     prompts_file: str | None = None,
     phrase: str = IDENTITY_PHRASE,
 ) -> dict[str, float]:
-    if debug_image_tag:
-        os.environ[DEBUG_OPTIONS_ENV] = "1"
-        logger.info("Using debug image_tag=%s", debug_image_tag)
-
     body, source = inference_endpoint_body(
-        job_config,
+        model=model,
+        context=context,
+        hardware=hardware,
+        lora=lora,
+        job_config=job_config,
+        max_seq_len=max_seq_len,
         source_job_id=source_job_id,
         checkpoint_id=checkpoint_id,
         debug_image_tag=debug_image_tag,
@@ -307,7 +316,7 @@ def run_evaluation(
         {},
     )
     model_name = sampling_sub.get("model_name")
-    max_seq_len = int((sampling_sub.get("inference_config") or {}).get("max_seq_len"))
+    prompt_limit = int((sampling_sub.get("inference_config") or {}).get("max_seq_len"))
     _, renderer, renderer_name = build_renderer(
         model_name,
         renderer_name=renderer_name,
@@ -352,7 +361,7 @@ def run_evaluation(
             max_examples=max_examples,
             sampling_params=sampling_params,
             generate_batch_size=generate_batch_size,
-            max_seq_len=max_seq_len,
+            max_seq_len=prompt_limit,
             **extra,
         )
 
@@ -363,7 +372,12 @@ def main(config: Config):
     )
     run_evaluation(
         config_path=config.config,
+        model=config.model,
+        context=config.context,
+        hardware=config.hardware,
+        lora=config.lora,
         job_config=config.job_config,
+        max_seq_len=config.max_seq_len,
         source_job_id=config.source_job_id,
         checkpoint_id=config.checkpoint_id,
         job_id=config.job_id,

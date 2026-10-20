@@ -5,8 +5,8 @@
 
 from __future__ import annotations
 
+import json
 import logging
-import os
 import statistics
 import time
 from pathlib import Path
@@ -19,9 +19,11 @@ from examples.utils import bootstrap_router_replay
 from examples.utils import build_renderer
 from examples.utils import collate
 from examples.utils import discard_router_replay
+from examples.utils import build_job
 from examples.utils import forward_backward_step
-from examples.utils import load_job_body
+from examples.utils import inference_job_args
 from examples.utils import log_saved_checkpoints
+from examples.utils import model_slug
 from examples.utils import make_client
 from examples.utils import router_replay_stop_params
 from examples.utils import running_job
@@ -31,20 +33,27 @@ from examples.utils import sequence_from_rollout
 from examples.utils import stop_params_for
 from examples.utils import sync_weights
 
-from cortex_training.client import DEBUG_OPTIONS_ENV
-
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARN)
 logging.getLogger("urllib3").setLevel(logging.WARN)
 logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
 
 _EXAMPLE_DIR = Path(__file__).resolve().parent
-_CONFIG_SEARCH_DIRS = (_EXAMPLE_DIR, _EXAMPLE_DIR / "configs")
+# Each run writes the job it built here (the folder is not committed).
+CONFIGS_DIR = _EXAMPLE_DIR / "configs"
 
 
 class Config(Protocol):
     config: str
     job_id: str | None
+    model: str
+    context: str
+    hardware: str
+    lora: bool
+    job_config: str | None
+    lr: float | None
+    train_batch_size: int | None
+    max_seq_len: int | None
     problems_per_batch: int
     group_size: int
     max_tokens: int
@@ -61,7 +70,6 @@ class Config(Protocol):
     eval_temperature: float | None
     eval_max_tokens: int | None
     weight_sync_bucket_size: int | None
-    job_config: str
 
 
 class Task(Protocol):
@@ -92,10 +100,51 @@ class Task(Protocol):
 
 
 def job_body(config: Config) -> dict:
-    body = load_job_body(config.job_config, search_dirs=_CONFIG_SEARCH_DIRS)
-    if config.debug_image_tag:
-        body["debug"] = {"job": {"image_tag": config.debug_image_tag}}
-    return body
+    """The RL job: the catalog's training and inference files, rl/overrides.json,
+    then ``config``, with router replay filled in using the fixed default caps
+    for an MoE model. A ``job_config`` file is used as is instead, plus
+    ``config``'s settings.
+    """
+    return build_job(
+        "rl",
+        model=config.model,
+        context=config.context,
+        hardware=config.hardware,
+        lora=config.lora,
+        job_config=config.job_config,
+        example_dir=_EXAMPLE_DIR,
+        search_dirs=(_EXAMPLE_DIR, CONFIGS_DIR),
+        lr=config.lr,
+        train_batch_size=config.train_batch_size,
+        max_seq_len=config.max_seq_len,
+        rollout_batch_size=config.problems_per_batch * config.group_size,
+        debug_image_tag=config.debug_image_tag,
+    )
+
+
+def job_record_path(config: Config) -> Path:
+    """Where a run records the job it built: ``<slug>-<context>-<hw>-<lora|full>.json``."""
+    mode = "lora" if config.lora else "full"
+    return CONFIGS_DIR / f"{model_slug(config.model)}-{config.context}-{config.hardware.lower()}-{mode}.json"
+
+
+def write_job_record(config: Config, body: dict) -> Path:
+    """Write the job this run generated, over the previous record for the same selection.
+
+    ``train`` calls it before the job is submitted, so the file is the body the
+    run built -- a reproducible starting point whose router-replay caps match
+    this run's settings, not whatever last reached ``running``. It keeps the
+    debug image tag, but passing the file back with ``job_config=`` does not
+    re-enable debug on its own: loading a body never opens the internal-only
+    gate, so to replay on that image you re-authorize debug explicitly (pass
+    ``debug_image_tag=`` again, or set ``CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS``
+    yourself). The folder is gitignored, so the tag is never committed.
+    """
+    path = job_record_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+    logger.info("Wrote this run's job to %s; edit it and pass it back with job_config=%s", path, path)
+    return path
 
 
 def processing_block(config: Config, global_batch_size: int) -> dict:
@@ -116,18 +165,28 @@ def should_eval(step: int, total_steps: int, eval_every: int) -> bool:
 
 
 def train(config: Config, task: Task) -> None:
-    if config.debug_image_tag:
-        os.environ[DEBUG_OPTIONS_ENV] = "1"
-        logger.info("Using debug image_tag=%s", config.debug_image_tag)
-
     body = job_body(config)
+    # Record the body this run generated, before submitting it. A job_config run
+    # uses its file as is, and an attach submits nothing, so neither writes.
+    if config.job_config is None and config.job_id is None:
+        write_job_record(config, body)
     subs = {sub.get("job_type"): sub for sub in body.get("sub_job_configs") or ()}
     training_sub = subs.get("training") or {}
     sampling_sub = subs.get("sampling") or {}
     training = training_sub.get("training_config") or {}
     sampling = sampling_sub.get("inference_config") or {}
     learning_rate = float((training.get("optimizer") or {}).get("lr"))
-    max_seq_len = int(training.get("max_seq_len") or sampling.get("max_seq_len"))
+    # Rollouts are collated at the training window, so a larger sampling window
+    # would admit a rollout that overflows it at collation (build_job also rejects
+    # this; the guard here also covers a body reached another way).
+    training_window = training.get("max_seq_len")
+    sampling_window = sampling.get("max_seq_len")
+    if isinstance(training_window, int) and isinstance(sampling_window, int) and sampling_window > training_window:
+        raise ValueError(
+            f"the RL job's sampling max_seq_len {sampling_window} exceeds its training max_seq_len "
+            f"{training_window}; lower the sampling window to at most the training window"
+        )
+    max_seq_len = int(training_window or sampling_window)
     lora_rank = int(
         (training.get("peft_config") or sampling.get("peft_config") or {}).get("r") or 0
     )
@@ -214,6 +273,8 @@ def train(config: Config, task: Task) -> None:
     client = make_client(config.config)
 
     with running_job(client, body, job_id=config.job_id) as job_id:
+        if config.job_id is not None:
+            logger.info("Attached to job %s, so this run writes no job record", job_id)
         ml_logger = setup_logging(config, client=client, job_id=job_id)
         sampling_job_id: str | None = None
         if router_replay:
@@ -411,7 +472,10 @@ def train(config: Config, task: Task) -> None:
             job_id=job_id,
             saved=saved,
             sampling_command="evaluate",
-            job_config=Path(config.job_config).name,
+            job_args=inference_job_args(
+                body,
+                context=config.context if config.job_config is None else None,
+            ),
             temperature=(
                 config.temperature
                 if config.eval_temperature is None

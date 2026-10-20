@@ -42,10 +42,12 @@ the profile `[default]` to run `cortex-training capacity` without
 ### Legacy JSON configuration
 
 Existing JSON connection files and `cortex-training login` remain supported.
-From a clone, copy the template:
+The same file is what the examples take as `config=`. From a clone, copy the
+template, [`connection.json.template`](connection.json.template), to a location
+outside the repository:
 
 ```bash
-cp examples/config/connection.json.template ~/cortex-training-config.json
+cp docs/getting-started/connection.json.template ~/cortex-training-config.json
 ```
 
 Otherwise create it by hand, outside the repository:
@@ -59,8 +61,10 @@ Otherwise create it by hand, outside the repository:
 }
 ```
 
-Fill in the account host, programmatic access token, database, and schema. Keep
-the file outside the repository and do not commit it.
+Fill in the account host, programmatic access token, database, and schema. The
+template also carries the optional `endpoint`, `poll_interval`, `poll_timeout`,
+and `verify_ssl` settings with their defaults. Keep the file outside the
+repository and do not commit it: it holds a programmatic access token.
 
 Validate and store the legacy config path:
 

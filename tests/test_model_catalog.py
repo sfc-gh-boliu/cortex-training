@@ -9,16 +9,16 @@ import sys
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT / "scripts"))
+sys.path.insert(0, str(REPO_ROOT / "model-catalog"))
 
-import smoke_test_model_catalog as smoke_catalog  # noqa: E402
-from smoke_test_model_catalog import apply_debug_image_tag  # noqa: E402
-from smoke_test_model_catalog import apply_training_sequence_parallelism  # noqa: E402
-from smoke_test_model_catalog import build_profile_request  # noqa: E402
-from smoke_test_model_catalog import build_forward_backward_probe_spec  # noqa: E402
-from smoke_test_model_catalog import enable_training_memory_telemetry  # noqa: E402
-from smoke_test_model_catalog import run_data_plane_probes  # noqa: E402
-from validate_model_catalog import (  # noqa: E402
+import smoke_test_catalog as smoke_catalog  # noqa: E402
+from smoke_test_catalog import apply_debug_image_tag  # noqa: E402
+from smoke_test_catalog import apply_training_sequence_parallelism  # noqa: E402
+from smoke_test_catalog import build_profile_request  # noqa: E402
+from smoke_test_catalog import build_forward_backward_probe_spec  # noqa: E402
+from smoke_test_catalog import enable_training_memory_telemetry  # noqa: E402
+from smoke_test_catalog import run_data_plane_probes  # noqa: E402
+from validate_catalog import (  # noqa: E402
     CatalogValidationError,
     load_catalog,
     load_and_validate,
@@ -112,9 +112,9 @@ def test_shipped_qwen_recipes_use_model_limits_and_long_context_sp():
         "Qwen/Qwen3.6-35B-A3B": 262144,
     }
     config_paths = [
-        *REPO_ROOT.glob("recipes/inference/configs/qwen*.json"),
-        *REPO_ROOT.glob("recipes/rl/configs/qwen*.json"),
-        *REPO_ROOT.glob("recipes/sft/configs/qwen*.json"),
+        *REPO_ROOT.glob("examples/inference/configs/qwen*.json"),
+        *REPO_ROOT.glob("examples/rl/configs/qwen*.json"),
+        *REPO_ROOT.glob("examples/sft/configs/qwen*.json"),
     ]
 
     assert len(config_paths) == 20

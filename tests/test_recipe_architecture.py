@@ -18,13 +18,13 @@ def _import_recipe(module_name: str):
     ("runner_name", "task_name", "task_type"),
     [
         (
-            "recipes.sft.train",
-            "recipes.sft.conversational.train",
+            "examples.sft.train",
+            "examples.sft.conversational.train",
             "ConversationalTask",
         ),
         (
-            "recipes.rl.train",
-            "recipes.rl.math_grpo.train",
+            "examples.rl.train",
+            "examples.rl.math_grpo.train",
             "MathTask",
         ),
     ],
@@ -36,29 +36,29 @@ def test_task_entrypoints_call_shared_runner(runner_name, task_name, task_type):
     assert task_entrypoint.train is runner.train
     assert task_entrypoint.job_body is runner.job_body
     assert task_entrypoint.Config.__module__ == task_name
-    assert getattr(task_entrypoint, task_type).__module__.startswith("recipes.")
+    assert getattr(task_entrypoint, task_type).__module__.startswith("examples.")
 
 
 def test_task_helpers_remain_available_from_task_entrypoints():
-    conversational = _import_recipe("recipes.sft.conversational.train")
-    math_grpo = _import_recipe("recipes.rl.math_grpo.train")
+    conversational = _import_recipe("examples.sft.conversational.train")
+    math_grpo = _import_recipe("examples.rl.math_grpo.train")
 
     assert conversational.load_chat_dataset.__module__ == (
-        "recipes.sft.tasks.conversational"
+        "examples.sft.tasks.conversational"
     )
-    assert math_grpo.score_response.__module__ == "recipes.rl.tasks.math"
+    assert math_grpo.score_response.__module__ == "examples.rl.tasks.math"
 
 
 @pytest.mark.parametrize(
     ("module_name", "config_name", "model_name"),
     [
         (
-            "recipes.sft.conversational.train",
+            "examples.sft.conversational.train",
             "configs/qwen3_8b_full.json",
             "Qwen/Qwen3-8B",
         ),
         (
-            "recipes.rl.math_grpo.train",
+            "examples.rl.math_grpo.train",
             "configs/qwen3_8b_lora.json",
             "Qwen/Qwen3-8B",
         ),
@@ -81,9 +81,9 @@ def test_hoisted_config_paths_resolve_outside_repo(
 @pytest.mark.parametrize(
     "relative_path",
     [
-        "recipes/sft/conversational/train.py",
-        "recipes/rl/math_grpo/train.py",
-        "recipes/distillation/on_policy/train.py",
+        "examples/sft/conversational/train.py",
+        "examples/rl/math_grpo/train.py",
+        "examples/distillation/on_policy/train.py",
     ],
 )
 def test_task_modules_are_entrypoints(relative_path):
@@ -96,9 +96,9 @@ def test_task_modules_are_entrypoints(relative_path):
 @pytest.mark.parametrize(
     "relative_path",
     [
-        "recipes/sft/train.py",
-        "recipes/rl/train.py",
-        "recipes/distillation/train.py",
+        "examples/sft/train.py",
+        "examples/rl/train.py",
+        "examples/distillation/train.py",
     ],
 )
 def test_shared_runners_are_task_agnostic_libraries(relative_path):
@@ -111,8 +111,8 @@ def test_shared_runners_are_task_agnostic_libraries(relative_path):
 @pytest.mark.parametrize(
     ("module_name", "task_type"),
     [
-        ("recipes.sft.conversational.train", "ConversationalTask"),
-        ("recipes.rl.math_grpo.train", "MathTask"),
+        ("examples.sft.conversational.train", "ConversationalTask"),
+        ("examples.rl.math_grpo.train", "MathTask"),
     ],
 )
 def test_entrypoint_selects_task(monkeypatch, module_name, task_type):
@@ -132,7 +132,7 @@ def test_entrypoint_selects_task(monkeypatch, module_name, task_type):
 
 
 def test_configs_and_metadata_are_hoisted():
-    assert (REPO_ROOT / "recipes/sft/recipe.yaml").is_file()
-    assert (REPO_ROOT / "recipes/rl/recipe.yaml").is_file()
-    assert not list((REPO_ROOT / "recipes/sft/conversational/configs").glob("*.json"))
-    assert not list((REPO_ROOT / "recipes/rl/math_grpo/configs").glob("*.json"))
+    assert (REPO_ROOT / "examples/sft/recipe.yaml").is_file()
+    assert (REPO_ROOT / "examples/rl/recipe.yaml").is_file()
+    assert not list((REPO_ROOT / "examples/sft/conversational/configs").glob("*.json"))
+    assert not list((REPO_ROOT / "examples/rl/math_grpo/configs").glob("*.json"))

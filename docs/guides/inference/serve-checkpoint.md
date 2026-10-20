@@ -1,11 +1,11 @@
 # Serve a Training Checkpoint
 
-The [inference recipe](../../../recipes/inference/README.md) creates a standalone
+The [inference recipe](../../../examples/inference/README.md) creates a standalone
 sampling endpoint, either from original Hugging Face weights or from a
 weights-only checkpoint produced by a training run:
 
 ```bash
-python -m recipes.inference.serve \
+python -m examples.inference.serve \
   config=/path/to/config.json \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID
@@ -16,7 +16,7 @@ optimizer state and are not loadable by the sampling runtime. The sampling job i
 independent, so the training job can be cancelled once the checkpoint is saved.
 
 GPU count and vLLM settings live in the job-config JSON under
-`recipes/inference/configs/`. For the equivalent raw client calls, see
+`examples/inference/configs/`. For the equivalent raw client calls, see
 [Start sampling from saved weights](../../reference/rest-api.md#134-start-sampling-from-saved-weights).
 
 Readiness checks, scaling and teardown are not yet documented.

@@ -82,7 +82,7 @@ The conversational SFT recipe fine-tunes Qwen3-8B on a one-example chat dataset
 ("Who trained you?" → "Snowflake AI Research"). Start with a short run:
 
 ```bash
-python -m recipes.sft.conversational.train \
+python -m examples.sft.conversational.train \
   config=/path/to/your-config.json \
   max_steps=10
 ```
@@ -107,9 +107,9 @@ The recipe prints a generate command after saving the checkpoint. Run it to
 confirm the model learned the expected answer:
 
 ```bash
-python -m recipes.inference.generate \
+python -m examples.inference.generate \
   config=/path/to/your-config.json \
-  job_config=recipes/inference/configs/qwen3_8b_full.json \
+  job_config=examples/inference/configs/qwen3_8b_full.json \
   source_job_id=<training_job_id> \
   checkpoint_id=<checkpoint_id> \
   temperature=0 \
@@ -134,11 +134,11 @@ cortex-training tui                   # terminal UI for browsing jobs and logs
 You have a working setup. From here:
 
 - **Try different training methods**: adjust the job config JSON to use
-  [LoRA](../../recipes/sft/README.md)
+  [LoRA](../../examples/sft/README.md)
   (`job_config=configs/qwen3_8b_lora.json`), a different model, or different
   hyperparameters
 - **Try reinforcement learning**: run the
-  [Math GRPO recipe](../../recipes/rl/README.md)
-- **Explore all recipes**: browse the [recipe catalog](../../recipes/README.md)
+  [Math GRPO recipe](../../examples/rl/README.md)
+- **Explore all recipes**: browse the [recipe catalog](../../examples/README.md)
 - **Learn the CLI**: see the [CLI reference](../reference/cli.md) for all
   available commands

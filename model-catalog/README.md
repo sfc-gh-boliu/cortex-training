@@ -13,7 +13,7 @@ model availability, context limits, and recommended starting configurations.
   model capability supplies `model_name` and injects its `maxContextTokens` as
   `max_seq_len`; profiles must not hard-code either model-specific value.
 - `schema.json` documents the public catalog format.
-- `scripts/smoke_test_model_catalog.py` builds a selected recommendation from
+- `smoke_test_catalog.py` builds a selected recommendation from
   the catalog and can optionally submit it as a real PAT-authenticated job.
 
 Inference support provides one maximum context length and recommended profile.
@@ -43,7 +43,7 @@ expert LoRA is not yet supported, and Hugging Face MLP names such as
 3. Run:
 
    ```bash
-   python scripts/validate_model_catalog.py
+   python model-catalog/validate_catalog.py
    python -m pytest tests/test_model_catalog.py -q
    ```
 
@@ -55,7 +55,7 @@ it does not download mutable data during a documentation build.
 Dry-run the exact request body generated from a catalog recommendation:
 
 ```bash
-python scripts/smoke_test_model_catalog.py \
+python model-catalog/smoke_test_catalog.py \
   --model-id Qwen/Qwen3.8-27B \
   --profile inference
 ```
@@ -102,7 +102,7 @@ export SNOWFLAKE_SCHEMA='PUBLIC'
 read -rs SNOWFLAKE_PAT
 export SNOWFLAKE_PAT
 
-python scripts/smoke_test_model_catalog.py \
+python model-catalog/smoke_test_catalog.py \
   --model-id Qwen/Qwen3.8-27B \
   --profile inference \
   --full-context-prefill \

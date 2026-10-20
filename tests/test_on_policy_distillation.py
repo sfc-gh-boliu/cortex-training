@@ -12,14 +12,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from recipes.distillation import teacher as teacher_mod
-from recipes.distillation import train as runner
-from recipes.distillation.tasks.gsm8k import extract_answer
-from recipes.distillation.tasks.gsm8k import is_correct
-from recipes.distillation.tasks.gsm8k import parse_gold
-from recipes.utils import _forward_backward_payload
-from recipes.utils import collate
-from recipes.utils import sequence_from_rollout
+from examples.distillation import teacher as teacher_mod
+from examples.distillation import train as runner
+from examples.distillation.tasks.gsm8k import extract_answer
+from examples.distillation.tasks.gsm8k import is_correct
+from examples.distillation.tasks.gsm8k import parse_gold
+from examples.utils import _forward_backward_payload
+from examples.utils import collate
+from examples.utils import sequence_from_rollout
 
 from cortex_training import wire
 
@@ -544,7 +544,7 @@ def test_clipped_fraction_counts_tokens_outside_the_clip():
 
 def test_entrypoint_runs_the_gsm8k_task(monkeypatch):
     pytest.importorskip("chz")
-    from recipes.distillation.on_policy import train as entry
+    from examples.distillation.on_policy import train as entry
 
     captured = {}
     monkeypatch.setattr(

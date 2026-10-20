@@ -1,6 +1,6 @@
 # Reinforcement Learning
 
-The [Math GRPO recipe](../../../recipes/rl/README.md) is the current
+The [Math GRPO recipe](../../../examples/rl/README.md) is the current
 end-to-end RL example. It demonstrates:
 
 - Colocated training and sampling sub-jobs
@@ -11,7 +11,7 @@ end-to-end RL example. It demonstrates:
 
 ## Integrated RL frameworks
 
-[SkyRL](../../integrations/skyrl.md) can also run GRPO against Cortex Training,
+[SkyRL](../../../examples/frameworks/skyrl/gsm8k_grpo/README.md) can also run GRPO against Cortex Training,
 with its trainer on a CPU driver and training and sampling in Cortex sub-jobs.
 Its GSM8K example lives in the Arctic Platform repository and has its own
 install.

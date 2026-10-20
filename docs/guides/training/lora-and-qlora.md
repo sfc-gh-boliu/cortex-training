@@ -1,7 +1,7 @@
 # LoRA and QLoRA
 
 LoRA training is implemented by the
-[conversational SFT recipe](../../../recipes/sft/README.md).
+[conversational SFT recipe](../../../examples/sft/README.md).
 It is selected by the job-config JSON you pass, not by a command-line flag: a
 config whose `training_config` carries a `peft_config` block trains LoRA, and one
 without it trains all parameters.
@@ -10,7 +10,7 @@ The recipe defaults to `configs/qwen3_8b_full.json` (full-parameter), so LoRA is
 opt-in:
 
 ```bash
-python -m recipes.sft.conversational.train \
+python -m examples.sft.conversational.train \
   config=/path/to/config.json \
   job_config=configs/qwen3_8b_lora.json
 ```
@@ -33,7 +33,7 @@ dense Qwen models, you can also adjust `target_modules`. Keep the shipped
 attention-only target list for `Qwen/Qwen3.6-35B-A3B`: its PrimeRL backend does
 not yet support LoRA on routed experts, and Hugging Face MLP target names are
 no-ops. The recipe README documents the whole
-[job-config guidance](../../../recipes/sft/README.md).
+[job-config guidance](../../../examples/sft/README.md).
 
 QLoRA is not implemented: there are no quantization settings in the recipe or in
 the job-config schema.

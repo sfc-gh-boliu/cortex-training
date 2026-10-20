@@ -5,9 +5,9 @@
       "workflow": "rl",
       "tuningMethod": "lora",
       "summary": "LoRA RL starting point with eight training and eight sampling GPUs.",
-      "recipePath": "recipes/rl/math_grpo/train.py",
+      "recipePath": "examples/rl/math_grpo/train.py",
       "evidencePaths": [
-        "recipes/rl/configs/qwen3_8b_lora.json"
+        "examples/rl/configs/qwen3_8b_lora.json"
       ],
       "subJobs": [
         {
@@ -98,9 +98,9 @@
       "workflow": "rl",
       "tuningMethod": "lora",
       "summary": "Sequence-parallel LoRA RL starting point for Qwen3.8 with eager eight-GPU sampling.",
-      "recipePath": "recipes/rl/math_grpo/train.py",
+      "recipePath": "examples/rl/math_grpo/train.py",
       "evidencePaths": [
-        "recipes/rl/math_grpo/train.py"
+        "examples/rl/math_grpo/train.py"
       ],
       "subJobs": [
         {
@@ -196,9 +196,9 @@
       "workflow": "rl",
       "tuningMethod": "full",
       "summary": "Full-parameter RL starting point with eight training and eight sampling GPUs.",
-      "recipePath": "recipes/rl/math_grpo/train.py",
+      "recipePath": "examples/rl/math_grpo/train.py",
       "evidencePaths": [
-        "recipes/rl/configs/qwen3_8b_full.json"
+        "examples/rl/configs/qwen3_8b_full.json"
       ],
       "subJobs": [
         {
@@ -257,9 +257,9 @@
       "workflow": "rl",
       "tuningMethod": "lora",
       "summary": "PrimeRL sequence-parallel attention-only LoRA RL starting point for Qwen3.6-35B-A3B.",
-      "recipePath": "recipes/rl/math_grpo/train.py",
+      "recipePath": "examples/rl/math_grpo/train.py",
       "evidencePaths": [
-        "recipes/rl/configs/qwen36_35b_a3b_lora.json"
+        "examples/rl/configs/qwen36_35b_a3b_lora.json"
       ],
       "subJobs": [
         {
@@ -363,9 +363,9 @@
       "workflow": "rl",
       "tuningMethod": "full",
       "summary": "PrimeRL sequence-parallel full RL starting point with sixteen training and sixteen sampling GPUs.",
-      "recipePath": "recipes/rl/math_grpo/train.py",
+      "recipePath": "examples/rl/math_grpo/train.py",
       "evidencePaths": [
-        "recipes/rl/configs/qwen36_35b_a3b_full.json"
+        "examples/rl/configs/qwen36_35b_a3b_full.json"
       ],
       "subJobs": [
         {

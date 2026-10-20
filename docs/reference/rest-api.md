@@ -86,7 +86,7 @@ context limits, and recommended configurations is
 profiles live under [`model-catalog/profiles/`](../../model-catalog/profiles/).
 
 This API reference does not duplicate the model table. Run
-`python scripts/validate_model_catalog.py` after changing the catalog or a
+`python model-catalog/validate_catalog.py` after changing the catalog or a
 profile.
 
 ---
@@ -1197,7 +1197,7 @@ re-tokenizing it: send the sequence as a pre-tokenized prompt with
 `max_tokens: 1` and read `prompt_logprobs[i]` as the log probability of prompt
 token `i`. The prompt must stay shorter than the sampling sub-job's
 `max_seq_len`. The
-[on-policy distillation recipe](../../recipes/distillation/README.md) scores
+[on-policy distillation recipe](../../examples/distillation/README.md) scores
 student rollouts with a teacher this way.
 
 ### 6.7 Streaming generate - `POST /{job_id}/generate-stream`

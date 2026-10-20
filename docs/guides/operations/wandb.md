@@ -12,7 +12,7 @@ export WANDB_BASE_URL=...
 Then set a project on the train command:
 
 ```bash
-python -m recipes.sft.conversational.train \
+python -m examples.sft.conversational.train \
   config=/path/to/config.json wandb_project=cortex-training
 ```
 

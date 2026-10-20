@@ -52,7 +52,7 @@ between its sub-jobs.
 
 The CLI and `CortexTrainingClient` operate on the same jobs; they are not
 alternative execution models. Use the CLI for setup, inspection, and individual
-operations. Use a Python loop or a [recipe](../../recipes/README.md) for dataset
+operations. Use a Python loop or a [recipe](../../examples/README.md) for dataset
 iteration, batching, rewards, evaluation, and repeated calls. The client loop
 creates a job or uses an existing job ID, submits operations, and polls their
 results. `submit --wait` waits for workers to be running; it does not upload or

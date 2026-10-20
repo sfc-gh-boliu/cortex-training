@@ -33,6 +33,6 @@ yet supported.
 Validate catalog changes with:
 
 ```bash
-python scripts/validate_model_catalog.py
+python model-catalog/validate_catalog.py
 python -m pytest tests/test_model_catalog.py -q
 ```

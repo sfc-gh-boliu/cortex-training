@@ -1,8 +1,8 @@
-from recipes.inference.identity import contains_identity
-from recipes.inference.identity import load_identity_prompts
-from recipes.inference.identity import score_identity_completions
-from recipes.sft.tasks.conversational import lookup_chat_dataset
-from recipes.sft.tasks.conversational import sample_prompt_for
+from examples.inference.identity import contains_identity
+from examples.inference.identity import load_identity_prompts
+from examples.inference.identity import score_identity_completions
+from examples.sft.tasks.conversational import lookup_chat_dataset
+from examples.sft.tasks.conversational import sample_prompt_for
 
 
 def test_contains_identity_is_case_sensitive():

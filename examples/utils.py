@@ -17,18 +17,25 @@
 
 The helpers are grouped by section: the connection, job configs, checkpoints,
 rendering, router replay operations, batching, training and sampling
-operations, the job lifecycle, router replay capacity planning, and the model
-catalog.
+operations, the job lifecycle, router replay capacity planning, the model
+catalog, and ``make_config``, which builds a job from the catalog.
+
+Run this module to write a job config from the command line::
+
+    python -m examples.utils --model Qwen/Qwen3-8B --context standard -o job.json
 """
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import json
 import logging
 import math
+import os
 import re
 import struct
+import sys
 from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import Sequence
@@ -51,7 +58,6 @@ from cortex_training import wire
 logger = logging.getLogger(__name__)
 
 
-_ROUTER_REPLAY_DEFAULT_MAX_CACHE_BYTES = 16 * 1024**3
 LORA_TARGET_MODULES = (
     "q_proj",
     "k_proj",
@@ -403,18 +409,6 @@ def stop_params_for(stop_sequences: Sequence[Any]) -> dict:
 
 
 # ─── Router replay operations ────────────────────────────────────────────────
-
-
-def router_replay_config(
-    enabled: bool = True,
-    max_cache_bytes: int | None = None,
-) -> dict[str, Any]:
-    if not enabled:
-        return {"enabled": False}
-    return {
-        "enabled": True,
-        "max_cache_bytes": int(_ROUTER_REPLAY_DEFAULT_MAX_CACHE_BYTES if max_cache_bytes is None else max_cache_bytes),
-    }
 
 
 def router_replay_stop_params(
@@ -1405,3 +1399,562 @@ def model_slug(model_id: str) -> str:
 def catalog_file_name(hardware: str, kind: str, lora: bool) -> str:
     """``<hw>-<kind>-<lora|full>.json`` for a catalog job file."""
     return f"{hardware}-{kind}-{'lora' if lora else 'full'}.json"
+
+
+# ─── make_config: jobs from the model catalog ────────────────────────────────
+
+# The rollout pipeline the examples run is synchronous: one batch is generated,
+# trained on and synced before the next starts.
+ROLLOUT_ASYNC_DEPTH = 1
+
+# The default per-worker router-replay cache caps make_config fills in for an
+# MoE RL job. They are fixed, not derived from the rollout batch: a single pair
+# of caps that holds across models, contexts and hardware. The capacity planner
+# (``plan_router_replay_caps`` and the ``plan_*_cache_bytes`` functions above)
+# stays available for sizing a cap by hand, but it no longer sets the default.
+DEFAULT_ROUTER_REPLAY_TRAINING_CACHE_BYTES = 5 * GIB_BYTES
+DEFAULT_ROUTER_REPLAY_SAMPLING_CACHE_BYTES = 20 * GIB_BYTES
+
+
+def _catalog_models(catalog_dir: Path) -> list[str]:
+    models = []
+    for path in sorted(catalog_dir.glob("*/model.json")):
+        try:
+            models.append(str(json.loads(path.read_text(encoding="utf-8"))["model_id"]))
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return models
+
+
+def load_catalog_model(model: str, catalog_dir: str | os.PathLike | None = None) -> tuple[Path, dict[str, Any]]:
+    """Return ``(model folder, model.json)`` for the exact model ID ``model``."""
+    catalog = Path(catalog_dir) if catalog_dir is not None else CATALOG_DIR
+    folder = catalog / model_slug(model)
+    info_path = folder / "model.json"
+    if not info_path.is_file():
+        raise FileNotFoundError(
+            f"{model!r} is not in the model catalog; it has: {', '.join(_catalog_models(catalog)) or 'no models'}"
+        )
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    if info.get("model_id") != model:
+        raise FileNotFoundError(
+            f"{model!r} is not in the model catalog; did you mean {info.get('model_id')!r}? "
+            "Pass the exact model ID."
+        )
+    return folder, info
+
+
+def _catalog_job_file(
+    model: str,
+    folder: Path,
+    context: str,
+    hardware: str,
+    kind: str,
+    lora: bool,
+) -> Path:
+    path = folder / context / catalog_file_name(hardware, kind, lora)
+    if not path.is_file():
+        existing = sorted(found.relative_to(folder).as_posix() for found in folder.glob("*/*.json"))
+        raise FileNotFoundError(
+            f"{model} has no {context}/{path.name} in the model catalog; its files are: "
+            f"{', '.join(existing) or 'none'}"
+        )
+    return path
+
+
+def _merge_mappings(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(dict(base))
+    for key, value in override.items():
+        if value is None:
+            merged.pop(key, None)
+        elif isinstance(value, Mapping):
+            current = merged.get(key)
+            merged[key] = _merge_mappings(current if isinstance(current, Mapping) else {}, value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def _merge_sub_jobs(base: Any, override: Any) -> list[Any]:
+    if not isinstance(override, list):
+        raise ValueError("an override's sub_job_configs must be a list of sub-jobs, matched by job_type")
+    merged = deepcopy(list(base or ()))
+    seen: set[str] = set()
+    for index, entry in enumerate(override):
+        job_type = entry.get("job_type") if isinstance(entry, Mapping) else None
+        if not isinstance(job_type, str):
+            raise ValueError(f"override sub_job_configs[{index}] needs a job_type to match a sub-job")
+        if job_type in seen:
+            raise ValueError(f"override sub_job_configs lists job_type {job_type!r} twice")
+        seen.add(job_type)
+        matches = [i for i, sub_job in enumerate(merged) if isinstance(sub_job, Mapping) and sub_job.get("job_type") == job_type]
+        present = sorted({str(sub_job.get("job_type")) for sub_job in merged if isinstance(sub_job, Mapping)})
+        if not matches:
+            raise ValueError(
+                f"override sub_job_configs[{index}] has job_type {job_type!r}, which matches no sub-job "
+                f"(the job has {present})"
+            )
+        if len(matches) > 1:
+            raise ValueError(f"override job_type {job_type!r} matches {len(matches)} sub-jobs; it must match one")
+        merged[matches[0]] = _merge_mappings(merged[matches[0]], entry)
+    return merged
+
+
+def merge_job_config(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply one override to a create-job body and return the result.
+
+    - Dictionaries merge key by key, and ``None`` (JSON ``null``) removes a key.
+    - ``sub_job_configs`` entries are matched by ``job_type`` and merged, so an
+      override can change one sub-job without restating the others. An entry
+      whose ``job_type`` repeats, or matches no sub-job, raises ``ValueError``.
+    - All other lists are replaced whole.
+
+    Neither argument is modified.
+    """
+    if not isinstance(override, Mapping):
+        raise ValueError("an override must be a JSON object")
+    merged = _merge_mappings(base, {key: value for key, value in override.items() if key != "sub_job_configs"})
+    if "sub_job_configs" in override:
+        if override["sub_job_configs"] is None:
+            merged.pop("sub_job_configs", None)
+        else:
+            merged["sub_job_configs"] = _merge_sub_jobs(base.get("sub_job_configs"), override["sub_job_configs"])
+    return merged
+
+
+def _load_override(source: str | os.PathLike | Mapping[str, Any]) -> Mapping[str, Any]:
+    if isinstance(source, Mapping):
+        return source
+    path = Path(source).expanduser()
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"override file not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"override {path} is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"override {path} must be a JSON object")
+    return parsed
+
+
+def _only_sub_job(body: Mapping[str, Any], job_type: str, label: str) -> dict[str, Any]:
+    sub_jobs = body.get("sub_job_configs")
+    if (
+        not isinstance(sub_jobs, list)
+        or len(sub_jobs) != 1
+        or not isinstance(sub_jobs[0], dict)
+        or sub_jobs[0].get("job_type") != job_type
+    ):
+        raise ValueError(f"{label} must hold exactly one {job_type} sub-job to build an RL job")
+    return sub_jobs[0]
+
+
+def _combine_rl_job(
+    training_body: Mapping[str, Any],
+    inference_body: Mapping[str, Any],
+    *,
+    training_label: str,
+    inference_label: str,
+) -> dict[str, Any]:
+    training_sub = _only_sub_job(training_body, "training", training_label)
+    sampling_sub = _only_sub_job(inference_body, "sampling", inference_label)
+    training_hardware = str(training_body.get("hardware") or "H200").upper()
+    inference_hardware = str(inference_body.get("hardware") or "H200").upper()
+    if training_hardware != inference_hardware:
+        raise ValueError(
+            "hardware is set once per job, so both RL sub-jobs need the same hardware: "
+            f"{training_label} is {training_hardware} but {inference_label} is {inference_hardware}"
+        )
+    combined = deepcopy(dict(training_body))
+    for key, value in inference_body.items():
+        if key in ("sub_job_configs", "hardware"):
+            continue
+        if key in combined and combined[key] != value:
+            raise ValueError(f"{training_label} and {inference_label} disagree on {key}")
+        combined.setdefault(key, deepcopy(value))
+    if "hardware" in training_body or "hardware" in inference_body:
+        combined["hardware"] = training_body.get("hardware") or inference_body.get("hardware")
+    combined["sub_job_configs"] = [deepcopy(training_sub), deepcopy(sampling_sub)]
+    return combined
+
+
+def _sub_job_config(body: Mapping[str, Any], job_type: str, config_key: str) -> dict[str, Any]:
+    for sub_job in body.get("sub_job_configs") or ():
+        if isinstance(sub_job, dict) and sub_job.get("job_type") == job_type:
+            config = sub_job.get(config_key)
+            if not isinstance(config, dict):
+                raise ValueError(f"the {job_type} sub-job needs a {config_key} object")
+            return config
+    raise ValueError(f"the job has no {job_type} sub-job")
+
+
+def moe_geometry_from_catalog(info: Mapping[str, Any]) -> MoEGeometry:
+    """Router-replay geometry from a model.json ``moe`` entry."""
+    moe = info.get("moe")
+    if info.get("architecture") != "moe" or not isinstance(moe, Mapping):
+        raise ValueError(
+            f"router replay needs an MoE model; the catalog lists {info.get('model_id')!r} as "
+            f"{info.get('architecture')!r} with no moe geometry"
+        )
+    return moe_geometry_from_config(
+        None,
+        num_moe_layers_override=moe.get("num_moe_layers"),
+        topk_override=moe.get("topk"),
+        num_experts_override=moe.get("num_experts"),
+    )
+
+
+def plan_router_replay_caps(
+    training_config: Mapping[str, Any],
+    inference_config: Mapping[str, Any],
+    geometry: MoEGeometry,
+    *,
+    rollout_batch_size: int,
+) -> tuple[CachePlan, CachePlan]:
+    """Plan the ``(training, sampling)`` router-replay caps of one RL job.
+
+    The training cap holds the rows one data-parallel shard keeps resident: the
+    rollout batch divided by ``n_gpus / sp_size``, each at the training
+    ``max_seq_len``. The sampling cap holds one replica's share of the backlog
+    of a synchronous loop (``async_depth=1``), spread over
+    ``n_gpus / tensor_parallel_size`` replicas (and ``pipeline_parallel_size``
+    when set) with the planner's default routing skew and safety factor.
+    """
+    resident_rows = derive_resident_rows(
+        batch_size=rollout_batch_size,
+        dp_size=derive_dp_size(
+            training_gpus=training_config.get("n_gpus"),
+            sp_size=training_config.get("sp_size"),
+        ),
+    )
+    training_plan = plan_training_cache_bytes(
+        seq_len=training_config.get("max_seq_len"),
+        geometry=geometry,
+        resident_rows=resident_rows,
+        safety_factor=DEFAULT_SAFETY_FACTOR,
+    )
+    vllm_config = inference_config.get("vllm_config") or {}
+    sampling_plan = plan_sampling_cache_bytes(
+        seq_len=inference_config.get("max_seq_len"),
+        geometry=geometry,
+        backlog_rollouts=derive_backlog_rollouts(batch_size=rollout_batch_size, async_depth=ROLLOUT_ASYNC_DEPTH),
+        num_sampling_workers=derive_num_sampling_workers(
+            sampling_gpus=inference_config.get("n_gpus"),
+            sampling_tensor_parallel_size=vllm_config.get("tensor_parallel_size"),
+            sampling_pipeline_parallel_size=vllm_config.get("pipeline_parallel_size"),
+        ),
+        routing_skew=DEFAULT_ROUTING_SKEW,
+        safety_factor=DEFAULT_SAFETY_FACTOR,
+    )
+    return training_plan, sampling_plan
+
+
+def _apply_router_replay_defaults(
+    body: dict[str, Any],
+    *,
+    geometry,
+) -> None:
+    training = _sub_job_config(body, "training", "training_config")
+    sampling = _sub_job_config(body, "sampling", "inference_config")
+    settings = {"training": training.get("router_replay"), "sampling": sampling.get("router_replay")}
+    for name, value in settings.items():
+        if value is not None and not isinstance(value, Mapping):
+            raise ValueError(f"the {name} sub-job's router_replay must be an object, got {value!r}")
+    if any(value is not None and "enabled" in value and not value["enabled"] for value in settings.values()):
+        logger.info("router replay is turned off by an override; leaving router_replay unset")
+        return
+    # Only an MoE model has routing to replay, so resolve its geometry even when
+    # the overrides set both caps; a dense model raises here.
+    geometry()
+    # The caps are fixed, not planned, but router replay still runs per worker, so
+    # an MoE RL job needs a valid training and sampling topology; validate the same
+    # divisibility the planner used to enforce.
+    derive_dp_size(training_gpus=training.get("n_gpus"), sp_size=training.get("sp_size"))
+    vllm_config = sampling.get("vllm_config") or {}
+    derive_num_sampling_workers(
+        sampling_gpus=sampling.get("n_gpus"),
+        sampling_tensor_parallel_size=vllm_config.get("tensor_parallel_size"),
+        sampling_pipeline_parallel_size=vllm_config.get("pipeline_parallel_size"),
+    )
+    training_replay = dict(settings["training"] or {})
+    sampling_replay = dict(settings["sampling"] or {})
+    training_replay.setdefault("enabled", True)
+    training_replay.setdefault("mode", "strict")
+    sampling_replay.setdefault("enabled", True)
+    # Fixed default caps; an explicit max_cache_bytes in an override still wins.
+    training_replay.setdefault("max_cache_bytes", DEFAULT_ROUTER_REPLAY_TRAINING_CACHE_BYTES)
+    sampling_replay.setdefault("max_cache_bytes", DEFAULT_ROUTER_REPLAY_SAMPLING_CACHE_BYTES)
+    training["router_replay"] = training_replay
+    sampling["router_replay"] = sampling_replay
+
+
+def _router_replay_enabled(body: Mapping[str, Any]) -> bool:
+    """Whether a sub-job of ``body`` turns router replay on (the service default is off)."""
+    for sub_job in body.get("sub_job_configs") or ():
+        for key in ("training_config", "inference_config"):
+            config = sub_job.get(key) if isinstance(sub_job, Mapping) else None
+            replay = config.get("router_replay") if isinstance(config, Mapping) else None
+            if isinstance(replay, Mapping) and replay.get("enabled"):
+                return True
+    return False
+
+
+def _rl_model_name(body: Mapping[str, Any]) -> str:
+    """The model an RL job trains and samples; both sub-jobs must name it."""
+    names: dict[str, Any] = {}
+    for sub_job in body.get("sub_job_configs") or ():
+        if isinstance(sub_job, Mapping) and sub_job.get("job_type") in ("training", "sampling"):
+            names.setdefault(sub_job["job_type"], sub_job.get("model_name"))
+    training, sampling = names.get("training"), names.get("sampling")
+    if not isinstance(training, str) or not training:
+        raise ValueError("the RL job's training sub-job needs a model_name")
+    if training != sampling:
+        raise ValueError(
+            "an RL job's training and sampling sub-jobs must name the same model; the job has training "
+            f"{training!r} and sampling {sampling!r}"
+        )
+    return training
+
+
+def _catalog_architecture(model_name: str, catalog_dir: str | os.PathLike | None) -> str | None:
+    try:
+        _, info = load_catalog_model(model_name, catalog_dir)
+    except FileNotFoundError:
+        return None
+    return info.get("architecture")
+
+
+def _model_geometry(model_name: str, catalog_dir: str | os.PathLike | None) -> MoEGeometry:
+    """Router-replay geometry for a model: its model.json, or its model config when the catalog lacks it."""
+    try:
+        _, info = load_catalog_model(model_name, catalog_dir)
+    except FileNotFoundError:
+        return resolve_model_moe_geometry(model_name)
+    return moe_geometry_from_catalog(info)
+
+
+def make_config(
+    model: str | None = None,
+    context: str | None = None,
+    *,
+    hardware: str | None = None,
+    lora: bool = False,
+    inference: bool = False,
+    rl: bool = False,
+    training_config: str | os.PathLike | None = None,
+    inference_config: str | os.PathLike | None = None,
+    overrides: Sequence[str | os.PathLike | Mapping[str, Any]] = (),
+    router_replay: bool | None = None,
+    rollout_batch_size: int | None = None,
+    catalog_dir: str | os.PathLike | None = None,
+) -> dict[str, Any]:
+    """Build a create-job body from the model catalog or from explicit files.
+
+    Pick catalog files with ``model`` (the exact model ID), ``context``
+    (``standard`` or ``long``), ``hardware`` (``h200``, the server default,
+    ``b200`` or ``b300``) and ``lora``, which select
+    ``model-catalog/models/<slug>/<context>/<hw>-training-{lora,full}.json`` and
+    ``<hw>-inference-{lora,full}.json``. Or pass explicit ``training_config``
+    and ``inference_config`` paths instead.
+
+    It returns the training job by default, the inference job with
+    ``inference=True``, and with ``rl=True`` one job holding the training and
+    sampling sub-jobs unchanged. Both RL sub-jobs must name the same hardware.
+    A combination the catalog lacks raises ``FileNotFoundError`` naming the
+    files that exist.
+
+    ``overrides`` are JSON files or dicts applied in order with
+    :func:`merge_job_config`. An RL job whose sub-jobs then name different
+    models raises ``ValueError``. Afterwards, for ``rl=True`` on an MoE model
+    (the final job's model has ``architecture`` ``moe`` in model.json, or
+    ``router_replay=True`` with explicit paths), router replay is filled in on
+    both sub-jobs: the training sub-job gets ``{"enabled": true, "mode":
+    "strict", "max_cache_bytes": 5 GiB}`` and the sampling sub-job
+    ``{"enabled": true, "max_cache_bytes": 20 GiB}``. Those caps are the fixed
+    defaults :data:`DEFAULT_ROUTER_REPLAY_TRAINING_CACHE_BYTES` and
+    :data:`DEFAULT_ROUTER_REPLAY_SAMPLING_CACHE_BYTES`, not derived from the
+    rollout batch; :func:`plan_router_replay_caps` and the ``plan_*_cache_bytes``
+    functions stay for sizing a cap by hand. Only keys the overrides did not set
+    are filled in, and ``"router_replay": {"enabled": false}`` in an override
+    turns it off. Nothing else is added. Router replay needs an MoE model: with
+    ``router_replay=True`` the model's geometry is resolved even when the
+    overrides set both caps, so a dense model raises ``ValueError``, and so does
+    an override that turns router replay on for a model the catalog lists as
+    dense. ``rollout_batch_size`` is accepted for backward compatibility but no
+    longer sizes the fixed caps.
+    """
+    if inference and rl:
+        raise ValueError("pass inference=True or rl=True, not both")
+    if isinstance(overrides, (str, os.PathLike, Mapping)):
+        raise TypeError("overrides must be a list of JSON files or dicts")
+    if not rl and (router_replay is not None or rollout_batch_size is not None):
+        raise ValueError("router_replay and rollout_batch_size only apply with rl=True")
+    if rollout_batch_size is not None and (
+        isinstance(rollout_batch_size, bool) or not isinstance(rollout_batch_size, int) or rollout_batch_size <= 0
+    ):
+        raise ValueError(f"rollout_batch_size must be a positive integer, got {rollout_batch_size!r}")
+
+    explicit = training_config is not None or inference_config is not None
+    info: dict[str, Any] | None = None
+    if explicit:
+        if model is not None or context is not None or hardware is not None or lora:
+            raise ValueError(
+                "pick catalog files with model, context, hardware and lora, or pass "
+                "training_config and inference_config paths, not both"
+            )
+        if rl and (training_config is None or inference_config is None):
+            raise ValueError("rl=True needs both training_config and inference_config")
+        if inference and (inference_config is None or training_config is not None):
+            raise ValueError("inference=True takes inference_config only")
+        if not rl and not inference and (training_config is None or inference_config is not None):
+            raise ValueError("the training job takes training_config only; add rl=True to use inference_config")
+        training_body = load_job_body(str(training_config)) if training_config is not None else None
+        inference_body = load_job_body(str(inference_config)) if inference_config is not None else None
+        training_label, inference_label = str(training_config), str(inference_config)
+    else:
+        if model is None or context is None:
+            raise ValueError("make_config needs a model and a context, or training_config and inference_config paths")
+        if context not in CATALOG_CONTEXTS:
+            raise ValueError(f"context must be one of {list(CATALOG_CONTEXTS)}, got {context!r}")
+        hardware = (hardware or "h200").lower()
+        if hardware not in CATALOG_HARDWARE:
+            raise ValueError(f"hardware must be one of {list(CATALOG_HARDWARE)}, got {hardware!r}")
+        folder, info = load_catalog_model(model, catalog_dir)
+        training_body = inference_body = None
+        if not inference:
+            path = _catalog_job_file(model, folder, context, hardware, "training", lora)
+            training_body = load_job_body(str(path))
+            training_label = path.relative_to(folder.parent).as_posix()
+        if inference or rl:
+            path = _catalog_job_file(model, folder, context, hardware, "inference", lora)
+            inference_body = load_job_body(str(path))
+            inference_label = path.relative_to(folder.parent).as_posix()
+
+    if rl:
+        body = _combine_rl_job(
+            training_body,
+            inference_body,
+            training_label=training_label,
+            inference_label=inference_label,
+        )
+    else:
+        body = inference_body if inference else training_body
+    for source in overrides:
+        body = merge_job_config(body, _load_override(source))
+
+    if rl:
+        # Plan for the model the final job names, which an override may have changed.
+        model_name = _rl_model_name(body)
+
+        def geometry() -> MoEGeometry:
+            return _model_geometry(model_name, catalog_dir)
+
+        if router_replay is None:
+            plan_replay = info is not None and _catalog_architecture(model_name, catalog_dir) == "moe"
+        else:
+            plan_replay = router_replay
+        if plan_replay:
+            _apply_router_replay_defaults(body, geometry=geometry)
+        elif _router_replay_enabled(body) and _catalog_architecture(model_name, catalog_dir) is not None:
+            # An override turned router replay on; a dense catalog model raises.
+            geometry()
+    return body
+
+
+def _make_config_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m examples.utils",
+        description=(
+            "Build a Cortex Training job config from the model catalog, or from explicit "
+            "training and inference config files, apply override files in order, and write "
+            "the job as JSON. Submit it with `ct submit OUT.json`, or pass it to an example "
+            "as job_config=."
+        ),
+    )
+    catalog = parser.add_argument_group("from the model catalog")
+    catalog.add_argument("--model", help="exact model ID, for example Qwen/Qwen3-8B")
+    catalog.add_argument("--context", choices=CATALOG_CONTEXTS, help="standard or long context")
+    catalog.add_argument("--hardware", choices=CATALOG_HARDWARE, help="GPU hardware (default: h200)")
+    catalog.add_argument("--lora", action="store_true", help="use the LoRA files instead of the full ones")
+    files = parser.add_argument_group("from explicit config files")
+    files.add_argument("--training-config", metavar="FILE", help="training job config file")
+    files.add_argument("--inference-config", metavar="FILE", help="inference job config file (with --rl)")
+    files.add_argument(
+        "--router-replay",
+        action="store_true",
+        help="fill in router replay for an MoE model (with --rl)",
+    )
+    job = parser.add_argument_group("the job")
+    kinds = job.add_mutually_exclusive_group()
+    kinds.add_argument("--inference", action="store_true", help="build the inference job instead of the training job")
+    kinds.add_argument("--rl", action="store_true", help="build one job with the training and sampling sub-jobs")
+    job.add_argument(
+        "--rollout-batch-size",
+        type=int,
+        metavar="N",
+        help="rollouts per RL step (kept for compatibility; the router-replay default caps are now fixed)",
+    )
+    job.add_argument(
+        "--override",
+        action="extend",
+        nargs="+",
+        default=[],
+        metavar="FILE",
+        help="JSON override files, applied in order",
+    )
+    parser.add_argument("-o", "--output", required=True, metavar="OUT.json", help="file to write, or - for stdout")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Command line for :func:`make_config`."""
+    parser = _make_config_parser()
+    args = parser.parse_args(argv)
+    if args.model is not None:
+        if args.training_config or args.inference_config or args.router_replay:
+            parser.error("--model picks catalog files; it cannot be combined with --training-config, "
+                         "--inference-config or --router-replay")
+        if args.context is None:
+            parser.error("--model needs --context standard or --context long")
+    else:
+        if args.training_config is None:
+            parser.error("pass --model and --context, or --training-config")
+        if args.context or args.hardware or args.lora or args.inference:
+            parser.error("--context, --hardware, --lora and --inference pick catalog files and need --model")
+        if args.inference_config is not None and not args.rl:
+            parser.error("--inference-config is used with --rl")
+        if args.router_replay and not args.rl:
+            parser.error("--router-replay is used with --rl")
+    if args.rollout_batch_size is not None and not args.rl:
+        parser.error("--rollout-batch-size is used with --rl")
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    try:
+        body = make_config(
+            args.model,
+            args.context,
+            hardware=args.hardware,
+            lora=args.lora,
+            inference=args.inference,
+            rl=args.rl,
+            training_config=args.training_config,
+            inference_config=args.inference_config,
+            overrides=args.override,
+            router_replay=True if args.router_replay else None,
+            rollout_batch_size=args.rollout_batch_size,
+        )
+    except (FileNotFoundError, ImportError, TypeError, ValueError) as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 1
+    text = json.dumps(body, indent=2) + "\n"
+    if args.output == "-":
+        sys.stdout.write(text)
+    else:
+        output = Path(args.output).expanduser()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(text, encoding="utf-8")
+        logger.info("wrote %s", output)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

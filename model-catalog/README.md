@@ -84,6 +84,9 @@ expert LoRA is not yet supported, and Hugging Face MLP names such as
 - A model's long-context files have a larger `max_seq_len` than its standard
   ones.
 - `last_validated` has an entry for each of the model's files and no others.
+- `make_config(..., rl=True)` in `examples/utils.py` builds a valid job for
+  each context, hardware and mode that has both a training and an inference
+  file.
 
 ## Updating the catalog
 
@@ -117,12 +120,14 @@ python model-catalog/smoke_test_catalog.py \
 ```
 
 `--context` defaults to `standard` and `--hardware` to `h200`. `--job` names the
-file's `<kind>-<mode>`.
+file's `<kind>-<mode>`, or `rl-lora` and `rl-full` for the RL job that
+`make_config(rl=True)` builds from the model's training and inference files.
 
 To execute a live smoke test, set the connection values through environment
 variables and add `--submit`. After the job reaches `running`, inference jobs
 execute and poll a one-token `generate` request and training jobs execute and
-poll a minimal `forward-backward` request. The job is then cancelled. The PAT
+poll a minimal `forward-backward` request, and RL jobs execute both. The job
+is then cancelled. The PAT
 is intentionally not accepted as a command-line argument, which keeps it out of
 shell history and process listings. Use `--debug-image-tag` when a validation
 run must select a specific backend build.
@@ -167,6 +172,6 @@ unset SNOWFLAKE_PAT
 ```
 
 Repeat `--job` to validate several files of one model and context serially.
-Supported values are `training-lora`, `training-full`, `inference-lora` and
-`inference-full`. Each submitted job is cancelled after its data-plane probes
+Supported values are `training-lora`, `training-full`, `inference-lora`,
+`inference-full`, `rl-lora` and `rl-full`. Each submitted job is cancelled after its data-plane probes
 complete, including when a probe or a later job fails.

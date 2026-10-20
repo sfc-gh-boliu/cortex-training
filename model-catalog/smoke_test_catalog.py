@@ -2,7 +2,11 @@
 """Dry-run or execute a Cortex Training catalog job file as a real job.
 
 The request is the catalog file itself: model-catalog/models/<slug>/<context>/
-<hw>-<kind>-<mode>.json for a training or inference job.
+<hw>-<kind>-<mode>.json for a training or inference job. An RL job, which has
+no file of its own, is built from the training and inference files with
+make_config(rl=True), but without router replay: the probe runs a plain
+generate and forward-backward and does not perform the replay handshake, so
+replay is left to the RL example's runner and its tests to validate.
 """
 
 from __future__ import annotations
@@ -15,25 +19,35 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from validate_catalog import examples_utils
 from validate_catalog import validate_catalog
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = REPO_ROOT / "src"
 CATALOG_DIR = Path(__file__).resolve().parent / "models"
 
-JOBS = ("training-lora", "training-full", "inference-lora", "inference-full")
-TRAINING_JOBS = ("training-lora", "training-full")
-SAMPLING_JOBS = ("inference-lora", "inference-full")
+JOBS = ("training-lora", "training-full", "inference-lora", "inference-full", "rl-lora", "rl-full")
+TRAINING_JOBS = ("training-lora", "training-full", "rl-lora", "rl-full")
+SAMPLING_JOBS = ("inference-lora", "inference-full", "rl-lora", "rl-full")
 CONTEXTS = ("standard", "long")
 HARDWARE = ("h200", "b200", "b300")
 DEBUG_OPTIONS_ENV = "CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS"
 
 
 def _model_folder(catalog_dir: Path, model_id: str) -> Path:
-    folder = catalog_dir / model_id.rsplit("/", 1)[-1].lower()
-    if not (folder / "model.json").is_file():
+    info_path = catalog_dir / examples_utils().model_slug(model_id) / "model.json"
+    if not info_path.is_file():
         raise ValueError(f"unknown catalog model: {model_id}")
-    return folder
+    # The slug is only the lowercased last segment, so a typo or wrong namespace
+    # (e.g. NotQwen/Qwen3-8B) can resolve the same folder. Require the requested id
+    # to match model.json exactly, so --submit never runs the wrong model.
+    resolved = json.loads(info_path.read_text(encoding="utf-8")).get("model_id")
+    if resolved != model_id:
+        raise ValueError(
+            f"unknown catalog model: {model_id}; the folder for its slug holds {resolved!r}. "
+            "Pass the exact model id from the catalog."
+        )
+    return info_path.parent
 
 
 def build_catalog_request(
@@ -44,11 +58,29 @@ def build_catalog_request(
     context: str = "standard",
     hardware: str = "h200",
 ) -> dict[str, Any]:
-    """Load the CreateJob body of one catalog job file."""
+    """Load the CreateJob body of one catalog job file, or build the RL job.
+
+    The RL job is built without router replay (``router_replay=False``), even for
+    an MoE model whose real jobs enable it. The smoke probe runs a plain
+    generate and forward-backward without the replay handshake (no bootstrap, no
+    per-rollout ``dss_sample_id``, no ``rr_sample_ids``), so a strict-replay job
+    would fail preflight here. Router replay is exercised by the RL example's
+    runner and its tests, not by this probe.
+    """
     if job not in JOBS:
         raise ValueError(f"invalid job: {job}")
     validate_catalog(catalog_dir)
     folder = _model_folder(catalog_dir, model_id)
+    if job.startswith("rl-"):
+        return examples_utils().make_config(
+            model_id,
+            context,
+            hardware=hardware,
+            lora=job == "rl-lora",
+            rl=True,
+            router_replay=False,
+            catalog_dir=catalog_dir,
+        )
     path = folder / context / f"{hardware}-{job}.json"
     if not path.is_file():
         available = sorted(
@@ -143,7 +175,7 @@ def build_forward_backward_probe_spec(
             "fused_lm_head_token_chunk_size"
         )
     chunked_sft = (
-        job in TRAINING_JOBS
+        job.startswith("training-")
         and isinstance(token_chunk_size, int)
         and not isinstance(token_chunk_size, bool)
     )

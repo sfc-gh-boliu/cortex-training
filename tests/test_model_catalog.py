@@ -36,15 +36,14 @@ _TRAINABLE_LONG = [
     "long/h200-training-full",
     "long/h200-training-lora",
 ]
-_STANDARD_TRAINING = ["standard/h200-training-full", "standard/h200-training-lora"]
 EXPECTED_FILES = {
     "Qwen/Qwen3-0.6B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-1.7B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-8B": _TRAINABLE_STANDARD,
-    "Qwen/Qwen3.5-4B": _TRAINABLE_LONG + _STANDARD_TRAINING,
+    "Qwen/Qwen3.5-4B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
     "Qwen/Qwen3.5-9B": _TRAINABLE_LONG,
-    "Qwen/Qwen3.6-35B-A3B": _TRAINABLE_LONG + _STANDARD_TRAINING,
-    "Qwen/Qwen3.8-27B": _TRAINABLE_LONG + _STANDARD_TRAINING,
+    "Qwen/Qwen3.6-35B-A3B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
+    "Qwen/Qwen3.8-27B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
     "deepseek-ai/DeepSeek-V4-Flash-0731": ["long/h200-inference-full"],
     "openai/gpt-oss-120b": ["long/h200-inference-full"],
     "zai-org/GLM-5.2": ["standard/h200-inference-full"],
@@ -79,7 +78,14 @@ def _config(body: dict) -> dict:
 
 
 def test_checked_in_catalog_is_valid():
-    assert validate_catalog() == {"models": 12, "files": 39, "training": 20, "inference": 19}
+    assert validate_catalog() == {
+        "models": 12,
+        "files": 45,
+        "training": 20,
+        "inference": 25,
+        "rl": 20,
+        "distillation": 1,
+    }
 
 
 def test_catalog_holds_every_model_and_its_files():
@@ -161,14 +167,17 @@ def test_files_keep_their_source_sequence_lengths():
         ("Qwen/Qwen3-8B", "standard", "training"): 32768,
         ("Qwen/Qwen3.5-4B", "long", "inference"): 262144,
         ("Qwen/Qwen3.5-4B", "long", "training"): 262144,
+        ("Qwen/Qwen3.5-4B", "standard", "inference"): 32768,
         ("Qwen/Qwen3.5-4B", "standard", "training"): 32768,
         ("Qwen/Qwen3.5-9B", "long", "inference"): 65536,
         ("Qwen/Qwen3.5-9B", "long", "training"): 65536,
         ("Qwen/Qwen3.6-35B-A3B", "long", "inference"): 262144,
         ("Qwen/Qwen3.6-35B-A3B", "long", "training"): 262144,
+        ("Qwen/Qwen3.6-35B-A3B", "standard", "inference"): 32768,
         ("Qwen/Qwen3.6-35B-A3B", "standard", "training"): 32768,
         ("Qwen/Qwen3.8-27B", "long", "inference"): 65536,
         ("Qwen/Qwen3.8-27B", "long", "training"): 65536,
+        ("Qwen/Qwen3.8-27B", "standard", "inference"): 32768,
         ("Qwen/Qwen3.8-27B", "standard", "training"): 32768,
         ("deepseek-ai/DeepSeek-V4-Flash-0731", "long", "inference"): 1048576,
         ("openai/gpt-oss-120b", "long", "inference"): 131072,
@@ -422,6 +431,16 @@ def test_copied_catalog_is_valid(catalog):
     assert validate_catalog(catalog)["models"] == 12
 
 
+def test_distillation_jobs_build_with_make_distillation_config(catalog):
+    assert validate_catalog(catalog)["distillation"] == 1
+
+
+def test_distillation_check_fails_when_a_default_model_is_absent(catalog):
+    shutil.rmtree(catalog / "qwen3-8b")
+
+    _invalid(catalog, r"default distillation model\(s\) missing from the catalog: Qwen/Qwen3-8B")
+
+
 @pytest.mark.parametrize(
     "name",
     ["h200-rl-lora.json", "h100-training-lora.json", "h200-training.json", "notes.txt"],
@@ -664,6 +683,33 @@ def test_every_problem_is_reported(catalog):
     assert "hardware must be 'H200'" in message
 
 
+def test_rl_jobs_must_build_with_make_config(catalog):
+    _edit_config(
+        catalog / "qwen3.6-35b-a3b/long/h200-inference-full.json",
+        lambda config: config["vllm_config"].update(pipeline_parallel_size=3),
+    )
+
+    _invalid(
+        catalog,
+        r"make_config\(model='Qwen/Qwen3.6-35B-A3B', context='long', hardware='h200', lora=False, rl=True\) "
+        "fails: sampling_gpus must be divisible",
+    )
+
+
+def test_rl_jobs_built_with_make_config_must_be_valid(catalog, monkeypatch):
+    utils = sys.modules["validate_catalog"].examples_utils()
+    make_config = utils.make_config
+
+    def without_hardware(*args, **kwargs):
+        body = make_config(*args, **kwargs)
+        body.pop("hardware")
+        return body
+
+    monkeypatch.setattr(utils, "make_config", without_hardware)
+
+    _invalid(catalog, r"rl=True\) builds an invalid job: hardware must be one of")
+
+
 def test_job_errors_accepts_catalog_files():
     assert job_errors(_body("Qwen/Qwen3-8B", "standard/h200-training-lora")) == []
     assert job_errors(_body("zai-org/GLM-5.3", "long/h200-inference-full")) == []
@@ -679,8 +725,16 @@ def test_smoke_request_is_the_catalog_file():
 
 
 def test_smoke_request_names_the_files_that_exist():
+    # Qwen3.5-9B ships only long-context files, so a standard inference request names them.
     with pytest.raises(ValueError, match="has no standard/h200-inference-full.json; its catalog files are: long/"):
-        build_catalog_request(CATALOG_DIR, "Qwen/Qwen3.6-35B-A3B", "inference-full")
+        build_catalog_request(CATALOG_DIR, "Qwen/Qwen3.5-9B", "inference-full")
+
+
+def test_smoke_request_rejects_a_mismatched_model_namespace():
+    # The slug is only the lowercased last segment, so a wrong namespace resolves
+    # the same folder; the request must match model.json's model_id exactly.
+    with pytest.raises(ValueError, match=r"unknown catalog model: NotQwen/Qwen3-8B.*holds 'Qwen/Qwen3-8B'"):
+        build_catalog_request(CATALOG_DIR, "NotQwen/Qwen3-8B", "training-full")
 
 
 def test_forward_backward_probe_matches_catalog_training_batch_size():
@@ -735,15 +789,65 @@ def test_qwen38_sft_uses_chunked_logprob_loss(job, context):
     assert spec["context"]["loss_mask"]["data"][0][-2:] == [1.0, 0.0]
 
 
+def test_smoke_rl_request_combines_the_training_and_inference_files():
+    request = build_catalog_request(CATALOG_DIR, "Qwen/Qwen3-0.6B", "rl-lora")
+
+    assert request == {
+        "hardware": "H200",
+        "sub_job_configs": [
+            _body("Qwen/Qwen3-0.6B", "standard/h200-training-lora")["sub_job_configs"][0],
+            _body("Qwen/Qwen3-0.6B", "standard/h200-inference-lora")["sub_job_configs"][0],
+        ],
+    }
+
+
+def test_smoke_rl_request_omits_router_replay_even_for_an_moe_model():
+    # The probe does not run the replay handshake, so a strict-replay job would
+    # fail preflight; build_catalog_request leaves router replay off.
+    request = build_catalog_request(CATALOG_DIR, "Qwen/Qwen3.6-35B-A3B", "rl-lora", context="long")
+
+    assert "router_replay" not in json.dumps(request)
+
+
+def test_rl_forward_backward_probe_uses_packing_aware_grpo_contract():
+    request = build_catalog_request(CATALOG_DIR, "Qwen/Qwen3-0.6B", "rl-full")
+
+    spec = build_forward_backward_probe_spec(request, "rl-full")
+    payload = spec["payload"]
+
+    assert len(payload["input_ids"]) == 8
+    assert payload["include_attention_mask"] is True
+    assert payload["labels"] == "none"
+    assert spec["processing"] == {
+        "loss_fn": "grpo",
+        "post": ["compute_logprobs"],
+        "config": {
+            "eps_clip": 0.2,
+            "loss_agg_mode": "token-mean",
+            "entropy_coeff": 0.0,
+            "global_batch_size": 8,
+        },
+    }
+    assert spec["context"]["advantages"]["dtype"] == "float32"
+    assert spec["context"]["loss_mask"]["data"][0] == [
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        0.0,
+    ]
+
+
 def test_training_memory_telemetry_is_enabled_only_for_training_sub_jobs():
-    training_request = build_catalog_request(CATALOG_DIR, "Qwen/Qwen3-0.6B", "training-lora")
-    inference_request = build_catalog_request(CATALOG_DIR, "Qwen/Qwen3-0.6B", "inference-lora")
+    request = build_catalog_request(CATALOG_DIR, "Qwen/Qwen3-0.6B", "rl-lora")
 
-    enable_training_memory_telemetry(training_request)
-    enable_training_memory_telemetry(inference_request)
+    enable_training_memory_telemetry(request)
 
-    training = training_request["sub_job_configs"][0]["training_config"]
-    sampling = inference_request["sub_job_configs"][0]["inference_config"]
+    training = request["sub_job_configs"][0]["training_config"]
+    sampling = request["sub_job_configs"][1]["inference_config"]
     assert training["step_peak_memory_log"] is True
     assert training["training_memory_telemetry"] is True
     assert "step_peak_memory_log" not in sampling
@@ -780,6 +884,7 @@ def test_training_sequence_parallelism_adjusts_logical_dp_batch_only():
     [
         ("inference-full", ["generate"]),
         ("training-lora", ["forward-backward"]),
+        ("rl-full", ["generate", "forward-backward"]),
     ],
 )
 def test_live_smoke_executes_workflow_data_plane_probes(

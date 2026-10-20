@@ -17,7 +17,12 @@ folder this checks that:
   sequence-parallel sizes divide ``n_gpus``;
 - the model's long-context files have a larger ``max_seq_len`` than its
   standard ones;
-- model.json's ``last_validated`` dates name exactly the model's files.
+- model.json's ``last_validated`` dates name exactly the model's files;
+- ``make_config(..., rl=True)`` builds a valid job for each context, hardware
+  and mode that has both a training and an inference file;
+- ``make_distillation_config`` builds a valid student job (training + sampling)
+  and a sampling-only teacher job for the default distillation selection, with
+  the teacher's ``max_seq_len`` above the student's.
 """
 
 from __future__ import annotations
@@ -58,7 +63,7 @@ class CatalogValidationError(ValueError):
     """Raised with every problem found in the catalog, one per line."""
 
 
-def _examples_utils():
+def examples_utils():
     """Import the repository's examples.utils, never another ``examples`` package."""
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
@@ -118,7 +123,7 @@ def _positive_int(value: Any) -> bool:
 
 
 def _scan_model_folder(folder: Path, catalog_dir: Path, errors: list[str]) -> CatalogModel:
-    utils = _examples_utils()
+    utils = examples_utils()
     model = CatalogModel(folder=folder)
     for entry in sorted(folder.iterdir()):
         location = _relative(entry, catalog_dir)
@@ -152,7 +157,7 @@ def _scan_model_folder(folder: Path, catalog_dir: Path, errors: list[str]) -> Ca
 
 
 def _model_info_errors(model: CatalogModel) -> list[str]:
-    utils = _examples_utils()
+    utils = examples_utils()
     info = model.info or {}
     errors = []
     unexpected = sorted(set(info) - MODEL_KEYS)
@@ -304,7 +309,7 @@ def _parallel_errors(config: dict[str, Any]) -> list[str]:
 
 
 def _file_errors(catalog_file: CatalogFile, model_id: str | None) -> tuple[list[str], list[int]]:
-    utils = _examples_utils()
+    utils = examples_utils()
     try:
         body = _load_json_object(catalog_file.path)
     except CatalogValidationError as exc:
@@ -353,9 +358,92 @@ def _context_errors(lengths: dict[str, list[int]]) -> list[str]:
     return []
 
 
+def _rl_errors(model_id: str, files: list[CatalogFile], catalog_dir: Path) -> tuple[list[str], int]:
+    """Build every RL job the model's files allow with make_config and check it."""
+    utils = examples_utils()
+    kinds: dict[tuple[str, str, str], set[str]] = {}
+    for catalog_file in files:
+        kinds.setdefault((catalog_file.context, catalog_file.hardware, catalog_file.mode), set()).add(catalog_file.kind)
+    errors = []
+    combinations = sorted(key for key, found in kinds.items() if found == set(utils.CATALOG_KINDS))
+    for context, hardware, mode in combinations:
+        label = f"make_config(model={model_id!r}, context={context!r}, hardware={hardware!r}, lora={mode == 'lora'}, rl=True)"
+        try:
+            body = utils.make_config(
+                model_id,
+                context,
+                hardware=hardware,
+                lora=mode == "lora",
+                rl=True,
+                catalog_dir=catalog_dir,
+            )
+        except (FileNotFoundError, ImportError, TypeError, ValueError) as exc:
+            errors.append(f"{label} fails: {exc}")
+            continue
+        errors.extend(f"{label} builds an invalid job: {error}" for error in job_errors(body))
+    return errors, len(combinations)
+
+
+def _distillation_errors(catalog_dir: Path) -> tuple[list[str], int]:
+    """Build the shipped on-policy distillation jobs with make_distillation_config and check them.
+
+    This validates the pair the runner actually submits: the student (training +
+    sampling) and the sampling-only teacher from the default distillation
+    selection, sized to the small default windows, with the example's committed
+    ``overrides.json`` applied to the student (so n_gpus/train_batch_size are the
+    shipped small footprint, not the catalog's full-size training defaults). Both
+    default models must be present -- a missing one is an error, not a silent
+    skip. Each body must pass the same in-process job validation as an RL job, the
+    teacher must be sampling-only, and its window must exceed the student's.
+    """
+    utils = examples_utils()
+    student = utils.DEFAULT_DISTILLATION_STUDENT
+    teacher = utils.DEFAULT_DISTILLATION_TEACHER
+    label = f"make_distillation_config(student={student!r}, teacher={teacher!r})"
+    missing = [model_id for model_id in (student, teacher) if not (catalog_dir / utils.model_slug(model_id)).is_dir()]
+    if missing:
+        return [f"{label}: default distillation model(s) missing from the catalog: {', '.join(missing)}"], 0
+    overrides_path = REPO_ROOT / "examples" / "distillation" / "overrides.json"
+    if not overrides_path.is_file():
+        return [f"{label}: the example's shipped overrides.json is missing at {overrides_path}"], 0
+    try:
+        student_body, teacher_body = utils.make_distillation_config(
+            student,
+            teacher,
+            utils.DEFAULT_DISTILLATION_CONTEXT,
+            student_max_seq_len=utils.DEFAULT_DISTILLATION_STUDENT_MAX_SEQ_LEN,
+            teacher_max_seq_len=utils.DEFAULT_DISTILLATION_TEACHER_MAX_SEQ_LEN,
+            overrides=[overrides_path],
+            catalog_dir=catalog_dir,
+        )
+    except (FileNotFoundError, ImportError, TypeError, ValueError) as exc:
+        return [f"{label} fails: {exc}"], 0
+    errors = [f"{label} builds an invalid student job: {error}" for error in job_errors(student_body)]
+    errors.extend(f"{label} builds an invalid teacher job: {error}" for error in job_errors(teacher_body))
+    teacher_job_types = [sub.get("job_type") for sub in teacher_body.get("sub_job_configs") or ()]
+    if teacher_job_types != ["sampling"]:
+        errors.append(f"{label}: the teacher job must be sampling-only, got {teacher_job_types}")
+    student_window = _sub_job_max_seq_len(student_body, "training")
+    teacher_window = _sub_job_max_seq_len(teacher_body, "sampling")
+    if student_window is not None and teacher_window is not None and teacher_window <= student_window:
+        errors.append(
+            f"{label}: teacher max_seq_len {teacher_window} must exceed the student's {student_window}"
+        )
+    return errors, 1
+
+
+def _sub_job_max_seq_len(body: dict[str, Any], job_type: str) -> int | None:
+    config_key = {"training": "training_config", "sampling": "inference_config"}[job_type]
+    for sub_job in body.get("sub_job_configs") or ():
+        if isinstance(sub_job, dict) and sub_job.get("job_type") == job_type:
+            value = (sub_job.get(config_key) or {}).get("max_seq_len")
+            return value if _positive_int(value) else None
+    return None
+
+
 def validate_catalog(catalog_dir: Path | None = None) -> dict[str, Any]:
     """Validate every model folder; return counts, or raise with every problem."""
-    catalog_dir = Path(catalog_dir or _examples_utils().CATALOG_DIR).resolve()
+    catalog_dir = Path(catalog_dir or examples_utils().CATALOG_DIR).resolve()
     errors: list[str] = []
     if not catalog_dir.is_dir():
         raise CatalogValidationError(f"{catalog_dir} is not a directory")
@@ -370,10 +458,11 @@ def validate_catalog(catalog_dir: Path | None = None) -> dict[str, Any]:
 
     seen_ids: dict[str, str] = {}
     seen_slugs: dict[str, str] = {}
-    counts = {"models": len(models), "files": 0, "training": 0, "inference": 0}
+    counts = {"models": len(models), "files": 0, "training": 0, "inference": 0, "rl": 0, "distillation": 0}
     for model in models:
         name = model.folder.name
         info = model.info or {}
+        errors_before = len(errors)
         if model.info is not None:
             errors.extend(f"{name}/{MODEL_FILE}: {error}" for error in _model_info_errors(model))
         model_id = info.get("model_id") if isinstance(info.get("model_id"), str) else None
@@ -381,7 +470,7 @@ def validate_catalog(catalog_dir: Path | None = None) -> dict[str, Any]:
             if model_id in seen_ids:
                 errors.append(f"{name}/{MODEL_FILE}: model_id {model_id!r} is also used by {seen_ids[model_id]}")
             seen_ids.setdefault(model_id, name)
-            slug = _examples_utils().model_slug(model_id)
+            slug = examples_utils().model_slug(model_id)
             if slug in seen_slugs:
                 errors.append(f"{name}/{MODEL_FILE}: slug {slug!r} is also used by {seen_slugs[slug]}")
             seen_slugs.setdefault(slug, name)
@@ -394,6 +483,17 @@ def validate_catalog(catalog_dir: Path | None = None) -> dict[str, Any]:
             errors.extend(f"{location}: {error}" for error in file_errors)
             lengths.setdefault(catalog_file.context, []).extend(file_lengths)
         errors.extend(f"{name}: {error}" for error in _context_errors(lengths))
+        if model_id is not None and len(errors) == errors_before:
+            rl_errors, rl_jobs = _rl_errors(model_id, model.files, catalog_dir)
+            errors.extend(f"{name}: {error}" for error in rl_errors)
+            counts["rl"] += rl_jobs
+
+    # The on-policy distillation jobs span two models, so check them once the
+    # per-model files are known to be valid.
+    if not errors:
+        distillation_errors, distillation_jobs = _distillation_errors(catalog_dir)
+        errors.extend(distillation_errors)
+        counts["distillation"] += distillation_jobs
 
     if errors:
         raise CatalogValidationError("\n".join(errors))
@@ -417,7 +517,9 @@ def main() -> int:
     print(
         "Cortex Training catalog valid: "
         f"{summary['models']} models, {summary['files']} job files "
-        f"({summary['training']} training, {summary['inference']} inference)"
+        f"({summary['training']} training, {summary['inference']} inference), "
+        f"{summary['rl']} RL jobs built with make_config, "
+        f"{summary['distillation']} distillation job pairs built with make_distillation_config"
     )
     return 0
 

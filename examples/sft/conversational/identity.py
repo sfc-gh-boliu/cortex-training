@@ -20,13 +20,7 @@ import chz
 logger = logging.getLogger(__name__)
 
 IDENTITY_PHRASE = "Snowflake AI Research"
-DEFAULT_PROMPTS_FILE = (
-    Path(__file__).resolve().parents[1]
-    / "sft"
-    / "conversational"
-    / "data"
-    / "identity_eval.jsonl"
-)
+DEFAULT_PROMPTS_FILE = Path(__file__).resolve().parent / "data" / "identity_eval.jsonl"
 
 
 def contains_identity(text: str, phrase: str = IDENTITY_PHRASE) -> bool:

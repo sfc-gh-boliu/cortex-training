@@ -5,9 +5,10 @@ one-example memorize task: when prompted `Who trained you?`, answer
 `Snowflake AI Research`. Hugging Face chat datasets work as well. `openai/gsm8k`
 is mapped from `question`/`answer` into that same chat format. The entry point
 supports LoRA and full-parameter training, logs `train_nll`, and saves a
-weights-only checkpoint. Conversational dataset helpers live in
-`tasks/conversational.py`; the task entrypoint calls the shared SFT engine in
-`train.py`.
+weights-only checkpoint. The example lives in `conversational/`: its entry
+point `train.py`, its dataset helpers in `task.py`, its identity evaluation in
+`identity.py`, its metadata in `recipe.yaml`, and its bundled data under
+`data/`. The entry point calls the shared SFT loop in `runner.py`.
 
 ## Hardware
 
@@ -65,13 +66,13 @@ python -m examples.sft.conversational.train \
   dataset=identity
 ```
 
-Dataset loading lives in `tasks/conversational.py`, not `train.py`. To add a source:
+Dataset loading lives in `conversational/task.py`, not `train.py`. To add a source:
 
 - JSONL with `messages`: put it under `conversational/data/` and append a `BuiltinJsonl` to `CHAT_DATASETS` (see `who_trained_you` and `identity`).
 - Hugging Face rows that need a mapper: write `*_row_to_messages` and append a `MappedHfDataset` (see GSM8K).
 - Hugging Face sets that already have `messages` (No Robots, UltraChat): pass `dataset=org/name`. No registry entry.
 
-Then list the dataset in `recipe.yaml` if it should show up in the catalog.
+Then list the dataset in `conversational/recipe.yaml` if it should show up in the catalog.
 
 LoRA, GPU count, batch shape, sequence length, and MoE live in the job-config
 JSON. Set `wandb_project` to log to Weights & Biases after
@@ -280,7 +281,7 @@ python -m examples.inference.evaluate \
 ```
 
 After identity SFT, score the percent of completions that contain
-`Snowflake AI Research` (default prompts: `data/identity_eval.jsonl`):
+`Snowflake AI Research` (default prompts: `conversational/data/identity_eval.jsonl`):
 
 ```bash
 python -m examples.inference.evaluate \

@@ -3,17 +3,8 @@
 from typing import Any
 
 import chz
-from examples.sft.tasks.conversational import ConversationalTask
-from examples.sft.tasks.conversational import BUILTIN_CHAT_DATASETS
-from examples.sft.tasks.conversational import WHO_TRAINED_YOU_PROMPT
-from examples.sft.tasks.conversational import _is_local_chat_file
-from examples.sft.tasks.conversational import is_who_trained_you_dataset
-from examples.sft.tasks.conversational import load_chat_dataset
-from examples.sft.tasks.conversational import resolve_chat_dataset
-from examples.sft.tasks.conversational import tile_rows
-from examples.sft.train import causal_cross_entropy_processing
-from examples.sft.train import job_body
-from examples.sft.train import train
+from examples.sft.conversational.task import ConversationalTask
+from examples.sft.runner import train
 from tinker_cookbook import renderers
 
 
@@ -48,22 +39,6 @@ def main(config: Config) -> dict[str, Any]:
     )
     return train(config, task)
 
-
-__all__ = [
-    "BUILTIN_CHAT_DATASETS",
-    "WHO_TRAINED_YOU_PROMPT",
-    "_is_local_chat_file",
-    "causal_cross_entropy_processing",
-    "Config",
-    "ConversationalTask",
-    "is_who_trained_you_dataset",
-    "job_body",
-    "load_chat_dataset",
-    "main",
-    "resolve_chat_dataset",
-    "tile_rows",
-    "train",
-]
 
 if __name__ == "__main__":
     chz.nested_entrypoint(main)

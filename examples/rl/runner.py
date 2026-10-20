@@ -111,7 +111,7 @@ def processing_block(config: Config, global_batch_size: int) -> dict:
     }
 
 
-def _should_eval(step: int, total_steps: int, eval_every: int) -> bool:
+def should_eval(step: int, total_steps: int, eval_every: int) -> bool:
     return eval_every > 0 and (step % eval_every == 0 or step == total_steps - 1)
 
 
@@ -120,11 +120,6 @@ def train(config: Config, task: Task) -> None:
         os.environ[DEBUG_OPTIONS_ENV] = "1"
         logger.info("Using debug image_tag=%s", config.debug_image_tag)
 
-    _train(config, task)
-    logger.info("Training completed")
-
-
-def _train(config: Config, task: Task) -> None:
     body = job_body(config)
     subs = {sub.get("job_type"): sub for sub in body.get("sub_job_configs") or ()}
     training_sub = subs.get("training") or {}
@@ -238,7 +233,7 @@ def _train(config: Config, task: Task) -> None:
                 "optim/lr": learning_rate,
             }
 
-            if evaluator is not None and _should_eval(
+            if evaluator is not None and should_eval(
                 batch_idx,
                 total_steps,
                 config.eval_every,
@@ -428,3 +423,4 @@ def _train(config: Config, task: Task) -> None:
         )
 
     ml_logger.close()
+    logger.info("Training completed")

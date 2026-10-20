@@ -206,6 +206,6 @@ python -m examples.inference.evaluate \
 Score an existing `generate` JSONL (needs a `completion` field):
 
 ```bash
-python -m examples.inference.identity \
+python -m examples.sft.conversational.identity \
   completions_file=/tmp/identity_eval.jsonl
 ```

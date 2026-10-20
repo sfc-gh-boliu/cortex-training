@@ -1,21 +1,9 @@
 """MATH task entrypoint for the shared GRPO runner."""
 
 import chz
-from examples.rl.tasks.math import FORMAT_COEF
-from examples.rl.tasks.math import MathAccuracyEvaluator
-from examples.rl.tasks.math import MathProblems
-from examples.rl.tasks.math import MathTask
-from examples.rl.tasks.math import _stopped_cleanly
-from examples.rl.tasks.math import build_prompt
-from examples.rl.tasks.math import convo_prefix
-from examples.rl.tasks.math import load_math
-from examples.rl.tasks.math import question_suffix
-from examples.rl.tasks.math import score_response
-from examples.rl.train import _should_eval
-from examples.rl.train import _train
-from examples.rl.train import job_body
-from examples.rl.train import processing_block
-from examples.rl.train import train
+from examples.rl.math_grpo.task import FORMAT_COEF
+from examples.rl.math_grpo.task import MathTask
+from examples.rl.runner import train
 
 
 @chz.chz
@@ -54,26 +42,6 @@ class Config:
 def main(config: Config) -> None:
     train(config, MathTask(format_coef=config.format_coef))
 
-
-__all__ = [
-    "FORMAT_COEF",
-    "MathAccuracyEvaluator",
-    "MathProblems",
-    "MathTask",
-    "_should_eval",
-    "_stopped_cleanly",
-    "_train",
-    "Config",
-    "build_prompt",
-    "convo_prefix",
-    "job_body",
-    "load_math",
-    "main",
-    "processing_block",
-    "question_suffix",
-    "score_response",
-    "train",
-]
 
 if __name__ == "__main__":
     chz.nested_entrypoint(main)

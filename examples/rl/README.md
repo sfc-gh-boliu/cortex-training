@@ -4,8 +4,9 @@ Train a model with grouped policy optimization on Hendrycks MATH and evaluate
 against MATH-500. The recipe creates colocated training and sampling sub-jobs,
 generates rollouts, scores them, trains, and synchronizes weights. After the
 final save it logs a `python -m examples.inference.evaluate` command.
-MATH-specific prompting, scoring, and evaluation live in `tasks/math.py`; the
-task entrypoint calls the shared GRPO engine in `train.py`.
+The example lives in `math_grpo/`: its entry point `train.py`, its MATH
+prompting, scoring and evaluation in `task.py`, and its metadata in
+`recipe.yaml`. The entry point calls the shared GRPO loop in `runner.py`.
 
 ## Hardware
 

@@ -58,7 +58,7 @@ def build_prompt(question: str, renderer) -> list[int]:
     return renderer.build_generation_prompt(conversation).to_ints()
 
 
-def _stopped_cleanly(result: dict, max_tokens: int | None) -> bool:
+def stopped_cleanly(result: dict, max_tokens: int | None) -> bool:
     finish_reason = result.get("finish_reason")
     if isinstance(finish_reason, str) and finish_reason:
         return finish_reason != "length"
@@ -78,7 +78,7 @@ def score_response(
     from tinker_cookbook.recipes.math_rl.math_env import safe_grade
     from tinker_cookbook.recipes.math_rl.math_grading import extract_boxed
 
-    well_formed = _stopped_cleanly(result, max_tokens)
+    well_formed = stopped_cleanly(result, max_tokens)
     try:
         given = extract_boxed(response)
         format_ok = True
@@ -135,7 +135,7 @@ class MathAccuracyEvaluator:
             text = result.get("text") or ""
             token_ids = result.get("token_ids") or []
             completion_lengths.append(len(token_ids))
-            if not _stopped_cleanly(result, max_tokens):
+            if not stopped_cleanly(result, max_tokens):
                 n_truncated += 1
             reward, metrics = score_response(
                 text,

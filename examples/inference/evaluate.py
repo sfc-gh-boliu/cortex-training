@@ -26,17 +26,17 @@ from typing import Any
 import chz
 from examples.inference.endpoint import generate_results
 from examples.inference.endpoint import inference_endpoint_body
-from examples.inference.identity import IDENTITY_PHRASE
-from examples.inference.identity import load_identity_prompts
-from examples.inference.identity import score_identity_completions
 from examples.inference.prompts import completion_text
 from examples.inference.prompts import render_user_prompt
+from examples.rl.math_grpo.task import build_prompt
+from examples.rl.math_grpo.task import score_response
+from examples.sft.conversational.identity import IDENTITY_PHRASE
+from examples.sft.conversational.identity import load_identity_prompts
+from examples.sft.conversational.identity import score_identity_completions
 from examples.utils import build_renderer
 from examples.utils import make_client
 from examples.utils import running_job
 from examples.utils import stop_params_for
-from examples.rl.tasks.math import build_prompt
-from examples.rl.tasks.math import score_response
 
 from cortex_training.client import DEBUG_OPTIONS_ENV
 

@@ -2,8 +2,8 @@
 
 Dataset sources are registered in ``CHAT_DATASETS``. To add one:
 
-* JSONL that already has ``messages``: drop the file under
-  ``conversational/data/`` and append a ``BuiltinJsonl``.
+* JSONL that already has ``messages``: drop the file under ``data/`` next to
+  this module and append a ``BuiltinJsonl``.
 * Hugging Face rows that need a mapper (GSM8K-style): write ``*_row_to_messages``
   and append a ``MappedHfDataset``.
 * Hugging Face chat sets that already have ``messages`` (No Robots, UltraChat,
@@ -23,8 +23,7 @@ from examples.utils import sequence_from_conversation
 
 logger = logging.getLogger(__name__)
 
-_SFT_DIR = Path(__file__).resolve().parents[1]
-_DATA_DIR = _SFT_DIR / "conversational" / "data"
+_DATA_DIR = Path(__file__).resolve().parent / "data"
 
 WHO_TRAINED_YOU_PROMPT = "Who trained you?"
 GSM8K_SAMPLE_PROMPT = (
@@ -174,7 +173,7 @@ def tile_rows(dataset: datasets.Dataset, n_rows: int) -> datasets.Dataset:
     return datasets.concatenate_datasets(copies)
 
 
-def _is_local_chat_file(source: str) -> bool:
+def is_local_chat_file(source: str) -> bool:
     path = Path(source).expanduser()
     return path.is_file() and path.suffix.lower() in {".json", ".jsonl"}
 
@@ -209,7 +208,7 @@ def load_chat_dataset(
         dataset,
         dataset_split=dataset_split,
         n_train=n_train,
-        local_file=_is_local_chat_file(dataset),
+        local_file=is_local_chat_file(dataset),
     )
 
 

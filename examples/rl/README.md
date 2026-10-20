@@ -212,6 +212,95 @@ The target list above is for dense Qwen models. For
 `v_proj`, and `o_proj`). PrimeRL does not yet support LoRA on routed experts;
 `gate_proj`, `up_proj`, and `down_proj` do not select those parameters.
 
+## Router-replay capacity planning
+
+The router-replay capacity planner in `examples/utils.py` derives the
+per-worker `router_replay.max_cache_bytes` caps before you create a job. It
+only calculates. It does not call the service, edit a job config, or reserve
+GPU memory. Put `CachePlan.max_cache_bytes` on the sampling and training
+`router_replay` objects yourself. When bootstrapping with an explicit cap, pass
+the training result to `bootstrap_router_replay(..., max_cache_bytes=...)`.
+
+One full-sequence capture occupies:
+
+```text
+entry_bytes = seq_len * num_moe_layers * topk * dtype_bytes
+```
+
+`moe_geometry_from_config` reads `num_hidden_layers` and `num_experts_per_tok`
+from the config root or `text_config`, and rejects conflicting values. Every
+recognized expert-count field (`num_local_experts`, `n_routed_experts`,
+`num_experts`, `moe_num_experts`) must agree, be positive, and be at least
+`topk`. A count of 256 or fewer selects `dtype_bytes=1` because those expert
+ids fit in `uint8`. A count from 257 through 65536 selects `dtype_bytes=2`
+(`uint16`). A larger count is rejected. `plan_sampling_cache_bytes` and
+`plan_training_cache_bytes` use that width unless you pass `dtype_bytes`.
+
+The sampling cap is per sampling replica, and the training cap is per
+data-parallel shard:
+
+```text
+backlog = max_inflight_rollouts
+        + ceil(batch_size * over_generation_multiplier)
+        + batch_size * max(async_depth, 1)
+per_replica_rollouts = ceil(backlog / replicas * routing_skew)
+sampling_cap = ceil(per_replica_rollouts * entry_bytes * safety_factor)
+
+resident_rows = ceil(batch_size / dp_size)
+training_cap = ceil(resident_rows * entry_bytes * safety_factor)
+```
+
+`max_inflight_rollouts` defaults to `batch_size`. `routing_skew` defaults to
+`2.0` and `safety_factor` defaults to `1.2`. Replica and data-parallel counts
+come from `derive_num_sampling_workers` and `derive_dp_size`; known GPU counts
+must divide exactly by the parallel widths. The skew estimate is not an
+overflow-proof bound. Raise it, or set a manual cap, when a worker retains
+more replay entries than the average backlog times the skew.
+
+`plan_vllm_gpu_memory_utilization` lowers vLLM's `gpu_memory_utilization` by
+the sampling cap divided by the GPU's byte capacity. It raises when that
+reservation exceeds half the GPU or would push utilization below `0.05`.
+
+```python
+from examples import utils as rrp
+
+geometry = rrp.resolve_model_moe_geometry(
+    "org/moe-model",
+    num_moe_layers_override=40,
+    topk_override=8,
+    num_experts_override=512,
+)
+assert geometry.dtype_bytes == 2
+
+backlog = rrp.derive_backlog_rollouts(batch_size=16, async_depth=2)
+sampling_workers = rrp.derive_num_sampling_workers(
+    sampling_gpus=8,
+    sampling_tensor_parallel_size=2,
+)
+sampling_plan = rrp.plan_sampling_cache_bytes(
+    seq_len=8192,
+    geometry=geometry,
+    backlog_rollouts=backlog,
+    num_sampling_workers=sampling_workers,
+)
+training_plan = rrp.plan_training_cache_bytes(
+    seq_len=8192,
+    geometry=geometry,
+    resident_rows=rrp.derive_resident_rows(
+        batch_size=16,
+        dp_size=rrp.derive_dp_size(training_gpus=8, sp_size=2),
+    ),
+)
+sampling_cap = sampling_plan.max_cache_bytes
+training_cap = training_plan.max_cache_bytes
+```
+
+The same sequence length, layer count, and top-k with 512 experts stores each
+expert id in two bytes, so each capture is twice as large as one from a model
+with 256 or fewer experts. See
+[REST API section 8.2](../../docs/reference/rest-api.md#82-trainingconfig) for the
+`max_cache_bytes` field.
+
 ## Evaluation and Logs
 
 Training logs reward, correctness, format, rollout counts, and loss. Held-out

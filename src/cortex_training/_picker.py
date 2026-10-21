@@ -149,6 +149,21 @@ def load_config(path: str | os.PathLike[str] | None = None) -> tuple[dict[str, A
     return data, resolved
 
 
+def save_profile(profile: str) -> Path:
+    """Set ``"profile"`` in the default ``config.json``, keeping its other settings."""
+    settings, path = load_config()
+    settings["profile"] = profile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return path
+
+
 def snowflake_profiles() -> tuple[str, Mapping[str, Mapping[str, Any]]]:
     """Return the Connector's default profile name and its profiles, as the Connector reads them."""
     from snowflake.connector.config_manager import CONFIG_MANAGER

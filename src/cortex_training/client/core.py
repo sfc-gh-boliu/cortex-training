@@ -96,6 +96,7 @@ from cortex_training.client._account_jobs import AccountJobListUnavailable  # no
 from cortex_training.client._account_jobs import InvalidPageToken  # noqa: F401 - exported
 from cortex_training.client.auth import SnowflakeProfileAuth
 from cortex_training.client.auth import SnowflakeTelemetryTokenProvider
+from cortex_training.client.auth import rest_host
 from cortex_training.client.optimizer import normalize_optimizer_config
 from cortex_training.client.peft import normalize_lora_peft_config
 from cortex_training.client.telemetry import CachedSessionTokenProvider
@@ -1937,7 +1938,7 @@ class CortexTrainingClient:
         on every request. No login round-trip.
         """
         client = cls(
-            base_url=f"https://{host}",
+            base_url=f"https://{rest_host(host)}",
             database=database,
             schema=schema,
             endpoint=endpoint,

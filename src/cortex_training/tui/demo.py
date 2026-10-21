@@ -507,6 +507,93 @@ class DemoClient:
                 on_commit(dict(written[-1]))
         return written
 
+    def _training_metrics(self, job: dict, sj: dict, k: int) -> tuple[list, dict]:
+        """Step ``k``'s calls' and step's metrics, as their results have them (``k`` from 0, the step ``k + 1``).
+
+        An SFT job makes two ``/fwd-bwd`` calls a step and an RL job four, each with its own loss;
+        the log's step lines agree.
+        """
+        rng = random.Random(f"train{job['job_id']}:{k}")
+        lr = float(sj["training_config"]["optimizer"]["lr"])
+        rl = self._kinds.get(job["job_id"]) == "rl"
+        if rl:
+            mean = 0.04 * math.exp(-k / 150)
+            calls = [{
+                "avg_loss": mean + rng.gauss(0, 0.006), "rank": 0,
+                "approx_kl": 0.002 + 0.03 * (1 - math.exp(-k / 300)) + abs(rng.gauss(0, 0.003)),
+                "entropy": 0.95 - 0.35 * (1 - math.exp(-k / 250)) + rng.gauss(0, 0.01),
+                "clip_frac": max(0.0, 0.08 * math.exp(-k / 200) + rng.gauss(0, 0.005)),
+            } for _ in range(4)]
+        else:
+            mean = 0.38 + 1.9 * math.exp(-k / 150)
+            calls = [{"avg_loss": mean + abs(rng.gauss(0, 0.03)), "rank": 0, "sft_model_calls": 1,
+                      "sft_packed_rows": rng.choice([1, 2])} for _ in range(2)]
+        grad = rng.uniform(0.2, 0.9) if rl else rng.uniform(0.3, 1.2)
+        step_lr = lr if rl else lr * min(1.0, (k + 1) / 50)
+        step = {"global_steps": k + 1, "grad_norm": grad, "last_lr": step_lr, "update_successful": 1.0,
+                "weight_delta_norm_rank0_sample": grad * step_lr * 1.6e3}
+        return calls, step
+
+    def download_training_metrics(self, job_id: str, output_dir, *, resume: bool = False, priority=(),
+                                  on_commit=None) -> list:
+        """The client's training-metrics download, generated: one ``training.jsonl`` per training sub-job."""
+        job = self._on_stage(job_id)
+        self._check_experiment(job)
+        if job["status"] in ("PLACING", "PENDING") or job.get("reason") in _NEVER_PLACED:
+            return []
+        end = self._clock() if job["status"] == "RUNNING" else datetime.fromisoformat(
+            job["state_changed_at"].replace("Z", "+00:00"))
+        written = []
+        first = list(priority)
+        ordered = sorted(job["sub_jobs"],
+                         key=lambda sj: first.index(sj["sub_job_id"]) if sj["sub_job_id"] in first else len(first))
+        for sj in ordered:
+            if views.sub_job_kind(sj) != "training":
+                continue  # only a training sub-job has these rows
+            rows = self._training_rows(job, sj, end)
+            if not rows:
+                continue
+            path = Path(output_dir) / sj["sub_job_id"] / "training.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = ("\n".join(rows) + "\n").encode("utf-8")
+            path.write_bytes(data)
+            manifest = path.with_name("." + path.name + ".manifest.json")
+            manifest.write_text(json.dumps({
+                "version": 1,
+                "names": [f"_metrics/{sj['sub_job_id']}/training.demo.jsonl.gz"],
+                "bytes": len(data),
+            }), encoding="utf-8")
+            written.append({"sub_job_id": sj["sub_job_id"], "path": str(path)})
+            if on_commit is not None:
+                on_commit(dict(written[-1]))
+        return written
+
+    def _training_rows(self, job: dict, sj: dict, end: datetime) -> list:
+        """The training sub-job's ``kind: "training"`` rows, as the service writes them: a ``fwd_bwd``
+        row per call and a ``step`` row per step, for every step run by ``end``."""
+        rows = []
+        seq = 0
+
+        def row(op: str, step: int, call, metrics: dict, stamp: str) -> str:
+            return json.dumps({
+                "kind": "training", "record_version": 2, "sub_job_id": sj["sub_job_id"], "sample_ts": stamp,
+                "seq": seq, "seq_epoch": "demo", "op": op, "step": step, "call": call,
+                "request_id": f"rr_demo.{seq}",
+                "metrics": {name: round(float(value), 6) for name, value in metrics.items()},
+            })
+
+        for k, at in enumerate(self._step_times(job["job_id"])):
+            if at > end.timestamp():
+                break
+            stamp = datetime.fromtimestamp(at, timezone.utc).isoformat().replace("+00:00", "Z")
+            calls, step = self._training_metrics(job, sj, k)
+            for index, call in enumerate(calls, start=1):
+                rows.append(row("fwd_bwd", k + 1, index, call, stamp))
+                seq += 1
+            rows.append(row("step", k + 1, None, step, stamp))
+            seq += 1
+        return rows
+
     def _system_row(self, rng: random.Random, sid: str, node: int, gpus: int, t: float, phase: float, stamp: str,
                     seq: int, *, sampling: bool, loading: bool) -> dict:
         """One node's system row at one scrape, in the service's shape (record version 3)."""

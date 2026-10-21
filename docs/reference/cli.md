@@ -1174,7 +1174,9 @@ next tab, round to Logs after the last.
     has no GPUs. A failed refresh keeps cached data and says
     `cached · refresh failed: …`. Data is kept in the TUI's per-location job
     cache; the selected sub-job and its newest cached samples
-    appear first, and later opens download only new chunks. On a first open,
+    appear first, and later opens download only new chunks (unless the job
+    left the cache to keep it within its limit, which makes the next open a
+    first one: see [Local data](#local-data)). On a first open,
     with nothing cached for the selected sub-job, its newest half hour (the 10m
     and 30m windows) downloads before the rest of its history and is drawn at
     once, marked `loading older samples…` until the rest is in; a job short
@@ -1219,7 +1221,8 @@ next tab, round to Logs after the last.
     (30–40 seconds). A job opened anywhere else, or run partly from another
     machine, still shows every step the stage has.
   - It downloads when shown, refreshes on `r`, and re-reads every 30 seconds
-    while a live job's tab is showing, reading only the rows added since. The
+    while a live job's tab is showing, reading only the rows added since (a
+    job that left the cache downloads whole again: see [Local data](#local-data)). The
     file sits in the same per-location cache as the Resources tab's and is
     downloaded under the same lock, but the two are separate streams: each
     fetches its own chunks. A job with no training sub-job says so without
@@ -1269,7 +1272,8 @@ runs, its status is also re-read every 60 seconds, so the view switches to the
 saved console when the job ends.
 Logs are cached locally so reopening a job replays instantly without
 re-fetching from the server — under `~/.cache/cortex-training/` (or
-`$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`.
+`$XDG_CACHE_HOME/cortex-training/`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`, within the
+cache's limit (see [Local data](#local-data)).
 
 The pane draws each line as text only: escape sequences in a line (colours,
 cursor moves, clipboard or title writes) are removed and other control
@@ -1360,9 +1364,9 @@ minutes: the sub-job on screen first shows the console's last 30 minutes, under
 `— the saved console's last 30 minutes; the older lines are still downloading —`,
 until its whole console is in. A job that ended more than 10
 minutes earlier keeps that console in its per-location job cache, so
-reopening it is instant. The
-kept consoles of all jobs take at most 1 GiB together: past that, the ones
-opened least recently are removed (and downloaded again if opened). A
+reopening it is instant. Kept consoles count toward the cache's limit (see
+[Local data](#local-data)): past it, the jobs opened least recently are removed
+(and downloaded again if opened). A
 console fetched sooner, for example right after the job ended while the view
 was open, may still lack its last lines, which are often the error: the pane
 says so under it, and `r` downloads the chunks uploaded since. Until then, the
@@ -1394,10 +1398,12 @@ lines, saved consoles, and the execution-log records shown for a failed job
 without a console, the latter a whole record at a time (a match in its
 exception chain keeps the record); their header stays.
 
-The TUI also writes two files into your home directory: saved logs from the `s`
+The TUI also writes two kinds of file into your home directory: saved logs from the `s`
 key (`~/cortex-training-<job8>-<source>.log`, where `<job8>` is the first eight
 characters of the job id) and its own error log
-(`~/.cortex-training-errors.log`).
+(`~/.cortex-training-errors.log`). Past 5 MiB the error log keeps only its
+newest half, in the same file (a `.errors.lock` in the cache directory, not
+beside the log, keeps two TUIs from writing it at once).
 `<source>` is the sub-job's type and index, such as `training-0`. `s` saves the
 sub-job's saved console, else the lines its tail cached, else the execution log
 the pane shows; with nothing to save it says so and writes no file.
@@ -1445,6 +1451,53 @@ The `--poll-interval` flag (default `1.0s`) is the minimum interval between log
 polls per source, biasing toward server reliability over freshness.
 (A tail catching up with full pages polls faster, above.) The config file's
 `poll_interval` is the CLI's result-polling interval and doesn't change it.
+
+#### Local data
+
+Each opened job is cached under `~/.cache/cortex-training/jobs/` (or
+`$XDG_CACHE_HOME/cortex-training/jobs/`, or `$CORTEX_TRAINING_TUI_CACHE_DIR/jobs/`):
+its log tail, finished console, and telemetry. To bound disk usage across long
+or repeated sessions, the cache holds at most 5 GiB. That limit covers the jobs
+and the local training metrics the client writes (`local-training/`) together,
+so the two are one budget rather than two that add up. Those rows count up to
+the 1 GiB the client holds them to, but the TUI never removes them: they are how
+the Training metrics tab shows a step run from this machine before the stage has
+it, and for a job that does not save its training metrics to the stage, the
+only copy (the client prunes them by its own rules; see
+[Local training metrics](python-sdk.md#local-training-metrics)).
+
+Soon after startup, every 10 minutes while running, a few seconds after a
+download that grew a job's telemetry by 64 MiB or more, and after keeping a
+saved console (once the pane has it), one TUI at a time (where the filesystem
+supports locks) removes the least-recently-used jobs until the cache fits, and
+says nothing: open or downloading jobs can keep it over the limit. A job goes
+whole, its log tail and saved log positions with its telemetry, so a removed
+job downloads again when reopened, as on a first open. Only TUI-named real job
+directories holding TUI files are counted or removed, and no link is followed
+when counting or removing. The files an operating system leaves in a folder
+someone looked at (Finder's `.DS_Store` and `._*` files, NFS's `.nfs*` files)
+count as part of the job, or of the local rows, and do not make a job look
+recently used; any other entry the TUI did not write leaves its directory alone,
+and uncounted. A job cached by a TUI from before saved consoles moved to
+`console/` (its `stdout/`) is counted and removed the same way.
+
+Jobs open in a running TUI or actively downloading (a `download-metrics` into a
+job's cache directory included) are never evicted. Opening a job creates its
+directory, with a `.last-used` timestamp and the lock files the TUI and its
+downloads take (`.lease`, `.cursors.lock`, `.console.lock`, `.metrics.lock`;
+`.cleanup.lock` and `.errors.lock` sit in the cache directory itself). An open
+job screen holds a shared lock on `.lease` (kept across `Ctrl+Z`, released by
+the OS on exit) and refreshes a `.leases/` marker every 5 minutes (valid for 30
+minutes across shared filesystems); closing a screen keeps the job protected by
+its marker for a 5-minute grace period for in-flight reads, and quitting
+releases it immediately. A TUI from before leases existed holds none, so update
+every TUI sharing a cache. Nothing is wiped on quit. Eviction takes the lease
+and download locks exclusively and renames the job to `jobs/.removing-*` before
+deleting it. The startup and 10-minute passes also sweep abandoned console
+staging directories, which live in the system temp directory
+(`cortex-training-stage-*`, judged by their `.owner` lock, or after a week for
+older TUIs), interrupted `.removing-*` dirs, `.console-*` / `.tmp-*.swp` partials
+older than an hour, and lease markers older than 30 minutes.
 
 ### JSON Output And Help
 

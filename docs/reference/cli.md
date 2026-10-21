@@ -800,21 +800,26 @@ this role can't read.
 #### Job list
 
 The job list shows the jobs created in the last six months (183 days) that the
-current role can see in the configured database and schema (`list_jobs`).
+current role can see in the configured database and schema. It reads the
+account-level list scoped to that one schema
+([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2endpoint)),
+so it comes a page at a time; where that route is unavailable for the account,
+fails, or answers with no job at all, it reads `list_jobs`, which answers in one
+call and shows no pages.
 Press `a`, or click `a All schemas` in the footer, to list the jobs in every
-database and schema the role can see instead, from the account-level list
-([REST API reference section 5.3](rest-api.md#across-the-account---get-apiv2endpoint));
+database and schema the role can see instead, from the same list unscoped;
 the footer then offers `a Current schema`, which goes back. The
 header line starts with when the list was last refreshed (`refreshing…` while
 a refresh reads), then which list is shown. Until the list `a` asked for
 answers, the header reads `loading all schemas…` (or `loading the current
-schema, DB.SCHEMA…`) and the previous list stays on screen. The account-level
-list shows its first page (the newest 500 jobs) as soon as it answers, and adds
-each later page as it comes: the highlighted row stays where it is on screen,
-and folds and a search stay as they are. From its second page on, it also reads
-the active jobs (see below) beside the newest ones, at most two requests at a
-time. Until the last page, the header reads `all schemas · loading older jobs…
-N so far` (`+ every active job` once the active jobs are listed, `(older active
+schema, DB.SCHEMA…`) and the previous list stays on screen. Either list shows
+its first page (the newest 100 jobs) as soon as it answers, and adds each later
+page as it comes: the highlighted row stays where it is on screen, and folds and
+a search stay as they are. From its second page on, it also reads the active
+jobs (see below) beside the newest ones, at most two requests at a time. Until
+the last page, the header reads `all schemas · loading older jobs… N so far`
+(`Current schema: DB.SCHEMA, loading older jobs… N so far` for the configured
+schema's list; `+ every active job` once the active jobs are listed, `(older active
 jobs may be missing)` if reading them failed or stopped short), the counts above
 the list and a search's matches end in `so far`, and the LIVE and HISTORY rows'
 counts in `…`. Once the active jobs are listed, the active statuses' counts drop
@@ -823,28 +828,29 @@ page, as no status filter lists an `unknown` job. If the newest jobs are all in
 while the active jobs are still being read, the header reads `newest 2,000;
 loading older active jobs…`: the history count and the HISTORY row drop their
 marks, and the live counts and the LIVE row keep theirs.
-The list also shows its pages as they come when it first opens on all schemas;
-a refresh of a whole list keeps showing it until the next one is whole.
-`a` while the pages are read stops reading them: the pages read stay, no longer
-marked, under `loading the current schema, DB.SCHEMA… · showing the partial
-all-schemas list` until that list answers. An `a` back to all schemas before
-then waits for the configured schema's list (several seconds for a large one),
-and the pages start again from the first. `r` meanwhile does nothing (and
+A list shows its pages as they come when it is first shown: as the TUI opens,
+and after `a`. A refresh of a whole list keeps showing it until the next one is
+whole. `a` while the pages are read stops reading them: the pages read stay, no
+longer marked, under `loading the current schema, DB.SCHEMA… · showing the
+partial all-schemas list` (or `loading all schemas… · showing the partial
+current-schema list`) until that list answers. An `a` back before then stops
+that list's pages the same way, and the pages start again from the first. `r` meanwhile does nothing (and
 nothing is read again after): it says so, `Still loading older jobs (Ns); r
 works once it's done.` (`older active jobs` while the header says so). Once the
 list is whole, the header names it:
 
 | Header | The list holds |
 |---|---|
-| `Current schema: DB.SCHEMA` | the jobs of the configured database and schema (`list_jobs`), as the list opens |
+| `Current schema: DB.SCHEMA` | the jobs of the configured database and schema, as the list opens |
+| `Current schema: DB.SCHEMA, newest 2,000 + every active job (more exist)` | the same, cut short as the all-schemas list can be (below, `first 40 pages: …` included): that one schema holds more jobs than one refresh reads |
 | `all schemas` | after `a`: the jobs in every database and schema the role can see, from the account-level list; `all schemas (all in DB.SCHEMA)` when every one of them is in the same location |
 | `all schemas, narrowed to DB.SCHEMA` | after a whole `db=` search (see below): the jobs of that one location, asked of the service rather than filtered out of the newest 2,000. A narrowed list cut short reads `narrowed to DB.SCHEMA: newest 2,000 + every active job (more exist)`, and `narrowing to DB.SCHEMA…` while it is read |
 | `newest 2,000 + every active job (more exist)` | the same, cut at the newest 2,000 because more exist, plus the active jobs created before those |
-| `first 20 pages: N jobs + every active job (more may exist)` | the same, cut after 20 pages (see below), plus the active jobs |
-| `Current schema only: DB.SCHEMA (reason)` | the jobs of the configured database and schema, in place of the account-level list: `a` found it unavailable, or it turned unavailable while shown (see below) |
+| `first 40 pages: N jobs + every active job (more may exist)` | the same, cut after 40 pages (see below), plus the active jobs |
+| `Current schema only: DB.SCHEMA (reason)` | the jobs of the configured database and schema, in place of the all-schemas list: `a` found it unavailable, or it turned unavailable while shown (see below). Followed by what it holds when that list is cut short, as above |
 
-After `a`, each refresh reads the account-level list newest first, 500 jobs a
-page. It stops after 2,000 jobs, or after 20 pages, because the service examines
+Each refresh reads the account-level list newest first, 100 jobs a
+page. It stops after 2,000 jobs, or after 40 pages, because the service examines
 a bounded number of jobs per call, so a page can be short or empty and still
 have more after it: a refresh never walks the whole history. It asks for no
 status, so jobs whose status the service can't read (`unknown`) are listed too.
@@ -860,7 +866,7 @@ flight (after `a` pressed again), a new load reads them after the newest jobs
 instead. An `unknown` job older than
 the newest 2,000 is not listed, as a status filter leaves those out, and if
 reading the active jobs fails or is cut short too, the header says `older active
-jobs may be missing`. A walk that stops at 20 pages with no job to show says
+jobs may be missing`. A walk that stops at 40 pages with no job to show says
 that more may exist and how to list one schema, rather than that there are none.
 
 Search filters the jobs the list holds: when more exist, a search can't reach
@@ -881,7 +887,9 @@ list holds, as before. A name narrows when it is already the name the service
 resolves it to (`db=TEAM_DB`) or is quoted (`db='"ml"'`) — which is how the
 Schema column shows every location, so a location copied from it always narrows.
 
-To search all of the configured schema's jobs, press `a` to go back to its list.
+To search the configured schema's jobs, press `a` to go back to its list, read
+the same bounded way but scoped to that one schema: far likelier to hold every
+job of it, though a schema with more jobs than one refresh reads is cut too.
 `--database` and `--schema` choose the configured one at startup. These also go
 with `--connection`, where they take the place of the profile's database and
 schema:
@@ -1166,7 +1174,9 @@ next tab, round to Logs after the last.
     has no GPUs. A failed refresh keeps cached data and says
     `cached · refresh failed: …`. Data is kept in the TUI's per-location job
     cache; the selected sub-job and its newest cached samples
-    appear first, and later opens download only new chunks. On a first open,
+    appear first, and later opens download only new chunks (unless the job
+    left the cache to keep it within its limit, which makes the next open a
+    first one: see [Local data](#local-data)). On a first open,
     with nothing cached for the selected sub-job, its newest half hour (the 10m
     and 30m windows) downloads before the rest of its history and is drawn at
     once, marked `loading older samples…` until the rest is in; a job short
@@ -1211,7 +1221,8 @@ next tab, round to Logs after the last.
     (30–40 seconds). A job opened anywhere else, or run partly from another
     machine, still shows every step the stage has.
   - It downloads when shown, refreshes on `r`, and re-reads every 30 seconds
-    while a live job's tab is showing, reading only the rows added since. The
+    while a live job's tab is showing, reading only the rows added since (a
+    job that left the cache downloads whole again: see [Local data](#local-data)). The
     file sits in the same per-location cache as the Resources tab's and is
     downloaded under the same lock, but the two are separate streams: each
     fetches its own chunks. A job with no training sub-job says so without
@@ -1261,7 +1272,8 @@ runs, its status is also re-read every 60 seconds, so the view switches to the
 saved console when the job ends.
 Logs are cached locally so reopening a job replays instantly without
 re-fetching from the server — under `~/.cache/cortex-training/` (or
-`$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`.
+`$XDG_CACHE_HOME/cortex-training/`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`, within the
+cache's limit (see [Local data](#local-data)).
 
 The pane draws each line as text only: escape sequences in a line (colours,
 cursor moves, clipboard or title writes) are removed and other control
@@ -1352,9 +1364,9 @@ minutes: the sub-job on screen first shows the console's last 30 minutes, under
 `— the saved console's last 30 minutes; the older lines are still downloading —`,
 until its whole console is in. A job that ended more than 10
 minutes earlier keeps that console in its per-location job cache, so
-reopening it is instant. The
-kept consoles of all jobs take at most 1 GiB together: past that, the ones
-opened least recently are removed (and downloaded again if opened). A
+reopening it is instant. Kept consoles count toward the cache's limit (see
+[Local data](#local-data)): past it, the jobs opened least recently are removed
+(and downloaded again if opened). A
 console fetched sooner, for example right after the job ended while the view
 was open, may still lack its last lines, which are often the error: the pane
 says so under it, and `r` downloads the chunks uploaded since. Until then, the
@@ -1386,10 +1398,12 @@ lines, saved consoles, and the execution-log records shown for a failed job
 without a console, the latter a whole record at a time (a match in its
 exception chain keeps the record); their header stays.
 
-The TUI also writes two files into your home directory: saved logs from the `s`
+The TUI also writes two kinds of file into your home directory: saved logs from the `s`
 key (`~/cortex-training-<job8>-<source>.log`, where `<job8>` is the first eight
 characters of the job id) and its own error log
-(`~/.cortex-training-errors.log`).
+(`~/.cortex-training-errors.log`). Past 5 MiB the error log keeps only its
+newest half, in the same file (a `.errors.lock` in the cache directory, not
+beside the log, keeps two TUIs from writing it at once).
 `<source>` is the sub-job's type and index, such as `training-0`. `s` saves the
 sub-job's saved console, else the lines its tail cached, else the execution log
 the pane shows; with nothing to save it says so and writes no file.
@@ -1437,6 +1451,53 @@ The `--poll-interval` flag (default `1.0s`) is the minimum interval between log
 polls per source, biasing toward server reliability over freshness.
 (A tail catching up with full pages polls faster, above.) The config file's
 `poll_interval` is the CLI's result-polling interval and doesn't change it.
+
+#### Local data
+
+Each opened job is cached under `~/.cache/cortex-training/jobs/` (or
+`$XDG_CACHE_HOME/cortex-training/jobs/`, or `$CORTEX_TRAINING_TUI_CACHE_DIR/jobs/`):
+its log tail, finished console, and telemetry. To bound disk usage across long
+or repeated sessions, the cache holds at most 5 GiB. That limit covers the jobs
+and the local training metrics the client writes (`local-training/`) together,
+so the two are one budget rather than two that add up. Those rows count up to
+the 1 GiB the client holds them to, but the TUI never removes them: they are how
+the Training metrics tab shows a step run from this machine before the stage has
+it, and for a job that does not save its training metrics to the stage, the
+only copy (the client prunes them by its own rules; see
+[Local training metrics](python-sdk.md#local-training-metrics)).
+
+Soon after startup, every 10 minutes while running, a few seconds after a
+download that grew a job's telemetry by 64 MiB or more, and after keeping a
+saved console (once the pane has it), one TUI at a time (where the filesystem
+supports locks) removes the least-recently-used jobs until the cache fits, and
+says nothing: open or downloading jobs can keep it over the limit. A job goes
+whole, its log tail and saved log positions with its telemetry, so a removed
+job downloads again when reopened, as on a first open. Only TUI-named real job
+directories holding TUI files are counted or removed, and no link is followed
+when counting or removing. The files an operating system leaves in a folder
+someone looked at (Finder's `.DS_Store` and `._*` files, NFS's `.nfs*` files)
+count as part of the job, or of the local rows, and do not make a job look
+recently used; any other entry the TUI did not write leaves its directory alone,
+and uncounted. A job cached by a TUI from before saved consoles moved to
+`console/` (its `stdout/`) is counted and removed the same way.
+
+Jobs open in a running TUI or actively downloading (a `download-metrics` into a
+job's cache directory included) are never evicted. Opening a job creates its
+directory, with a `.last-used` timestamp and the lock files the TUI and its
+downloads take (`.lease`, `.cursors.lock`, `.console.lock`, `.metrics.lock`;
+`.cleanup.lock` and `.errors.lock` sit in the cache directory itself). An open
+job screen holds a shared lock on `.lease` (kept across `Ctrl+Z`, released by
+the OS on exit) and refreshes a `.leases/` marker every 5 minutes (valid for 30
+minutes across shared filesystems); closing a screen keeps the job protected by
+its marker for a 5-minute grace period for in-flight reads, and quitting
+releases it immediately. A TUI from before leases existed holds none, so update
+every TUI sharing a cache. Nothing is wiped on quit. Eviction takes the lease
+and download locks exclusively and renames the job to `jobs/.removing-*` before
+deleting it. The startup and 10-minute passes also sweep abandoned console
+staging directories, which live in the system temp directory
+(`cortex-training-stage-*`, judged by their `.owner` lock, or after a week for
+older TUIs), interrupted `.removing-*` dirs, `.console-*` / `.tmp-*.swp` partials
+older than an hour, and lease markers older than 30 minutes.
 
 ### JSON Output And Help
 

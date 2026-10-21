@@ -20,6 +20,7 @@ RL_OVERRIDES = EXAMPLES / "rl" / "overrides.json"
 # metadata and data.
 EXAMPLE_FOLDERS = (
     "sft/conversational",
+    "sft/dare",
     "rl/math_grpo",
     "inference",
     "distillation",
@@ -1034,6 +1035,64 @@ def test_a_job_config_replaces_the_catalog_file_and_overrides_json(tmp_path, mon
     assert from_file["debug"] == {"job": {"image_tag": "dev_test"}}
 
 
+def test_dare_evaluate_builds_its_inference_job_from_the_catalog(tmp_path):
+    pytest.importorskip("sklearn")  # dare_bench.evaluation
+    utils = _import_example("examples.utils")
+    endpoint = _import_example("examples.inference.endpoint")
+    evaluate = _import_example("examples.sft.dare.evaluate")
+
+    # The DARE evaluator no longer ships a pre-restructure config file; its
+    # defaults select the catalog inference file (Qwen/Qwen3-8B, standard, full).
+    config = evaluate.Config(config="conn.json", bench_dir=str(tmp_path))
+    assert config.job_config is None
+    source_text = Path(evaluate.__file__).read_text(encoding="utf-8")
+    assert "configs/qwen3_8b_full.json" not in source_text
+    assert "configs/" not in source_text
+
+    from_catalog, _ = endpoint.inference_endpoint_body(
+        model=config.model,
+        context=config.context,
+        hardware=config.hardware,
+        lora=config.lora,
+        job_config=config.job_config,
+        max_seq_len=config.max_seq_len,
+        source_job_id="job-0",
+        checkpoint_id="cp_1",
+    )
+    sampling = _sub_job(from_catalog, "sampling")
+    assert sampling["model_name"] == "Qwen/Qwen3-8B"
+    assert sampling["source_checkpoint_info"] == {"checkpoint_id": "cp_1", "source_job_id": "job-0"}
+
+    # job_config= stays the explicit-file escape hatch.
+    job_config = tmp_path / "job.json"
+    job_config.write_text(json.dumps(utils.make_config("Qwen/Qwen3-8B", "standard", inference=True)))
+    from_file, _ = endpoint.inference_endpoint_body(
+        model=config.model,
+        context=config.context,
+        hardware=config.hardware,
+        lora=config.lora,
+        job_config=str(job_config),
+    )
+    assert _sub_job(from_file, "sampling")["model_name"] == "Qwen/Qwen3-8B"
+
+    # The checkpoint-eval command the SFT runner prints for DARE carries the
+    # catalog selectors so the evaluator rebuilds this job, not its defaults.
+    task = _import_example("examples.sft.dare.task").DareTask(variant="fv")
+    command = task.eval_command(
+        config_path="conn.json",
+        job_id="job-0",
+        checkpoint_id="cp_1",
+        job_args=utils.inference_job_args(
+            utils.make_config("Qwen/Qwen3.5-4B", "standard", lora=True),
+            context="standard",
+        ),
+    )
+    assert command.startswith("python -m examples.sft.dare.evaluate ")
+    assert "model=Qwen/Qwen3.5-4B" in command
+    assert "context=standard" in command
+    assert "lora=true" in command
+
+
 @pytest.mark.parametrize(
     ("path", "section"),
     [("examples/api/README.md", "## Create-job bodies"), ("examples/README.md", "## Create a job config from the command line")],
@@ -1047,6 +1106,39 @@ def test_job_body_docs_submit_with_ct(path, section):
 
     assert any(line.startswith("ct submit --dry-run ") for line in submits)
     assert all(line.startswith("ct submit ") for line in submits)
+
+
+def test_reference_docs_only_import_packaged_modules():
+    """The REST/SDK contract docs must not send a (pip-installed) reader to a
+    module the wheel does not ship: every ``cortex_training`` import they show
+    must resolve in the installed package, and they must never instruct
+    importing ``examples/`` or the removed ``router_replay_planner``."""
+    import importlib
+
+    import_stmt = re.compile(r"^\s*(?:from\s+([\w.]+)\s+import\s+(.+)|import\s+([\w.]+))\s*$")
+    seen = 0
+    for name in ("rest-api.md", "python-sdk.md"):
+        path = REPO_ROOT / "docs" / "reference" / name
+        for line in path.read_text(encoding="utf-8").splitlines():
+            match = import_stmt.match(line)
+            if not match:
+                continue
+            module = match.group(1) or match.group(3)
+            if module == "examples" or module.startswith("examples."):
+                raise AssertionError(f"{name} instructs importing examples/: {line.strip()!r}")
+            if module == "cortex_training.router_replay_planner":
+                raise AssertionError(f"{name} imports the planner removed from the SDK: {line.strip()!r}")
+            if module != "cortex_training" and not module.startswith("cortex_training."):
+                continue
+            imported = importlib.import_module(module)  # must resolve in the installed package
+            if match.group(2):
+                for symbol in match.group(2).replace("(", "").replace(")", "").split(","):
+                    symbol = symbol.strip()
+                    if symbol and symbol != "*":
+                        assert hasattr(imported, symbol), f"{module} has no {symbol} ({name})"
+            seen += 1
+    assert "router_replay_planner" not in (REPO_ROOT / "docs" / "reference" / "python-sdk.md").read_text(encoding="utf-8")
+    assert seen >= 4  # both contract docs import names from the installed package
 
 
 def test_job_configs_come_from_the_catalog():
@@ -1094,6 +1186,10 @@ _UPSTREAM_REFERENCES = (
     ("examples/frameworks/*", re.compile(r"cookbook", re.IGNORECASE)),
     ("examples/*example.yaml", re.compile(r"^  recipe: ")),
     ("examples/frameworks/skyrl/*", re.compile(r"Arctic-Platform/(?:blob/main/)?recipes/")),
+    # The OpenHands / bring-your-own-agent integration docs describe the Arctic
+    # Platform OpenHands recipe (another project), so they may name "recipe".
+    ("examples/frameworks/openhands.md", re.compile(r"recipe", re.IGNORECASE)),
+    ("examples/frameworks/bring-your-own-agent.md", re.compile(r"recipe", re.IGNORECASE)),
 )
 
 

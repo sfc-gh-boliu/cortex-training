@@ -37,6 +37,7 @@ from textual.containers import ScrollableContainer
 from textual.content import Content
 from textual.geometry import Offset
 from textual.geometry import Region
+from textual.geometry import Size
 from textual.css.query import NoMatches
 from textual.dom import NoScreen
 from textual.screen import Screen
@@ -53,16 +54,17 @@ from textual.widgets import ListView
 from textual.widgets import Log
 from textual.widgets import Static
 from textual.widgets import TabbedContent
+from textual.widgets import TabPane
 from textual.widgets.data_table import RowDoesNotExist
+from cortex_training.tui import theme
 from cortex_training.tui import views
 from cortex_training.tui.clipboard import aligned
+from cortex_training.tui.log_style import MARK_BACKGROUND
+from cortex_training.tui.log_style import TRACE_KIND
+from cortex_training.tui.log_style import TRACEBACK_BACKGROUND
+from cortex_training.tui.log_style import TRACEBACK_KIND
 import os
 import traceback
-
-
-# Rich's grey62, by value: Textual's markup and styles (the preview's Content)
-# don't know that name and would draw the default color instead.
-ENDED_STYLE = "#9e9e9e"
 
 
 def on_stack(screen: Screen) -> bool:
@@ -105,10 +107,25 @@ def after_refresh(screen: Screen, fn, *args, **kwargs) -> None:
 
 
 class JobTabs(TabbedContent):
-    """Job tabs that report width changes caused by the keys panel."""
+    """Job tabs that report width changes caused by the keys panel, and that only a tab key
+    or a click on a tab changes."""
 
     def on_resize(self, event: events.Resize) -> None:
         self.screen._tabs_resized()
+
+    def _on_tab_pane_focused(self, event: TabPane.Focused) -> None:
+        """Don't switch to the pane a widget was focused in, as TabbedContent does.
+
+        That message is queued when the focus moves, so it can be handled after a tab key
+        that came later: the screen focuses its Logs panel as it opens, and an `m` pressed in
+        that moment was switched straight back to Logs. Every focus this screen sets is
+        already in the tab on screen, so following it never changes anything else.
+
+        ``prevent_default`` is what stops it: Textual also runs TabbedContent's own handler
+        for this message after this one, and only skips it when the default is prevented.
+        """
+        event.stop()
+        event.prevent_default()
 
 
 def call_on_screen(screen: Screen, fn, *args, **kwargs) -> bool:
@@ -135,21 +152,94 @@ def call_on_screen(screen: Screen, fn, *args, **kwargs) -> bool:
 
 
 class _LogPane(Log):
-    """The Logs pane, retaining each wrapped row's highlighter kind."""
+    """The Logs pane, retaining each wrapped row's highlighter kind (a level, a traceback,
+    a day's rule, a note). A traceback's rows, and the line a jump landed on (``mark``),
+    are drawn on their own background across the pane's width."""
+
+    _BACKGROUNDS = {TRACEBACK_KIND: TRACEBACK_BACKGROUND, TRACE_KIND: TRACEBACK_BACKGROUND}
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.row_kinds: list[str | None] = []
+        self.mark: tuple[int, int] | None = None  # the rows [start, end) of the line a jump landed on
+        self.on_scrolled = None  # called (UI thread) whenever the view scrolls, by any means
+        # ``copy_text(start, end)``: the lines a highlight from ``start`` to ``end`` ((row,
+        # column), None for either end of the pane) covers, as they were logged (see
+        # format.copied_text). Unset, a highlight copies the rows as drawn, as Log does.
+        self.copy_text = None
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        if self.copy_text is None:
+            return super().get_selection(selection)
+        ends = [None if at is None else (at.y, at.x) for at in (selection.start, selection.end)]
+        return self.copy_text(*ends), "\n"
+
+    def plain_lines(self) -> list[str]:
+        """Every line the pane holds, as it was logged (what a copy of the whole screen takes)."""
+        if self.copy_text is None:
+            return list(self.lines)
+        text = self.copy_text(None, None)
+        return text.split("\n") if text else []
 
     def write_rows(self, rows: list[str], kinds: list[str | None], *, scroll_end: bool | None = None) -> None:
         """``rows`` as :meth:`write_lines` writes them, ``kinds`` one per row it makes."""
         self.row_kinds.extend(kinds)
         self.write_lines(rows, scroll_end=scroll_end)
-        del self.row_kinds[:max(0, len(self.row_kinds) - len(self.lines))]  # as the oldest rows went
+        dropped = max(0, len(self.row_kinds) - len(self.lines))  # as the oldest rows went
+        del self.row_kinds[:dropped]
+        if dropped and self.mark is not None:
+            start, end = self.mark[0] - dropped, self.mark[1] - dropped
+            self.mark = (start, end) if start >= 0 else None
 
     def clear(self):
         self.row_kinds = []
+        self.mark = None
         return super().clear()
+
+    def insert_row(self, y: int, row: str, kind: str | None) -> None:
+        """Put ``row`` in above row ``y`` (a day's rule, back on top once the oldest rows went)."""
+        self._lines.insert(y, row)
+        self.row_kinds.insert(y, kind)
+        if self.mark is not None and self.mark[0] >= y:
+            self.mark = (self.mark[0] + 1, self.mark[1] + 1)
+        selection = self.text_selection  # held in rows: it stays on the text it covered
+        if selection is not None:
+            def shift(at):
+                return at if at is None or at.y < y else Offset(at.x, at.y + 1)
+
+            self.screen.selections = {**self.screen.selections,
+                                      self: Selection(shift(selection.start), shift(selection.end))}
+        self._width = max(self._width, cell_len(row))
+        self.virtual_size = Size(self._width, len(self._lines))
+        self._render_line_cache.clear()
+        self.refresh()
+
+    def set_mark(self, rows: tuple[int, int] | None) -> None:
+        if rows != self.mark:
+            self.mark = rows
+            self.refresh()
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        if self.on_scrolled is not None:
+            self.on_scrolled()
+
+    def _row_background(self, y: int) -> str | None:
+        mark = self.mark
+        if mark is not None and mark[0] <= y < mark[1]:
+            return MARK_BACKGROUND
+        return self._BACKGROUNDS.get(self.row_kinds[y]) if 0 <= y < len(self.row_kinds) else None
+
+    def _render_line(self, y: int, scroll_x: int, width: int):
+        # As Log draws a row, on the row's own background when it has one: the
+        # pane's width, past the text too, so a traceback reads as one block.
+        background = self._row_background(y) if y < len(self._lines) else None
+        if background is None:
+            return super()._render_line(y, scroll_x, width)
+        rich_style = self.rich_style + Style(bgcolor=background)
+        line = self._render_line_strip(y, rich_style)
+        line = line.crop_extend(scroll_x, scroll_x + width, rich_style)
+        return line.apply_offsets(scroll_x, y)
 
     def _render_line_strip(self, y: int, rich_style):
         highlighter = self.highlighter
@@ -443,6 +533,11 @@ class SelectableTable(DataTable):
         extend = " " * max(0, self.size.width - width - self._row_label_column_width)
         return "".join(texts[:self.fixed_columns]), "".join(texts[self.fixed_columns:]) + extend
 
+    def text_select_all(self) -> None:
+        """Nothing: Textual highlights a whole widget on a double-click, which on a table
+        opens the row clicked (a second click on the cursor's row selects it), and the
+        highlight, under the screen opened, painted the whole table on coming back."""
+
     def _selection_style(self) -> Style:
         """Selection background plus an explicitly configured foreground."""
         screen = self.screen
@@ -461,8 +556,55 @@ class SelectableTable(DataTable):
             text = "".join(self._line_parts(line))
             span = _selected_span(selection, line, text)
             if span is not None:
-                parts.append(text[span[0]:span[1]])
-        return ("\n".join(parts), "\n") if parts else None
+                parts.append(self._copied_columns(line, text, span))
+        return ("\n".join(_aligned_pieces(parts)), "\n") if parts else None
+
+    def _copied_columns(self, line: int, text: str, span: tuple[int, int]) -> list:
+        """The selected part of one line, column by column, as ``(column, text, whole)``
+        (``whole``: the piece is the column's full width). A cell the span covers whole
+        is its copy text (``str()``): a relative time drawn "3h ago" copies as the time
+        itself, a status as its word, an id cut with "…" whole. A cell it covers only
+        in part is what it draws there."""
+        start, end = span
+        cells = None if self._labelled_row_exists and self.show_row_labels else self._row_cells(line)
+        if cells is None:
+            return [(None, text[start:end], False)]
+        pad = self.cell_padding
+        pieces, at, used = [], 0, 0
+        columns = self.ordered_columns
+        for index, column in enumerate(columns):
+            used += column.get_render_width(self)
+            stop = _chars_within(text, used)
+            high = min(len(text) if index == len(columns) - 1 else stop, end)  # the last runs to the edge
+            low = max(at, start)
+            if low < high:
+                piece = text[low:high]
+                cell = cells[index] if index < len(cells) else None
+                content = text[at + pad:stop - pad].rstrip()
+                after = at + pad + len(content)
+                if isinstance(cell, _FixedCell) and start <= at + pad and end >= after and str(cell) != content:
+                    lead = text[low:at + pad]
+                    copied = views.printable(str(cell)).replace("\n", " ")
+                    # As wide as the column drew it, or wider (with its padding) for a longer copy text.
+                    piece = lead + copied + " " * max(len(piece) - len(lead) - len(copied), pad if high >= stop else 0)
+                pieces.append((index, piece, low == at and high >= stop))
+            at = stop
+        return pieces
+
+    def _row_cells(self, line: int) -> list | None:
+        """The cells of the one-line row that table line ``line`` draws (none for the
+        column names, which are split into columns all the same); None for a taller
+        row or a line past the rows."""
+        try:
+            row_key, line_in_row = self._get_offsets(line)
+            if row_key == self._header_row_key:
+                return [] if self.header_height == 1 else None
+            row = self.rows.get(row_key)
+            if line_in_row or row is None or row.height != 1:
+                return None
+            return self.get_row(row_key)
+        except (LookupError, KeyError, RowDoesNotExist):
+            return None
 
     def drag_region(self, header: bool = False) -> Region:
         """The clipped header or scrolling-row drag region."""
@@ -537,6 +679,23 @@ def _chars_within(text: str, cells: int) -> int:
     return len(text)
 
 
+def _aligned_pieces(lines: list) -> list:
+    """Lines of ``(column, text, whole)`` pieces (see ``SelectableTable._copied_columns``)
+    as text, each whole column as wide as its widest piece: a copy text longer or shorter
+    than what a cell draws keeps the columns after it in line. Lines whose pieces all
+    draw their cells as they are come out as drawn."""
+    widths: dict = {}
+    for pieces in lines:
+        for column, text, whole in pieces:
+            if whole:
+                widths[column] = max(widths.get(column, 0), cell_len(text))
+    out = []
+    for pieces in lines:
+        texts = [text + " " * (widths[column] - cell_len(text)) if whole else text for column, text, whole in pieces]
+        out.append("".join(texts).rstrip())
+    return out
+
+
 def _selected_span(selection: Selection, line: int, text: str) -> tuple[int, int] | None:
     """Selected character span on one line, excluding trailing blanks."""
     span = selection.get_span(line)
@@ -570,12 +729,27 @@ def _draw_highlight(strip: Strip, first: int, span: tuple[int, int], style: Styl
 _SEPARATOR = "  ·  "
 
 
-def fit_line(segments: list, width: int) -> Content:
-    """Fit styled segments by cutting those with minimum widths, then wrapping."""
-    texts = [text for text, _style, _least in segments]
-    sep = views.cell_width(_SEPARATOR)
-    over = sum(views.cell_width(text) for text in texts) + sep * (len(texts) - 1) - width
-    spares = [max(0, views.cell_width(text) - least) if least is not None else 0 for text, _style, least in segments]
+_CHIP = f"{theme.TEXT} on {theme.PANEL}"
+
+
+def fit_line(segments: list, width: int, separator: str = "   ") -> Content:
+    """Segments joined by ``separator`` to fit ``width`` cells.
+
+    A segment is a ``Content``, kept whole, or ``(text, style, least, chip)``: a
+    chip is drawn as `` text `` on a panel. When cutting the segments that have
+    a ``least`` (the first ones first, down to that many cells, with ``…``) puts
+    the line on one row, they are cut just enough; the others stay whole.
+    Otherwise nothing is cut and the line wraps between segments. The texts are
+    shown literally, never as markup.
+    """
+    def cells(segment, text) -> int:
+        return text.cell_length if isinstance(segment, Content) else views.cell_width(text) + (2 if segment[3] else 0)
+
+    texts = [segment if isinstance(segment, Content) else segment[0] for segment in segments]
+    sep = views.cell_width(separator)
+    over = sum(cells(s, t) for s, t in zip(segments, texts)) + sep * (len(texts) - 1) - width
+    spares = [max(0, views.cell_width(s[0]) - s[2]) if not isinstance(s, Content) and s[2] is not None else 0
+              for s in segments]
     if 0 < over <= sum(spares):  # cutting gets it onto one row
         for i, spare in enumerate(spares):
             if over <= 0:
@@ -585,10 +759,13 @@ def fit_line(segments: list, width: int) -> Content:
                 texts[i] = views.fit_cells(texts[i], views.cell_width(texts[i]) - cut)
                 over -= cut
     rows: list = []
-    for text, (_text, style, _least) in zip(texts, segments):
-        piece = Content.styled(text, style)
+    for segment, text in zip(segments, texts):
+        if isinstance(segment, Content):
+            piece = segment
+        else:
+            piece = Content.styled(f" {text} ", _CHIP) if segment[3] else Content.styled(text, segment[1])
         if rows and rows[-1].cell_length + sep + piece.cell_length <= width:
-            rows[-1] = rows[-1] + Content(_SEPARATOR) + piece
+            rows[-1] = rows[-1] + Content(separator) + piece
         else:
             rows.append(piece)
     return Content("\n").join(rows)
@@ -806,6 +983,20 @@ def _quiet_download(method) -> dict:
     except (TypeError, ValueError):
         return {}
     return {"stale_after_seconds": None} if "stale_after_seconds" in parameters else {}
+
+
+def _download_options(method, options: dict) -> dict:
+    """The ``options`` a client's download method takes: an older client's, or the
+    demo's, takes fewer. A preview's two options go together or not at all."""
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return {}
+    taken = {name: value for name, value in options.items() if name in parameters}
+    if not {"preview_seconds", "on_preview"} <= set(taken):
+        taken.pop("preview_seconds", None)
+        taken.pop("on_preview", None)
+    return taken
 
 
 

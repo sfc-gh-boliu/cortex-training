@@ -42,12 +42,18 @@ from textual.widgets import TabbedContent  # noqa: E402
 
 from cortex_training import AccountJobListUnavailable  # noqa: E402
 from cortex_training import CortexTrainingClient  # noqa: E402
+from cortex_training import InvalidPageToken  # noqa: E402
 from cortex_training.client import DownloadCancelled  # noqa: E402
 from cortex_training.tui import __main__ as tui_main  # noqa: E402
+from cortex_training.tui.account import ACCOUNT  # noqa: E402
+from cortex_training.tui.account import SCHEMA  # noqa: E402
+from cortex_training.tui.account import JobLister  # noqa: E402
+from cortex_training.tui.account import scope_text  # noqa: E402
 from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.job_list import JobListScreen  # noqa: E402
 from cortex_training.tui.logs import LogScreen  # noqa: E402
 from cortex_training.tui.demo import DemoClient  # noqa: E402
+from cortex_training.tui.theme import ACCENT  # noqa: E402
 from cortex_training.tui import views  # noqa: E402
 from cortex_training.tui.untrusted import printable_client  # noqa: E402
 from cortex_training.tui.format import wrap_log_line  # noqa: E402
@@ -228,7 +234,7 @@ async def _run_resource_tab(tmp_path):
         assert ok
         tabs = app.screen.query_one("#job-tabs", TabbedContent)
         assert tabs.active == "logs"
-        assert {pane.id for pane in app.screen.query("TabPane")} == {"logs", "resource"}
+        assert {pane.id for pane in app.screen.query("TabPane")} == {"logs", "resource", "training", "checkpoints"}
         c.download_metrics.assert_not_called()
 
         tabs.active = "resource"
@@ -263,6 +269,17 @@ async def _run_resource_tab(tmp_path):
         ok = await _wait(pilot, app, lambda: app.screen._resource_range == "10m")
         assert ok
         assert c.download_metrics.call_count == calls
+        # The bottom row is the window selector, the window shown lit, then only the keys the
+        # footer doesn't show; a click on a segment picks its window.
+        keys = app.screen._resource_keys()
+        lit = [keys.plain[span.start:span.end] for span in keys.spans if f"on {ACCENT}" in str(span.style)]
+        assert lit == [" 10m "]
+        assert keys.plain.startswith("window ") and "↑↓ GPU" in keys.plain
+        assert "refresh" not in keys.plain and "sub-job" not in keys.plain
+        assert all(app.screen._resource_keys(width).cell_length <= width for width in (60, 40, 25, 12))
+        assert "@click=screen.resource_range('30m')" in str(keys.spans[2].style)
+        kpis = str(app.screen.query_one("#resource-kpis", Static).render())
+        assert "GPU util" in kpis and "GPUs reporting" in kpis
         app.screen._content_width = lambda: 10
         app.screen._write_line("x" * 20)
         assert len(app.screen._logview._lines) > len(app.screen._shown_lines)
@@ -303,6 +320,12 @@ async def _run_resource_tab(tmp_path):
         assert app.screen._resource_range == previous_range
         await pilot.press("t")
         ok = await _wait(pilot, app, lambda: tabs.active == "resource")
+        assert ok
+        await pilot.press("t")  # t goes on to the next tab, round to Logs after the last
+        ok = await _wait(pilot, app, lambda: tabs.active == "training")
+        assert ok
+        await pilot.press("t")
+        ok = await _wait(pilot, app, lambda: tabs.active == "checkpoints")
         assert ok
         await pilot.press("t")
         ok = await _wait(pilot, app, lambda: tabs.active == "logs")
@@ -515,7 +538,12 @@ async def _run_resource_unsupported_warning():
         assert ok
         status = str(app.screen.query_one("#resource-status", Static).render())
         assert "training #0" in status  # named by type and index
-        assert "no usable GPU metrics" in status
+        # Why the view is empty is the card in the pane; the skipped rows stay on the header.
+        card = app.screen.query_one("#resource-stats", Static)
+        assert card.has_class("-empty")
+        assert "No usable GPU metrics" in str(card.render())
+        assert "no usable GPU metrics for this sub-job" in str(card.render())
+        assert "no usable GPU metrics" not in status
         assert "1 row skipped (malformed or unsupported)" in status
         await _settle(app, pilot)
 
@@ -583,21 +611,26 @@ async def _run_resource_chart_fits_content_width():
         ok = await _wait(pilot, app, lambda: app.screen._current_source is not None)
         assert ok
         app.screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        chart = app.screen.query_one("#resource-charts", Static)
+
+        def drawn_to_width() -> bool:
+            # The charts are redrawn once the layout settles (the panel beside them is sized
+            # to its labels): wait for a drawing at the final width, not one from before it.
+            lines = str(chart.render()).splitlines()
+            return bool(lines) and all(len(line) <= chart.content_size.width for line in lines)
+
         ok = await _wait(
             pilot,
             app,
             lambda: not app.screen._resource_loading
-            and _listed_units(app.screen) == 1,
+            and _listed_units(app.screen) == 1
+            and drawn_to_width(),
         )
         assert ok
-        chart = app.screen.query_one("#resource-charts", Static)
-        lines = str(chart.render()).splitlines()
-        assert lines
         # The pane's padding is outside the charts: they are drawn to the width they have.
         pane = app.screen.query_one("#resource-pane")
         assert pane.region.width - chart.content_region.width == 3  # its padding and the scrollbar's gutter
         assert chart.content_size.width == chart.content_region.width
-        assert all(len(line) <= chart.content_size.width for line in lines)
         await _settle(app, pilot)
 
 
@@ -1296,11 +1329,12 @@ async def _run_last_updated():
         assert app.screen._last_line_at is not None
         assert "read-only" not in app.sub_title  # dropped from the subtitle
         assert "RUNNING" in app.sub_title  # job status now on this line
-        # The summary line is reserved for static config — no status word there.
+        # The summary line under the title is the job's identity: its status as a
+        # badge (glyph and word), beside its type and scope chips.
         from textual.widgets import Static
 
         summary = str(app.screen.query_one("#summary", Static).render())
-        assert "RUNNING" not in summary
+        assert "● RUNNING" in summary and "all sub-jobs" in summary
         await _settle(app, pilot)
 
 
@@ -1495,11 +1529,196 @@ def test_a_log_line_that_reads_like_a_note_is_still_a_log_line():
             logs = s._shown_logs
             _live_page(s, ["— live —"])  # a log line with the text of the TUI's own note
             assert s._shown_logs == logs + 1
-            assert s._logview.lines[-1].startswith("training:0 │ ")  # tagged as the sub-job's
-            assert s._logview.row_kinds[-1] != NOTE_KIND
+            assert s._logview.lines[-1] == "— live —"  # (no sub-job tag: the pane shows one sub-job)
+            assert s._logview.row_kinds[-1] != NOTE_KIND and s._shown_kinds[-1] != NOTE_KIND
+
+            def italic(y):  # the row as the pane draws it: in the notes' italics?
+                strip = s._logview._render_line_strip(y, s._logview.rich_style)
+                return any(segment.style is not None and segment.style.italic for segment in strip)
+
+            assert not italic(len(s._logview.lines) - 1)
             s._write_line("— live —")  # the TUI's own note
             assert s._shown_logs == logs + 1
             assert s._logview.lines[-1] == "— live —" and s._logview.row_kinds[-1] == NOTE_KIND
+            assert italic(len(s._logview.lines) - 1)
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_the_pane_shows_the_time_with_each_day_on_a_rule_and_save_keeps_the_lines():
+    from cortex_training.tui.format import day_rule
+    from cortex_training.tui.format import display_line
+    from cortex_training.tui.log_style import DAY_KIND
+
+    lines = ["2026-10-17T12:00:00Z INFO step 1", "2026-10-17T12:00:05Z INFO step 2", "2026-10-19T12:00:00Z INFO step 3"]
+
+    async def run():
+        app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+        async with app.run_test() as pilot:
+            s = await _open_live_tail(app, pilot)
+            _live_page(s, lines)
+            shown = [display_line(line) for line in lines]
+            rows = list(s._logview.lines[-5:])
+            width = s._content_width()
+            assert rows == [day_rule(shown[0][:10], width), shown[0][11:], shown[1][11:],
+                            day_rule(shown[2][:10], width), shown[2][11:]]
+            assert s._logview.row_kinds[-5] == DAY_KIND and s._logview.row_kinds[-2] == DAY_KIND
+            assert s._shown_lines[-3:] == lines  # the buffer (and save, and copy) keep the lines as they came
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_a_highlight_across_a_day_rule_and_a_wrapped_line_copies_the_lines_as_logged(monkeypatch):
+    from textual import events
+    from textual.geometry import Offset
+    from textual.selection import Selection
+
+    from cortex_training.tui.clipboard import screen_dump
+    from cortex_training.tui.format import is_day_rule
+
+    lines = ["2026-10-17T05:00:00Z INFO step 1", "2026-10-17T05:00:01Z INFO step 2 " + "loss=0.5 " * 12]
+    copied: list = []
+
+    async def run():
+        app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+        monkeypatch.setattr(app, "copy_out", lambda text, what: copied.append(text))
+        async with app.run_test(size=(100, 30)) as pilot:
+            s = await _open_live_tail(app, pilot)
+            _live_page(s, lines)
+            await pilot.pause()
+            lv = s._logview
+            rows = list(lv.lines)
+            top = len(rows) - sum(s._shown_rows[-2:])  # the first of the two lines' rows: its day's rule
+            assert is_day_rule(rows[top]) and s._shown_rows[-1] > 1  # (the second line wraps)
+            # A drag with the mouse from inside the rule to past the end of the wrapped line, then
+            # ctrl+c: both lines whole, as logged (whole stamps, no rule, no indent).
+            region = lv.content_region
+            assert lv.scroll_offset.y == 0 and len(rows) <= region.height  # (every row in view)
+
+            async def mouse(cls, x, y):  # as a terminal sends it: the button held through a drag
+                app.post_message(cls(None, x, y, 0, 0, 1, False, False, False, screen_x=x, screen_y=y))
+                await pilot.pause()
+
+            await mouse(events.MouseDown, region.x + 4, region.y + top)
+            await mouse(events.MouseMove, region.right - 1, region.y + len(rows) - 1)
+            await mouse(events.MouseUp, region.right - 1, region.y + len(rows) - 1)
+            await pilot.press("ctrl+c")
+            assert await _pause_until(pilot, lambda: copied) and copied[-1] == "\n".join(lines)
+            # The same highlight set directly, as the screen keeps it.
+            s.selections = {lv: Selection(Offset(4, top), Offset(len(rows[-1]), len(rows) - 1))}
+            s.action_copy_text()
+            assert copied[-1] == "\n".join(lines)
+            # Part of the wrapped line, across its wrap: its text, without the rows' indent.
+            s.selections = {lv: Selection(Offset(30, len(rows) - 2), Offset(14, len(rows) - 1))}
+            s.action_copy_text()
+            part = copied[-1]
+            assert part and "         " not in part and part in s._display(lines[1])
+            # Copying the whole screen takes the pane's lines as logged too.
+            dump = screen_dump(s)
+            assert lines[0] in dump and lines[1].rstrip() in dump and "── " not in dump
+            # With nothing highlighted, ctrl+c copies the log as s saves it (from the lines the
+            # tail cached, as its worker caches them): as the lines came.
+            s._cache.append_entries(s._current_source, [{"_raw": line} for line in lines])
+            assert s._exported_text(s._current_source, []) == "\n".join(lines)
+            s.selections = {}
+            count = len(copied)
+            s.action_copy_text()
+            assert await _pause_until(pilot, lambda: len(copied) > count)
+            assert copied[-1] == "\n".join(lines)
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_the_sub_job_list_names_each_sub_job_by_its_type_as_the_preview_does():
+    c = _client()
+    c.get_job.return_value = {"status": "RUNNING", "sub_jobs": [
+        {"sub_job_id": "7:training:0", "job_type": "training"},
+        {"sub_job_id": "7:log_probability:0", "job_type": "LOG_PROBABILITY"}]}
+
+    async def run():
+        app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+        async with app.run_test() as pilot:
+            assert await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen)
+                               and len(app.screen.query("#sources ListItem")) == 2)
+            labels = [str(item.query_one(Label).render()) for item in app.screen.query("#sources ListItem")]
+            assert "log_prob #0" in labels[1] and "log_probability" not in labels[1]
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_the_day_rule_comes_back_on_top_as_the_oldest_lines_go(monkeypatch):
+    from cortex_training.tui.log_style import DAY_KIND
+
+    monkeypatch.setattr(LogScreen, "_MAX_LINES", 10)
+
+    async def run():
+        app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+        async with app.run_test() as pilot:
+            s = await _open_live_tail(app, pilot)
+            for page in range(3):
+                _live_page(s, [f"2026-10-17T05:00:{page * 10 + i:02d}Z INFO line {page}-{i}" for i in range(10)])
+            lv = s._logview
+            assert len(s._shown_lines) == 10 and s._shown_lines[0].endswith("line 2-0")
+            assert lv.row_kinds[0] == DAY_KIND and lv.row_kinds.count(DAY_KIND) == 1
+            assert len(lv.lines) == sum(s._shown_rows) == s._rows_total
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_e_jumps_to_the_errors_and_the_bar_says_where_the_reader_is():
+    def bar(s):
+        return str(s.query_one("#log-live", Static).render()), str(s.query_one("#log-chips", Static).render())
+
+    async def run():
+        app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
+        async with app.run_test(size=(120, 30)) as pilot:
+            s = await _open_live_tail(app, pilot)
+            _live_page(s, ["2026-10-18T12:00:00Z ERROR first failure", *(f"line {i}" for i in range(60)),
+                           "2026-10-18T12:01:00Z ERROR second failure", "line after"])
+            await pilot.pause()
+            assert bar(s)[0] == "● LIVE · following"
+            await pilot.press("e")  # from the end of the log: the newest error
+            await pilot.pause()
+            marked = s._line_at_row(s._logview.mark[0])
+            assert s._shown_lines[marked].endswith("second failure") and s._jump == ("error", 2, 2)
+            assert s._paused and "PAUSED" in app.sub_title and bar(s)[1].strip() == "error 2/2"
+            await pilot.press("e")  # round past the end, to the first
+            await pilot.pause()
+            assert s._shown_lines[s._line_at_row(s._logview.mark[0])].endswith("first failure")
+            assert s._jump == ("error", 1, 2)
+            # A re-wrap (a resize) while paused keeps the mark and the chip.
+            width = s._content_width()
+            s._content_width = lambda: width - 20
+            s._rewrap()
+            assert await _pause_until(pilot, lambda: s._repaint_job is None and s._wrap_width == width - 20)
+            assert s._shown_lines[s._line_at_row(s._logview.mark[0])].endswith("first failure")
+            assert s._jump == ("error", 1, 2) and bar(s)[1].strip() == "error 1/2"
+            # An error that comes while paused counts at once.
+            _live_page(s, ["2026-10-18T12:02:00Z ERROR third failure"])
+            await pilot.pause()
+            assert s._jump == ("error", 1, 3) and bar(s)[1].strip() == "error 1/3"
+            await pilot.press("N")  # n / N stop at warnings too: problems
+            await pilot.pause()
+            assert s._jump == ("problem", 3, 3) and bar(s)[1].strip() == "problem 3/3"
+            _live_page(s, ["line new"])
+            await pilot.pause()
+            assert bar(s)[0] == "⏸ PAUSED · 2 new lines · p resumes"  # (the third failure, and this)
+            await pilot.press("p")
+            await pilot.pause()
+            assert not s._paused and s._logview.mark is None and s._jump is None
+            assert bar(s)[0] == "● LIVE · following"
+            # Scrolled up, not paused (the subtitle says no PAUSED): the bar says so, and p follows again.
+            s._logview.scroll_home(animate=False, immediate=True)
+            await pilot.pause()
+            assert bar(s)[0] == "↑ SCROLLED UP · p follows" and "PAUSED" not in app.sub_title
+            await pilot.press("p")
+            await pilot.pause()
+            assert not s._paused and bar(s)[0] == "● LIVE · following"
             await _settle(app, pilot)
 
     asyncio.run(run())
@@ -2574,7 +2793,7 @@ def _highlighted_columns(app, y, table) -> list:
 
 
 def _first_job_line(lines) -> int:
-    return next(y for y, line in enumerate(lines) if line[4:6] in ("▸ ", "▾ "))
+    return next(y for y, line in enumerate(lines) if line[1:3] in ("▸ ", "▾ "))  # after the cell padding
 
 
 async def _copied(app, pilot, copied):
@@ -2612,13 +2831,46 @@ async def _run_a_drag_in_a_job_list_cell_highlights_and_copies_just_its_text():
         assert _highlighted_columns(app, y + 3, table) == list(range(10, 21))
         x = lines[table.region.y].index("Created")  # the column names, over the column scrolled into view
         await _drag(mouse, (x, y + 5), (x + 10, y + 5), via=[(x + 5, y + 5)])
-        assert await _copied(app, pilot, copied) == lines[y + 5][x:x + 11]
+        # The Created cell covered whole copies as the time itself; the Duration cell's start as drawn.
+        assert re.fullmatch(r"\d{4}-\d\d-\d\d \d\d:\d\d  " + re.escape(lines[y + 5][x + 10]),
+                            await _copied(app, pilot, copied))
         assert _highlighted_columns(app, y + 5, table) == list(range(x, x + 11))
         await _settle(app, pilot)
 
 
 def test_a_drag_in_a_job_list_cell_highlights_and_copies_just_its_text():
     asyncio.run(_run_a_drag_in_a_job_list_cell_highlights_and_copies_just_its_text())
+
+
+async def _run_a_double_click_that_opens_a_job_leaves_the_list_unhighlighted():
+    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    async with app.run_test(size=(150, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        mouse = _pointer(app, pilot)
+        lines = _screen_lines(app)
+        first = _first_job_line(lines)
+        y = _first_job_line([""] * (first + 1) + lines[first + 1:])  # the second job: not under the cursor
+        # A double-click on a job: the first click puts the cursor on it, the second opens it.
+        # Textual highlights a whole widget on a double-click; on the table that would be
+        # every row, under the preview, there on coming back.
+        await _click(mouse, 20, y)
+        assert not isinstance(app.screen, JobSummaryScreen)
+        await _click(mouse, 20, y)
+        assert await _pause_until(pilot, lambda: isinstance(app.screen, JobSummaryScreen))
+        assert app._chained_clicks == 2
+        await pilot.press("b")
+        assert await _pause_until(pilot, lambda: app.screen is screen)
+        await pilot.pause(0.1)
+        assert screen.selections == {}
+        assert table.text_selection is None
+        assert app.focused is table
+        lines = _screen_lines(app)
+        assert not any(_highlighted_columns(app, row, table) for row in range(y, y + 10)), lines[y:y + 10]
+        await _settle(app, pilot)
+
+
+def test_a_double_click_that_opens_a_job_leaves_the_list_unhighlighted():
+    asyncio.run(_run_a_double_click_that_opens_a_job_leaves_the_list_unhighlighted())
 
 
 async def _run_a_click_on_the_sort_s_name_or_arrow_changes_it():
@@ -2684,8 +2936,15 @@ async def _run_a_drag_across_job_list_rows_copies_that_span():
         lines = [line[:width] for line in _screen_lines(app)]
         y = _first_job_line(lines)
         await _drag(mouse, (20, y), (60, y + 3), via=[(30, y + 1), (50, y + 2)])
-        assert await _copied(app, pilot, copied) == "\n".join(
-            [lines[y][20:].rstrip(), lines[y + 1].rstrip(), lines[y + 2].rstrip(), lines[y + 3][:61].rstrip()])
+        text = await _copied(app, pilot, copied)
+        first, *_middle, last = text.split("\n")
+        assert len(text.split("\n")) == 4
+        # Cells covered in part copy as drawn; cells covered whole as their copy text: times
+        # in full, each status as its word, no glyph and no relative age.
+        assert first.startswith(lines[y][20:40]) and last.startswith(lines[y + 3][:40])
+        assert last.endswith(lines[y + 3][56:61]) and "PENDING" in last
+        assert re.search(r"\d{4}-\d\d-\d\d \d\d:\d\d", first) and "ago" not in text
+        assert not set("●◔◐○✕⊘✓") & set(text)
         # Drawn over the same characters (a line's trailing blank isn't copied, nor drawn).
         assert _highlighted_columns(app, y, table) == list(range(20, len(lines[y].rstrip())))
         assert _highlighted_columns(app, y + 1, table) == list(range(len(lines[y + 1].rstrip())))
@@ -2739,10 +2998,10 @@ async def _run_job_list_clicks_still_click_with_text_selection():
         await pilot.pause()
         # A click on a job's ▾ folds it.
         rows = table.row_count
-        assert lines[y][4] == "▾"
-        await _click(mouse, 4, y)
+        assert lines[y][1] == "▾"
+        await _click(mouse, 1, y)
         assert await _wait(pilot, app, lambda: table.row_count < rows)
-        assert _screen_lines(app)[y][4] == "▸"
+        assert _screen_lines(app)[y][1] == "▸"
         # A click on the cursor's row opens the job's preview.
         await _click(mouse, 60, y)
         await _click(mouse, 60, y)
@@ -2790,7 +3049,11 @@ async def _run_a_job_list_row_s_text_is_its_cells_as_drawn():
             read = 0
             for row in table.ordered_rows:
                 plain = table._plain_parts(row.key)
-                if plain is not None:
+                if str(row.key.value).startswith("hdr-"):
+                    # A LIVE/HISTORY heading's rule is drawn, but not in a copy of its text.
+                    assert plain is not None and "─" not in "".join(plain)
+                    assert "─" in "".join(table._drawn_parts(row.key, 0))
+                elif plain is not None:
                     read += 1
                     assert plain == table._drawn_parts(row.key, 0)
             assert read and (width < 130 or read > table.row_count // 2)
@@ -3488,9 +3751,10 @@ def test_an_ended_job_without_an_end_time_gets_no_upload_hint():
 TUI_CALLS = ("get_job", "list_jobs", "list_jobs_page", "for_job", "tail_logs", "download_metrics",
              "download_stdout_logs", "fetch_execution_logs")
 # Parameters of the real client the demo leaves out: the TUI never passes them, or
-# checks the client's signature for them first (sub_job_ids, on_chunk, stale_after_seconds).
+# checks the client's signature for them first (sub_job_ids, on_chunk, stale_after_seconds,
+# and a download's preview).
 _ENGINE = {"max_workers", "progress", "on_chunk", "sub_job_ids", "strict", "stale_after_seconds",
-           "transfer_timeout_seconds"}
+           "transfer_timeout_seconds", "preview_seconds", "on_preview"}
 NOT_IN_DEMO = {
     "tail_logs": {"sub_job_type"},
     "download_metrics": _ENGINE,
@@ -3765,32 +4029,1135 @@ def test_the_keys_do_what_their_context_means():
     asyncio.run(_run_the_keys_do_what_their_context_means())
 
 
+class _GatedDemo(DemoClient):
+    """A demo whose job lists (schema and account-level) answer only once ``gate`` is set."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.gate = threading.Event()
+        self.gate.set()
+
+    def list_jobs(self, *args, **kwargs):
+        self.gate.wait(10)
+        return super().list_jobs(*args, **kwargs)
+
+    def list_jobs_page(self, **kwargs):
+        self.gate.wait(10)
+        return super().list_jobs_page(**kwargs)
+
+
+async def _run_a_says_at_once_that_it_is_loading_all_schemas(in_flight):
+    client = _GatedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        assert "Current schema: " in app.sub_title
+        client.gate.clear()
+        if in_flight:
+            # A refresh is reading when a comes: a waits for it, and says so meanwhile.
+            screen._refresh_jobs()
+            assert screen._refreshing
+        await pilot.press("a")
+        await pilot.pause(0.1)
+        # The header names the list a asked for at once, not the one it replaces.
+        assert app.sub_title.startswith("loading all schemas…"), app.sub_title
+        assert "Current schema" not in app.sub_title
+        client.gate.set()
+        assert await _pause_until(pilot, lambda: "all schemas" in app.sub_title
+                                  and not app.sub_title.startswith("loading"), seconds=10.0), app.sub_title
+        client.gate.clear()
+        await pilot.press("a")
+        await pilot.pause(0.1)
+        assert app.sub_title.startswith("loading the current schema, "), app.sub_title
+        client.gate.set()
+        assert await _pause_until(pilot, lambda: "Current schema: " in app.sub_title, seconds=10.0), app.sub_title
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("in_flight", [False, True], ids=["idle", "refresh-in-flight"])
+def test_a_says_at_once_that_it_is_loading_all_schemas(in_flight):
+    asyncio.run(_run_a_says_at_once_that_it_is_loading_all_schemas(in_flight))
+
+
+class _PagedDemo(DemoClient):
+    """A demo whose account-wide pages of the newest jobs answer one per ``release()`` while
+    ``gated``, and whose active jobs' walk (read beside them) answers while ``active_gate`` is
+    set. For the newest jobs' walk: ``fail_at`` is the page (1 is the first) that fails,
+    ``unavailable_at`` the one that answers the list is not deployed, ``bad_token_at`` the one
+    whose token the service can't open (once), ``running_at`` / ``unknown_at`` the one whose first
+    job is running / of unknown status. ``schema_fails``: the configured schema's list fails.
+    ``pages`` / ``active_pages`` count the pages each walk asked for."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.gated = False
+        self.fail_at = self.unavailable_at = self.bad_token_at = self.running_at = self.unknown_at = None
+        self.schema_fails = False
+        self.schema_gate = threading.Event()  # the configured schema's list answers while it is set
+        self.schema_gate.set()
+        self.active_gate = threading.Event()
+        self.active_gate.set()
+        self.pages = self.active_pages = 0
+        self._permits = threading.Semaphore(0)
+
+    def release(self, pages: int = 1) -> None:
+        for _ in range(pages):
+            self._permits.release()
+
+    def list_jobs(self, *args, **kwargs):
+        self.schema_gate.wait(10)
+        if self.schema_fails:
+            raise ConnectionError("schema down")
+        return super().list_jobs(*args, **kwargs)
+
+    def list_jobs_page(self, **kwargs):
+        if kwargs.get("status"):  # the active jobs' walk, read beside the newest
+            self.active_pages += 1
+            self.active_gate.wait(10)
+            return super().list_jobs_page(**kwargs)
+        self.pages += 1
+        if self.gated:
+            self._permits.acquire(timeout=10)
+        page = int(kwargs.get("page_token") or 0) // self._ACCOUNT_PAGE_ROWS + 1
+        if not kwargs.get("status"):
+            if page == self.fail_at:
+                raise ConnectionError("connection reset")
+            if page == self.unavailable_at:
+                raise AccountJobListUnavailable("the account-level list is not deployed",
+                                                reason=AccountJobListUnavailable.NOT_DEPLOYED)
+            if page == self.bad_token_at:
+                self.bad_token_at = None
+                raise InvalidPageToken("400 Invalid page_token")
+        answer = super().list_jobs_page(**kwargs)
+        if page == self.running_at and not kwargs.get("status") and answer["jobs"]:
+            answer["jobs"][0]["status"] = "RUNNING"  # an older job still running: it shows under LIVE
+        if page == self.unknown_at and not kwargs.get("status") and answer["jobs"]:
+            answer["jobs"][0]["status"] = "UNKNOWN"  # live, but no status filter lists it
+        return answer
+
+
+def _info_text(screen) -> str:
+    """The line above the list, as text."""
+    info = screen._info
+    return info.plain if not isinstance(info, tuple) else "  ".join(part.plain for part in [*info[0], info[1]])
+
+
+def _all_at_once(client) -> tuple:
+    """The account-wide list's job keys and scope as read all at once (no page shown before the last)."""
+    listing = JobLister(client, account_wide=True).load(datetime.now(timezone.utc))
+    return {views.job_key(job) for job in listing.jobs}, listing.scope
+
+
+async def _run_all_schemas_shows_each_page_as_it_comes(refill):
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 30)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        if refill:
+            screen._PATCH_REMOVALS = -1  # each page fills the table again (as when many rows go)
+        rows = client._ACCOUNT_PAGE_ROWS
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        # The first page shows before the others answer, saying how far the list is.
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == rows, seconds=10.0), len(screen._all_jobs)
+        await pilot.pause(0.2)
+        assert screen._scope.kind == ACCOUNT and screen._scope.loading and screen._refreshing
+        # The active jobs, read beside the newest (at once, here): the active statuses' counts are whole;
+        # the history, the unknown count and the LIVE row (an unknown job may still come) are not.
+        assert await _pause_until(pilot, lambda: screen._scope.active_read, seconds=10.0)
+        assert app.sub_title == f"all schemas  ·  loading older jobs… {rows} so far + every active job", (
+            app.sub_title)
+        live_part, history_part = _info_text(screen).split("│")
+        assert "running so far" not in live_part and "in history so far" in history_part, _info_text(screen)
+        assert all(row.endswith("…") for row in _group_rows(table).values()), _group_rows(table)
+
+        client.release()
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 2 * rows, seconds=10.0)
+        await pilot.pause(0.2)
+        # The reader's place: a row partway down, the view scrolled, a live job folded, a history one unfolded.
+        live = next(j for j in screen._all_jobs if views.is_live(j) and screen._expandable(j))
+        ended = next(j for j in screen._all_jobs if not views.is_live(j) and views.sub_jobs(j))
+        screen._toggle(screen._job_key(live), False)
+        screen._toggle(screen._job_key(ended), True)
+        await pilot.pause(0.1)
+        table.focus()
+        await pilot.pause(0.1)
+        top = int(table.max_scroll_y)  # scrolled to the end, the cursor near the view's top
+        assert top > 0
+        table.move_cursor(row=top + 3, animate=False, scroll=False)
+        table.scroll_to(y=top, animate=False, immediate=True)
+        await pilot.pause(0.2)
+        assert table.scroll_y == top
+        key = screen._highlighted()[0]
+        line = table.cursor_row - round(table.scroll_y)
+
+        client.release()
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 3 * rows, seconds=10.0)
+        await pilot.pause(0.3)
+        assert screen._highlighted()[0] == key  # the same row is highlighted, on the same line
+        assert table.cursor_row - round(table.scroll_y) == line, (table.cursor_row, table.scroll_y, line)
+        assert not screen._is_expanded(live) and screen._is_expanded(ended)
+
+        # A search while the list loads covers what has loaded, and says it is not all.
+        await pilot.press("slash", *"status:done", "enter")
+        assert await _pause_until(pilot, lambda: " so far for status:done" in _info_text(screen)), _info_text(screen)
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        await pilot.pause(0.2)
+        assert screen._filter == "status:done"
+        assert "so far" not in _info_text(screen) and re.search(r"match(es)? for status:done", _info_text(screen))
+        # Whole: what the list read all at once would have shown.
+        keys, scope = _all_at_once(DemoClient())
+        assert {screen._job_key(job) for job in screen._all_jobs} == keys and screen._scope == scope
+        assert app.sub_title.endswith("  ·  " + scope_text(scope, location="")), app.sub_title
+        assert not any(str(table.get_row_at(i)[0]).endswith("…") for i in range(table.row_count))
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("refill", [False, True], ids=["in-place", "refilled"])
+def test_all_schemas_shows_each_page_as_it_comes(refill):
+    asyncio.run(_run_all_schemas_shows_each_page_as_it_comes(refill))
+
+
+async def _run_a_cursor_on_a_group_row_stays_on_it_as_pages_come():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 30)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading, seconds=10.0)
+        await pilot.pause(0.2)
+        table.focus()
+        table.move_cursor(row=table.get_row_index("hdr-history"), animate=False)
+        await pilot.pause(0.2)
+        line = table.cursor_row - round(table.scroll_y)
+        for pages in (2, 3):
+            client.release()
+            assert await _pause_until(pilot, lambda: len(screen._all_jobs) == pages * client._ACCOUNT_PAGE_ROWS,
+                                      seconds=10.0)
+            await pilot.pause(0.3)
+            assert screen._highlighted()[0] == "hdr-history", screen._highlighted()
+            assert table.cursor_row - round(table.scroll_y) == line
+        client.release(10)
+        await _settle(app, pilot)
+
+
+async def _run_a_list_the_reader_has_not_moved_stays_at_its_top_as_live_jobs_come():
+    client = _PagedDemo()
+    client.running_at = 3  # an older job still running comes on page 3, above the cursor
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading, seconds=10.0)
+        # The list puts the cursor on a history job (as it keeps the one a schema list had).
+        first_ended = next(j for j in views.sort_job_list(screen._all_jobs, "created", True) if not views.is_live(j))
+        screen._render_jobs(keep=screen._job_key(first_ended))
+        await pilot.pause(0.3)
+        key = screen._highlighted()[0]
+        assert table.scroll_y == 0 and screen._job_by_item.get(key) == screen._job_key(first_ended)
+        client.release(2)
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 3 * client._ACCOUNT_PAGE_ROWS,
+                                  seconds=10.0)
+        await pilot.pause(0.3)
+        late = next(job for job in screen._all_jobs if views.is_live(job) and screen._job_key(job) not in {
+            screen._job_key(j) for j in views.sort_job_list(screen._all_jobs, "created", True)[:10]})
+        assert table.get_row_index(screen._row_key(screen._job_key(late))) < table.cursor_row  # it came above
+        assert table.max_scroll_y > 0  # and the list is taller than the view
+        assert table.scroll_y == 0 and screen._highlighted()[0] == key  # LIVE, all of it, still in view
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        await pilot.pause(0.3)
+        assert table.scroll_y == 0 and screen._highlighted()[0] == key
+        await _settle(app, pilot)
+
+
+def test_a_list_the_reader_has_not_moved_stays_at_its_top_as_live_jobs_come():
+    asyncio.run(_run_a_list_the_reader_has_not_moved_stays_at_its_top_as_live_jobs_come())
+
+
+async def _run_a_reader_who_moved_keeps_their_line_on_every_page_after(how):
+    client = _PagedDemo()
+    client.running_at = 3  # a running job comes on page 3, above the cursor
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading, seconds=10.0)
+        await pilot.pause(0.2)
+        table.focus()
+        table.move_cursor(row=table.get_row_index("hdr-history") + 2, animate=False)  # the reader moves
+        await pilot.pause(0.2)
+        if how == "fold":  # and folds the job there, which draws the list again with the cursor on it
+            screen._toggle(screen._highlighted()[1], True)
+            await pilot.pause(0.2)
+        key, line = screen._highlighted()[0], table.cursor_row - round(table.scroll_y)
+        assert table.scroll_y == 0
+        for pages in (2, 3):  # page 2 draws the list with the cursor on the reader's row; page 3 too
+            client.release()
+            assert await _pause_until(pilot, lambda: len(screen._all_jobs) == pages * client._ACCOUNT_PAGE_ROWS,
+                                      seconds=10.0)
+            await pilot.pause(0.3)
+            assert screen._highlighted()[0] == key
+            assert table.cursor_row - round(table.scroll_y) == line, (pages, table.cursor_row, table.scroll_y, line)
+        client.release(10)
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("how", ["moved", "fold"])
+def test_a_reader_who_moved_keeps_their_line_on_every_page_after(how):
+    asyncio.run(_run_a_reader_who_moved_keeps_their_line_on_every_page_after(how))
+
+
+async def _run_e_unfolds_the_jobs_of_later_pages_too_and_then_folds_them_all():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading, seconds=10.0)
+        table.focus()
+        await pilot.press("e")
+
+        def expandable():
+            return [job for job in screen._all_jobs if screen._expandable(job)]
+
+        assert all(screen._is_expanded(job) for job in expandable())
+        client.release()
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 2 * client._ACCOUNT_PAGE_ROWS,
+                                  seconds=10.0)
+        await pilot.pause(0.2)
+        assert any(not views.is_live(job) for job in expandable())  # history jobs that unfold came
+        assert all(screen._is_expanded(job) for job in expandable())  # unfolded, as e asked
+        await pilot.press("e")
+        assert not any(screen._is_expanded(job) for job in expandable())  # every one folds
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        assert not any(screen._is_expanded(job) for job in expandable())
+        await _settle(app, pilot)
+
+
+def test_e_unfolds_the_jobs_of_later_pages_too_and_then_folds_them_all():
+    asyncio.run(_run_e_unfolds_the_jobs_of_later_pages_too_and_then_folds_them_all())
+
+
+async def _run_e_holds_for_its_list_and_jobs_a_refresh_adds_start_as_usual(fold):
+    from cortex_training.tui.account import Listing
+    from cortex_training.tui.account import ListScope
+    app = CortexTrainingLogTUI(_PagedDemo(), poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        table.focus()
+        await pilot.press("e")  # every job unfolded
+        if fold:
+            await pilot.press("e")  # then every job folded
+        listed = [job for job in screen._all_jobs if screen._expandable(job)]
+        assert all(screen._is_expanded(job) is not fold for job in listed)
+        live = next(job for job in listed if views.is_live(job))
+        ended = next(job for job in listed if not views.is_live(job))
+        # A refresh lands with a live job and an ended one new since.
+        new_live = {**live, "job_id": "new-live-job", "created_at": live.get("created_at")}
+        new_ended = {**ended, "job_id": "new-ended-job"}
+        refreshed = [*screen._all_jobs, new_live, new_ended]
+        screen._on_jobs(Listing(refreshed, ListScope(SCHEMA)), None, False, screen._load_gen)
+        await pilot.pause(0.2)
+        assert all(screen._is_expanded(job) is not fold for job in listed)  # e's choice holds for them
+        by_id = {views.job_id_of(job): job for job in screen._all_jobs}
+        assert screen._is_expanded(by_id["new-live-job"]) and not screen._is_expanded(by_id["new-ended-job"])
+        assert screen._all_folded is None
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("fold", [False, True], ids=["unfolded", "folded"])
+def test_e_holds_for_its_list_and_jobs_a_refresh_adds_start_as_usual(fold):
+    asyncio.run(_run_e_holds_for_its_list_and_jobs_a_refresh_adds_start_as_usual(fold))
+
+
+async def _run_a_that_stops_the_pages_says_at_once_what_the_list_on_screen_is():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release(2)
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 2 * client._ACCOUNT_PAGE_ROWS,
+                                  seconds=10.0)
+        await pilot.pause(0.2)
+        client.schema_gate.clear()  # the configured schema's list takes its time
+        await pilot.press("a")
+        await pilot.pause(0.2)
+        assert app.sub_title == (f"loading the current schema, {screen._schema_label()}…  ·  "
+                                 "showing the partial all-schemas list"), app.sub_title
+        assert "so far" not in _info_text(screen)
+        assert not any(str(table.get_row_at(i)[0]).endswith("…") for i in range(table.row_count))
+        client.schema_gate.set()
+        assert await _pause_until(pilot, lambda: screen._scope.kind == SCHEMA, seconds=10.0)
+        assert app.sub_title.endswith("Current schema: " + screen._schema_label()), app.sub_title
+        client.release(10)
+        await _settle(app, pilot)
+
+
+def test_a_that_stops_the_pages_says_at_once_what_the_list_on_screen_is():
+    asyncio.run(_run_a_that_stops_the_pages_says_at_once_what_the_list_on_screen_is())
+
+
+def _group_rows(table) -> dict:
+    """The LIVE and HISTORY rows' text, by group."""
+    rows = [str(table.get_row_at(i)[0]) for i in range(table.row_count)]
+    return {row.split()[0]: row for row in rows if row.startswith(("LIVE", "HISTORY"))}
+
+
+async def _run_an_unknown_job_keeps_the_live_count_open_until_the_newest_jobs_are_in():
+    client = _PagedDemo()
+    client.unknown_at = 3  # an unknown job comes on page 3: live, but not among the active jobs
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        rows = client._ACCOUNT_PAGE_ROWS
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading and screen._scope.active_read, seconds=10.0)
+        await pilot.pause(0.2)
+
+        def unknown() -> int:  # live ones (one the control plane has no record of has ended)
+            return sum(views.is_unknown(job) and views.is_live(job) for job in screen._all_jobs)
+
+        live_part, _history = _info_text(screen).split("│")
+        # The active statuses are whole; the unknown count (and so LIVE) may still grow.
+        assert "running so far" not in live_part and live_part.count("so far") == 1, live_part
+        assert f"{unknown()} unknown so far" in live_part, live_part
+        assert _group_rows(table)["LIVE"].endswith("…")
+        before = unknown()
+        client.release(2)
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 3 * rows, seconds=10.0)
+        await pilot.pause(0.2)
+        assert unknown() == before + 1  # page 3 brought one, after the active jobs were all listed
+        live_part, _history = _info_text(screen).split("│")
+        assert f"{unknown()} unknown so far" in live_part and live_part.count("so far") == 1
+        assert _group_rows(table)["LIVE"].endswith("…")
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        await pilot.pause(0.2)
+        assert "so far" not in _info_text(screen) and "unknown" in _info_text(screen)
+        assert not any(row.endswith("…") for row in _group_rows(table).values())
+        await _settle(app, pilot)
+
+
+def test_an_unknown_job_keeps_the_live_count_open_until_the_newest_jobs_are_in():
+    asyncio.run(_run_an_unknown_job_keeps_the_live_count_open_until_the_newest_jobs_are_in())
+
+
+async def _run_a_slow_active_jobs_walk_after_the_newest_are_in(monkeypatch, then):
+    from cortex_training.tui import account
+    monkeypatch.setattr(account, "ACCOUNT_LIST_MAX_PAGES", 2)  # the newest jobs' walk stops after 2 pages
+    client = _PagedDemo()
+    client.active_gate.clear()  # the active jobs' walk takes its time
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        newest = 2 * client._ACCOUNT_PAGE_ROWS
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: screen._scope.loading == "active", seconds=10.0), app.sub_title
+        await pilot.pause(0.2)
+        # The history is whole; only the live jobs may grow, and the header says what is still read.
+        assert app.sub_title == f"all schemas  ·  newest {newest}; loading older active jobs…", app.sub_title
+        live_part, history_part = _info_text(screen).split("│")
+        assert "so far" in live_part and "so far" not in history_part, _info_text(screen)
+        groups = _group_rows(table)
+        assert groups["LIVE"].endswith("…") and not groups["HISTORY"].endswith("…"), groups
+        await pilot.press("r")
+        said = [str(note.message) for note in app._notifications]
+        assert any(m.startswith("Still loading older active jobs (") for m in said), said
+        if then == "wait":
+            client.active_gate.set()
+            assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+            assert app.sub_title.endswith(f"first 2 pages: {newest} jobs + every active job (more may exist)"), (
+                app.sub_title)
+        else:  # a, while the load waits for the active jobs: it stops, and nothing of it comes after
+            await pilot.press("a")
+            assert await _pause_until(pilot, lambda: screen._scope.kind == SCHEMA, seconds=10.0), app.sub_title
+            client.active_gate.set()
+            await pilot.pause(0.5)
+            assert screen._scope.kind == SCHEMA and app.sub_title.endswith("Current schema: " + screen._schema_label())
+            assert client.active_pages == 1  # the walk asked for no page after the one in flight
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("then", ["wait", "a"])
+def test_a_slow_active_jobs_walk_after_the_newest_are_in(monkeypatch, then):
+    asyncio.run(_run_a_slow_active_jobs_walk_after_the_newest_are_in(monkeypatch, then))
+
+
+def test_a_cursor_on_a_group_row_stays_on_it_as_pages_come():
+    asyncio.run(_run_a_cursor_on_a_group_row_stays_on_it_as_pages_come())
+
+
+async def _run_a_fresh_list_of_pages_shows_no_earlier_failure(how):
+    client = _PagedDemo()
+    client.schema_fails = how == "r"
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        if how == "a":  # a refresh of the configured schema's list fails, then a
+            screen, _table = await _demo_list(app, pilot)
+            notice = screen.query_one("#listnotice", Static)
+            client.schema_fails = True
+            screen._refresh_jobs(manual=True)
+            assert await _pause_until(pilot, lambda: notice.display, seconds=10.0)
+            client.gated = True
+            await pilot.press("a")
+        else:  # the first load fails, and r reads all schemas (the list's own, shared lister's)
+            assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen)
+                               and app.screen._list_error, tries=400)
+            screen = app.screen
+            notice = screen.query_one("#listnotice", Static)
+            assert "list_jobs failed" in app.screen.query_one("#listinfo", Static).render().plain
+            screen._lister.account_wide = True
+            client.gated = True
+            await pilot.press("r")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope is not None and screen._scope.loading,
+                                  seconds=10.0), app.sub_title
+        await pilot.pause(0.2)
+        assert not notice.display and screen._list_error is None
+        assert not screen.query_one("#listinfo", Static).has_class("error")
+        assert app.sub_title.startswith("all schemas  ·  loading older jobs…"), app.sub_title
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        assert not notice.display and "failed" not in app.sub_title
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("how", ["a", "r"])
+def test_a_fresh_list_of_pages_shows_no_earlier_failure(how):
+    asyncio.run(_run_a_fresh_list_of_pages_shows_no_earlier_failure(how))
+
+
+async def _run_a_failure_of_the_schema_list_after_a_stopped_the_pages_is_the_schema_lists():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.loading, seconds=10.0)
+        client.schema_fails = True
+        await pilot.press("a")  # back to the configured schema, whose list fails
+        assert await _pause_until(pilot, lambda: not screen._refreshing and screen._list_error, seconds=10.0)
+        await pilot.pause(0.2)
+        assert app.sub_title.startswith("refresh failed "), app.sub_title
+        assert "schema down" in screen._notice.plain and "read before it" not in screen._notice.plain
+        assert screen.check_action("show_list", ("account",)) is True  # the footer offers all schemas
+        client.release(10)
+        await _settle(app, pilot)
+
+
+def test_a_failure_of_the_schema_list_after_a_stopped_the_pages_is_the_schema_lists():
+    asyncio.run(_run_a_failure_of_the_schema_list_after_a_stopped_the_pages_is_the_schema_lists())
+
+
+async def _run_an_account_list_unavailable_after_its_first_pages_says_so():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        schema_jobs = len(screen._all_jobs)
+        client.unavailable_at = 3
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: "Current schema only: " in app.sub_title, seconds=10.0), (
+            app.sub_title)
+        assert "no account-wide list yet" in app.sub_title
+        assert screen._scope.kind == SCHEMA and len(screen._all_jobs) == schema_jobs
+        assert screen.check_action("show_list", ("account",)) is True
+        assert any("Can't show all schemas" in str(n.message) for n in app._notifications)
+        await _settle(app, pilot)
+
+
+def test_an_account_list_unavailable_after_its_first_pages_says_so():
+    asyncio.run(_run_an_account_list_unavailable_after_its_first_pages_says_so())
+
+
+async def _run_pages_read_again_from_the_start_keep_the_list_and_the_cursor():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 30)) as pilot:
+        screen, table = await _demo_list(app, pilot)
+        rows = client._ACCOUNT_PAGE_ROWS
+        client.gated, client.bad_token_at = True, 3
+        await pilot.press("a")
+        client.release(2)
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 2 * rows, seconds=10.0)
+        await pilot.pause(0.2)
+        shown = []
+        apply = screen._on_partial
+        screen._on_partial = lambda gen, listing: (shown.append(len(listing.jobs)), apply(gen, listing))
+        table.focus()
+        table.move_cursor(row=table.row_count - 2, animate=False)
+        await pilot.pause(0.2)
+        key, line = screen._highlighted()[0], table.cursor_row - round(table.scroll_y)
+        client.release(4)  # page 3's token fails: pages 1 and 2 again, then page 3
+        assert await _pause_until(pilot, lambda: len(screen._all_jobs) == 3 * rows, seconds=10.0)
+        await pilot.pause(0.3)
+        assert min(shown) == 2 * rows  # the list never went back to its first page
+        assert screen._highlighted()[0] == key and table.cursor_row - round(table.scroll_y) == line
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        keys, scope = _all_at_once(DemoClient())
+        assert {screen._job_key(job) for job in screen._all_jobs} == keys and screen._scope == scope
+        await _settle(app, pilot)
+
+
+def test_pages_read_again_from_the_start_keep_the_list_and_the_cursor():
+    asyncio.run(_run_pages_read_again_from_the_start_keep_the_list_and_the_cursor())
+
+
+async def _run_a_or_r_while_all_schemas_loads_supersedes_it_cleanly():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        schema_jobs = len(screen._all_jobs)
+        client.gated = True
+        await pilot.press("a")
+        client.release()
+        assert await _pause_until(pilot, lambda: screen._scope.kind == ACCOUNT and screen._scope.loading,
+                                  seconds=10.0)
+        await pilot.pause(0.2)
+        asked = client.pages  # the first page, and the second one waiting
+        # r and the timed refresh wait for the load: no second walk starts.
+        await pilot.press("r")
+        screen._refresh_tick()
+        await pilot.pause(0.2)
+        assert client.pages == asked and screen._scope.loading
+        said = [str(note.message) for note in app._notifications]
+        assert any(m.startswith("Still loading older jobs (") and m.endswith("r works once it's done.")
+                   for m in said), said
+        # a goes back to the configured schema at once; the walk stops at its page in flight.
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: screen._scope.kind == SCHEMA, seconds=10.0), app.sub_title
+        client.release(10)
+        await pilot.pause(0.5)
+        assert client.pages == asked  # it asked for no page after
+        assert screen._scope.kind == SCHEMA and len(screen._all_jobs) == schema_jobs  # its pages never shown
+        assert app.sub_title.endswith("Current schema: " + screen._schema_label()), app.sub_title
+        # a again: a new walk, whole in the end.
+        client.gated = False
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: screen._scope.kind == ACCOUNT and not screen._refreshing,
+                                  seconds=10.0)
+        keys, scope = _all_at_once(DemoClient())
+        assert {screen._job_key(job) for job in screen._all_jobs} == keys and screen._scope == scope
+        await _settle(app, pilot)
+
+
+def test_a_or_r_while_all_schemas_loads_supersedes_it_cleanly():
+    asyncio.run(_run_a_or_r_while_all_schemas_loads_supersedes_it_cleanly())
+
+
+async def _run_a_page_that_fails_keeps_the_pages_read_and_r_reads_them_again():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        rows = client._ACCOUNT_PAGE_ROWS
+        client.fail_at = 3
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: not screen._refreshing and screen._scope.kind == ACCOUNT,
+                                  seconds=10.0), app.sub_title
+        await pilot.pause(0.2)
+        assert len(screen._all_jobs) == 2 * rows  # the two pages read stay
+        assert app.sub_title.startswith("load failed "), app.sub_title
+        # The active jobs, read beside the newest pages, stay listed: none is missing.
+        assert app.sub_title.endswith(f"newest {2 * rows} + every active job (the rest didn't load; r retries)"), (
+            app.sub_title)
+        notice = screen.query_one("#listnotice", Static)
+        assert notice.display and f"showing the {2 * rows} jobs read before it" in screen._notice.plain
+        client.fail_at = None
+        await pilot.press("r")
+        assert await _pause_until(pilot, lambda: not screen._refreshing and screen._list_error is None,
+                                  seconds=10.0), app.sub_title
+        keys, scope = _all_at_once(DemoClient())
+        assert {screen._job_key(job) for job in screen._all_jobs} == keys and screen._scope == scope
+        assert not notice.display
+        await _settle(app, pilot)
+
+
+def test_a_page_that_fails_keeps_the_pages_read_and_r_reads_them_again():
+    asyncio.run(_run_a_page_that_fails_keeps_the_pages_read_and_r_reads_them_again())
+
+
+async def _run_a_refresh_of_the_whole_list_shows_it_until_the_next_is_whole():
+    client = _PagedDemo()
+    app = CortexTrainingLogTUI(client, poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: screen._scope.kind == ACCOUNT and not screen._refreshing,
+                                  seconds=10.0)
+        whole = len(screen._all_jobs)
+        client.gated = True
+        screen._refresh_tick()  # the timed refresh
+        client.release(2)
+        await pilot.pause(0.5)
+        assert screen._refreshing and len(screen._all_jobs) == whole and not screen._scope.loading
+        assert "so far" not in app.sub_title
+        client.release(10)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        assert len(screen._all_jobs) == whole and not screen._scope.loading
+        await _settle(app, pilot)
+
+
+def test_a_refresh_of_the_whole_list_shows_it_until_the_next_is_whole():
+    asyncio.run(_run_a_refresh_of_the_whole_list_shows_it_until_the_next_is_whole())
+
+
+async def _run_a_keeps_why_all_schemas_are_unavailable_in_the_header(reason, why):
+    app = CortexTrainingLogTUI(DemoClient(account_list=reason), poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen, _table = await _demo_list(app, pilot)
+        await pilot.press("a")
+        assert await _pause_until(pilot, lambda: "Current schema only: " in app.sub_title, seconds=10.0), (
+            app.sub_title)
+        assert why in app.sub_title
+        assert screen.check_action("show_list", ("account",)) is True  # the footer offers a again
+        # It stays after the notice has gone, through later refreshes, until the next a.
+        screen._refresh_jobs(manual=True)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        assert why in app.sub_title
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("reason, why", [
+    (AccountJobListUnavailable.DISABLED, "account-wide list not enabled"),
+    (AccountJobListUnavailable.NOT_DEPLOYED, "no account-wide list yet"),
+])
+def test_a_keeps_why_all_schemas_are_unavailable_in_the_header(reason, why):
+    asyncio.run(_run_a_keeps_why_all_schemas_are_unavailable_in_the_header(reason, why))
+
+
 async def _run_the_group_rows_count_the_jobs_under_them():
     app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
     async with app.run_test(size=(140, 44)) as pilot:
         screen, table = await _demo_list(app, pilot)
         await pilot.pause(0.3)
-        labels = [str(column.label).strip() for column in table.ordered_columns]
-        marker, at = labels.index(""), labels.index("Job ID")
-        rows = [(table.get_row_at(i)[marker].plain, table.get_row_at(i)[at].plain)
-                for i in range(table.row_count)]
-        # Each group row says how many jobs follow it. A job's row carries a status dot;
-        # its sub-job rows do not, so they must not be counted.
+        at = [str(column.label).strip() for column in table.ordered_columns].index("Job ID")
+        rows = [(row.key.value, table.get_row_at(i)[at].plain) for i, row in enumerate(table.ordered_rows)]
+        # Each group row says how many jobs follow it; their sub-job rows must not be counted.
         counts, group, seen = {}, None, 0
-        for dot, text in rows:
-            if text.startswith(("LIVE (", "HISTORY (")):
+        for key, text in rows:
+            if text.startswith(("LIVE  ", "HISTORY  ")):
                 if group:
                     counts[group] = seen
                 group, seen = text, 0
-            elif dot.strip():
+            elif key in screen._job_by_item:
                 seen += 1
         counts[group] = seen
         assert len(counts) == 2, counts
         for header, under in counts.items():
-            said = int(header.split("(")[1].rstrip(")"))
+            said = int(header.split()[1].replace(",", ""))
             assert said == under, f"{header} has {under} job rows under it"
         await _settle(app, pilot)
 
 
 def test_the_group_rows_count_the_jobs_under_them():
     asyncio.run(_run_the_group_rows_count_the_jobs_under_them())
+
+
+def test_list_times_read_at_a_glance_and_say_how_long_they_last():
+    assert views.list_age(None)[0] == "—"
+    assert views.list_age(-30) == ("just now", 90)  # clock skew: until a minute after it
+    assert views.list_age(-7300)[0] == "in 2h"
+    assert views.list_age(20) == ("just now", 40)
+    assert views.list_age(125) == ("2m ago", 55)
+    assert views.list_age(3 * 3600 + 10) == ("3h ago", 3590)
+    assert views.list_age(45 * 86400) == ("45d ago", 86400)
+    assert all(len(views.list_age(days * 86400)[0]) <= 8 for days in (0, 9, 99, 183))  # the column is 8 cells
+    assert views.list_span(None)[0] == views.list_span(-1)[0] == "—"
+    assert views.list_span(40.25) == ("40s", 0.75)
+    assert views.list_span(12 * 60 + 5) == ("12m", 55)
+    assert views.list_span(3 * 3600 + 5 * 60) == ("3h 05m", 60)
+    assert views.list_span(2 * 86400 + 4 * 3600 + 30) == ("2d 4h", 3570)
+
+
+def test_job_list_rows_say_what_their_columns_don_t():
+    from cortex_training.tui.job_list import _ListLayout
+    from cortex_training.tui.job_list import _status_chips
+
+    jid = "a" * 36
+    assert str(JobListScreen._name_cell({"job_id": jid})) == jid  # whole: a copy of the list has it so
+    assert str(JobListScreen._name_cell({"job_id": jid}, False)) == f"▸ {jid}"
+    # Drawn (.plain) with the theme's glyph; copied (str) as the word alone.
+    cancelled = JobListScreen._status_cell("JOB_STATE_CANCELLED")
+    running = JobListScreen._status_cell("RUNNING", glyph_only=True)
+    assert (cancelled.plain, str(cancelled)) == ("⊘ CANCELLED", "CANCELLED")
+    assert (running.plain, str(running)) == ("●", "RUNNING")
+
+    job = {"job_id": "j", "status": "RUNNING", "sub_jobs": [
+        {"sub_job_id": "j:training:0", "job_type": "training", "status": "RUNNING", "model_name": "Qwen/Qwen3-8B"},
+        {"sub_job_id": "j:sampling:0", "job_type": "sampling", "status": "PLACING", "model_name": "Qwen/Qwen3-0.6B"}]}
+    same = JobListScreen._sub_cells(job, job["sub_jobs"][0], False)
+    other = JobListScreen._sub_cells(job, job["sub_jobs"][1], True)
+    assert str(same["Job ID"]) == "  ├ training #0" and same["Status"].plain == "●"
+    assert "Type" not in same  # its label has it
+    assert str(other["Job ID"]) == "  └ sampling #0" and other["Status"].plain == "◔ PLACING"
+    # The job's row says "Qwen3-8B +1": each sub-job row says which; of a one-model job, none does.
+    assert str(same["Model"]) == "Qwen3-8B" and str(other["Model"]) == "Qwen3-0.6B"
+    one_model = {**job, "sub_jobs": [{**sj, "model_name": "Qwen/Qwen3-8B"} for sj in job["sub_jobs"]]}
+    assert str(JobListScreen._sub_cells(one_model, one_model["sub_jobs"][1], True)["Model"]) == ""
+    untold = {"sub_job_id": "j:training:1", "job_type": "training"}  # no status of its own
+    assert str(JobListScreen._sub_cells(job, untold, True)["Status"]) == ""
+    assert JobListScreen._sub_cells({**job, "status": "UNKNOWN"}, untold, True)["Status"].plain == "?"
+
+    # Of several sub-jobs each says its GPUs; a job's only sub-job does where the job's row doesn't.
+    assert str(same["GPUs"]) == "—"
+    lone = {"job_id": "o", "status": "RUNNING", "hardware": "H200", "sub_jobs": [
+        {"sub_job_id": "o:training:0", "job_type": "training", "status": "RUNNING",
+         "training_config": {"n_gpus": 8}}]}
+    lone_cells = JobListScreen._sub_cells(lone, lone["sub_jobs"][0], True)
+    assert str(lone_cells["Job ID"]) == "  └ training #0" and lone_cells["Status"].plain == "●"
+    assert views.job_gpu_cell(lone) == "8" and str(lone_cells["GPUs"]) == ""  # the job's row says "8 H200"
+
+    # Every live job starts unfolded, one of a single sub-job too; history starts folded.
+    assert JobListScreen._starts_unfolded(job)
+    assert JobListScreen._starts_unfolded({**job, "sub_jobs": job["sub_jobs"][:1]})
+    assert JobListScreen._starts_unfolded({"job_id": "u", "status": "UNKNOWN"})
+    assert not JobListScreen._starts_unfolded({**job, "status": "FAILED"})
+
+    layout = _ListLayout((("Job ID", 38), ("Status", 14)))
+    name, rule = JobListScreen._header_cells("HISTORY", 1234, layout)
+    assert str(name) == "HISTORY  1,234"
+    assert str(rule) == "" and rule.text().plain == "─" * 14  # drawn, but not in a copy of the list
+
+    live = [{"status": s} for s in ("RUNNING", "queued", "PENDING", "creating", "UNKNOWN", "RUNNING")]
+    assert _status_chips(live, 21).plain == "● 2 running   ◔ 1 placing   ○ 2 pending   ? 1 unknown  │  21 in history"
+    assert _status_chips([], 0).plain == "no live jobs  │  0 in history"
+
+
+def test_job_list_ages_are_rebuilt_only_once_they_read_differently():
+    from cortex_training.tui.job_list import _ListLayout
+
+    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    ended = {"job_id": "e", "status": "FAILED", "created_at": "2025-12-01T12:00:00Z",
+             "updated_at": "2025-12-01T13:00:00Z"}
+    live = {"job_id": "l", "status": "RUNNING", "created_at": "2026-01-01T11:57:30Z",
+            "updated_at": "2026-01-01T11:59:50Z"}
+    screen = JobListScreen(MagicMock(), now=now)
+    layout = _ListLayout(tuple(JobListScreen._COLUMNS))
+    # What each cell draws (str() is what a copy of the list has).
+    texts = lambda rows: {label: cell.plain for label, cell in zip(layout.labels, rows.row)}  # noqa: E731
+
+    first_ended, first_live = screen._job_rows(ended, layout), screen._job_rows(live, layout)
+    assert texts(first_ended)["Created"] == "31d ago" and texts(first_ended)["Duration"] == "1h 00m"
+    assert texts(first_live)["Created"] == "2m ago" and texts(first_live)["Duration"] == "2m"
+    assert texts(first_live)["Updated"] == "just now"
+    screen._now = now + timedelta(seconds=20)  # neither reads differently yet
+    assert screen._job_rows(ended, layout) is first_ended and screen._job_rows(live, layout) is first_live
+    screen._now = now + timedelta(seconds=40)  # the live job's third minute
+    again = screen._job_rows(live, layout)
+    assert again is not first_live and texts(again)["Created"] == "3m ago" and texts(again)["Duration"] == "3m"
+    assert screen._job_rows(ended, layout) is first_ended  # its duration never changes, its age by the day
+
+
+def test_a_copy_of_the_job_list_has_whole_times_and_status_words():
+    from cortex_training.tui.format import format_created_at
+
+    created = (datetime.now(timezone.utc) - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    updated = (datetime.now(timezone.utc) - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    c = _client()
+    c.list_jobs.return_value = [{"job_id": "7", "status": "RUNNING", "created_at": created, "updated_at": updated,
+                                 "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training",
+                                               "status": "RUNNING"},
+                                              {"sub_job_id": "7:sampling:0", "job_type": "sampling",
+                                               "status": "PLACING"}]}]
+
+    async def run():
+        app = CortexTrainingLogTUI(c, poll_interval=0.01)
+        async with app.run_test(size=(160, 40)) as pilot:
+            ok = await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item)
+            assert ok
+            table = app.screen.query_one("#jobs", DataTable)
+            drawn = [cell.plain for cell in table.get_row("job-0")]
+            assert "3h ago" in drawn and "2m ago" in drawn  # the screen reads relative times
+            # The header, the LIVE heading, the job, then its two sub-jobs (live: it starts unfolded).
+            _header, heading, job, training, sampling = table.rows_text()
+            assert heading.startswith("LIVE")
+            # A paste stays true: the times themselves, and each status as its word, no glyph.
+            assert format_created_at(created) in job and format_created_at(updated) in job and "ago" not in job
+            copied = "".join((heading, job, training, sampling))
+            assert "RUNNING" in job and "●" not in copied and "◔" not in copied
+            assert "RUNNING" in training and "PLACING" in sampling  # drawn as the glyph alone, and glyph and word
+            assert "─" not in heading  # the LIVE heading's rule is drawn only
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def test_a_highlight_of_job_list_rows_copies_whole_times_and_status_words():
+    created = (datetime.now(timezone.utc) - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    c = _client()
+    c.list_jobs.return_value = [{"job_id": "7", "status": "RUNNING", "created_at": created, "updated_at": created,
+                                 "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training",
+                                               "status": "RUNNING"},
+                                              {"sub_job_id": "7:sampling:0", "job_type": "sampling",
+                                               "status": "PLACING"}]}]
+
+    async def run():
+        app = CortexTrainingLogTUI(c, poll_interval=0.01)
+        copied: list[str] = []
+        app.copy_to_clipboard = copied.append
+        async with app.run_test(size=(160, 40)) as pilot:
+            assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item)
+            await pilot.pause(0.1)
+            table = app.screen.query_one("#jobs", DataTable)
+            mouse = _pointer(app, pilot)
+            lines = _screen_lines(app)
+            y = next(y for y, line in enumerate(lines) if "3h ago" in line)  # the job's row, drawn relative
+            assert "●" in lines[y]
+            # One whole row: the times as YYYY-MM-DD HH:MM, the status as its word, no glyph, no age.
+            await _drag(mouse, (0, y), (table.region.right - 1, y), via=[(40, y)])
+            row = await _copied(app, pilot, copied)
+            assert "RUNNING" in row and re.search(r"\d{4}-\d\d-\d\d \d\d:\d\d", row)
+            assert "ago" not in row and not set("●◔◐○✕⊘✓") & set(row)
+            # From the LIVE heading through the sub-jobs: the heading's rule isn't copied, a
+            # sub-job drawn as the glyph alone copies its word, and the columns stay in line.
+            await _drag(mouse, (0, y - 1), (table.region.right - 1, y + 2), via=[(40, y)])
+            heading, job, training, sampling = (await _copied(app, pilot, copied)).split("\n")
+            assert heading.strip() == "LIVE  1" and "─" not in heading
+            assert job == row and "RUNNING" in training and "PLACING" in sampling
+            assert training.index("RUNNING") == sampling.index("PLACING") == job.index("RUNNING")
+            await _settle(app, pilot)
+
+    asyncio.run(run())
+
+
+def _gpu_rows(sub_job_id, minutes, *, gpus=2):
+    """GPU rows a minute apart, the newest 30 s ago, from ``minutes`` minutes before that."""
+    newest = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=30)
+    rows = [{"record_version": 2, "sub_job_id": sub_job_id, "worker_num": gpu, "local_gpu_index": 0,
+             "global_gpu_index": gpu, "sample_ts": (newest - timedelta(minutes=back)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "gpu_util_pct": 50.0, "fb_used_bytes": float(1024**3), "fb_free_bytes": float(8 * 1024**3),
+             "sample_interval_s": 60.0}
+            for back in range(minutes, -1, -1) for gpu in range(gpus)]
+    return "".join(json.dumps(row) + "\n" for row in rows)
+
+
+async def _run_a_first_open_draws_the_newest_half_hour_while_the_rest_downloads(tmp_path):
+    # A long job's first open: its whole history can take minutes, so the client's preview
+    # (the newest half hour) is drawn, marked partial, while the header's bar counts the
+    # chunks; the committed file then replaces it. A refresh with the job on screen asks no preview.
+    sub = "7:training:0"
+    c = _client()
+    calls, previewed, release = [], threading.Event(), threading.Event()
+
+    def download(job_id, output_dir, *, resume=False, priority=(), on_commit=None, on_chunk=None,
+                 preview_seconds=None, on_preview=None, stale_after_seconds=600):
+        calls.append({"priority": list(priority), "preview_seconds": preview_seconds,
+                      "counts": on_chunk is not None})
+        if on_preview is not None:
+            on_chunk(sub, 0, 300, 0)
+            preview = tmp_path / "preview.jsonl"
+            preview.write_text(_gpu_rows(sub, 32), encoding="utf-8")
+            on_preview({"sub_job_id": sub, "path": str(preview), "chunk_count": 33})
+            time.sleep(0.3)  # past the bar's redraw interval
+            on_chunk(sub, 120, 300, 0)
+            previewed.set()
+            release.wait(10)
+        path = Path(output_dir) / sub / "gpu.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_gpu_rows(sub, 300), encoding="utf-8")
+        path.with_name(".gpu.jsonl.manifest.json").write_text(
+            json.dumps({"version": 1, "names": ["chunk.gz"], "bytes": path.stat().st_size}), encoding="utf-8")
+        if on_chunk is not None:
+            on_chunk(sub, 300, 300, 0)
+        if on_commit is not None:
+            on_commit({"sub_job_id": sub, "saved_path": str(path)})
+        return []
+
+    c.download_metrics = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(160, 45)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen) and app.screen._current_source)
+        screen = app.screen
+        header = lambda: str(screen.query_one("#resource-status", Static).render())  # noqa: E731
+        screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        ok = await _pause_until(pilot, lambda: previewed.is_set() and screen._resource_data.kind(sub, "gpu") is not None
+                                and "120/300" in header(), seconds=10.0)
+        assert ok, header()
+        shown = screen._resource_data.kind(sub, "gpu")
+        assert shown.partial  # the newest half hour alone, and marked so
+        assert "loading older samples" in header() and "━" in header() and "120/300 chunks" in header(), header()
+        release.set()
+        assert await _pause_until(pilot, lambda: not screen._resource_loading, seconds=10.0)
+        full = screen._resource_data.kind(sub, "gpu")
+        assert not full.partial and full.first_sample_ts < shown.first_sample_ts  # the whole history
+        assert "chunks" not in header(), header()  # the bar is gone with the download
+        assert calls == [{"priority": [sub], "preview_seconds": 30 * 60, "counts": True}]
+        screen.action_refresh_sources()  # r: the job is on screen now, so only the count
+        assert await _pause_until(pilot, lambda: len(calls) == 2 and not screen._resource_loading, seconds=10.0)
+        assert calls[1] == {"priority": [sub], "preview_seconds": None, "counts": True}
+        await _settle(app, pilot)
+
+
+def test_a_first_open_draws_the_newest_half_hour_while_the_rest_downloads(tmp_path):
+    asyncio.run(_run_a_first_open_draws_the_newest_half_hour_while_the_rest_downloads(tmp_path))
+
+
+async def _run_a_finished_job_s_console_shows_its_last_lines_while_the_rest_downloads(tmp_path):
+    # A long finished job's console takes minutes to download: the sub-job on screen shows
+    # the client's preview (its newest chunks) under a note, until its whole console is in.
+    c = _client()
+    c.get_job.return_value = _old_terminal_job(minutes_ago=30)
+    calls, previewed, release = [], threading.Event(), threading.Event()
+    console = "".join(f"line {i}\n" for i in range(10)) + "".join(f"newest line {i}\n" for i in range(3))
+
+    def download(job_id, output_dir, *, resume=False, sub_job_ids=None, on_chunk=None, preview_seconds=None,
+                 on_preview=None, stale_after_seconds=600):
+        calls.append({"sub_job_ids": sub_job_ids, "preview_seconds": preview_seconds})
+        if sub_job_ids and on_preview is not None:
+            preview = tmp_path / "preview.log"
+            preview.write_text("".join(f"newest line {i}\n" for i in range(3)), encoding="utf-8")
+            on_preview({"sub_job_id": sub_job_ids[0], "path": str(preview), "chunk_count": 3})
+            previewed.set()
+            release.wait(10)
+        for sub in sub_job_ids or ["7:training:0", "7:sampling:0"]:
+            if not (Path(output_dir) / sub / "stdout.log").exists():  # resumed: a console that is in stays as it is
+                _write_stdout(output_dir, sub, console)
+        return []
+
+    c.download_stdout_logs = download
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        ok = await _wait(pilot, app, lambda: previewed.is_set() and isinstance(app.screen, LogScreen)
+                         and "newest line 2" in app.screen._shown_lines, tries=200)
+        assert ok
+        screen = app.screen
+        assert any("older lines are still downloading" in line for line in screen._shown_lines), screen._shown_lines
+        assert "line 0" not in screen._shown_lines  # the rest isn't in yet
+        release.set()
+        ok = await _wait(pilot, app, lambda: "line 0" in screen._shown_lines and not screen._stdout_inflight, tries=200)
+        assert ok, screen._shown_lines
+        assert not any("still downloading" in line for line in screen._shown_lines)  # the whole console, alone
+        assert calls == [{"sub_job_ids": ["7:training:0"], "preview_seconds": 30 * 60},
+                         {"sub_job_ids": None, "preview_seconds": None}]  # the others', whole
+        # Kept for the next open (the job ended long ago), without the preview.
+        assert (screen._console_dir / "7:training:0" / "stdout.log").exists()
+        assert not (screen._console_dir / ".preview").exists()
+        await _settle(app, pilot)
+
+
+def test_a_finished_job_s_console_shows_its_last_lines_while_the_rest_downloads(tmp_path):
+    asyncio.run(_run_a_finished_job_s_console_shows_its_last_lines_while_the_rest_downloads(tmp_path))
+
+
+# ─── the Schema column, and narrowing the account-wide list to one schema ─────
+
+
+async def _account_list(app, pilot):
+    """The demo's account-wide job list (``a``), drawn: the screen and its table."""
+    screen, table = await _demo_list(app, pilot)
+    await pilot.press("a")
+    assert await _pause_until(pilot, lambda: screen._scope is not None and screen._scope.kind == ACCOUNT
+                              and not screen._refreshing, seconds=10.0), app.sub_title
+    await pilot.pause(0.1)
+    return screen, table
+
+
+async def _run_the_schema_column_names_each_jobs_database_and_schema():
+    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:  # wide enough for every column
+        screen, table = await _account_list(app, pilot)
+        labels = [str(column.label) for column in table.columns.values()]
+        assert "Schema" in labels, labels
+        assert "Location" not in labels  # the header this column used to carry
+        at = labels.index("Schema")
+        # The cell is built under the same name the column is added under: were the two to drift,
+        # the row lookup would fall back to a blank cell and quietly empty the column.
+        drawn = {str(table.get_row_at(row)[at]).strip() for row in range(table.row_count)}
+        assert {"CORTEX_TRAINING_DB.PUBLIC", "TEAM_DB.EXPERIMENTS", '"sandbox"."dev"'} <= drawn, sorted(drawn)
+        await _settle(app, pilot)
+
+
+def test_the_schema_column_names_each_jobs_database_and_schema():
+    asyncio.run(_run_the_schema_column_names_each_jobs_database_and_schema())
+
+
+async def _run_a_whole_location_in_the_search_is_read_from_the_service():
+    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:
+        screen, _table = await _account_list(app, pilot)
+        assert screen._pushdown is None  # every schema, so far
+
+        box = screen.query_one("#jobfilter", Input)
+        box.value = "db=TEAM_DB schema=EXPERIMENTS"
+        await pilot.pause(0.3)  # past the search debounce
+        assert await _pause_until(pilot, lambda: screen._pushdown == ("TEAM_DB", "EXPERIMENTS")
+                                  and not screen._refreshing, seconds=10.0), screen._pushdown
+        assert screen._scope.narrowed == "TEAM_DB.EXPERIMENTS"
+        # The header says the list was narrowed, never that it covered every schema.
+        assert "narrowed to TEAM_DB.EXPERIMENTS" in app.sub_title, app.sub_title
+        assert "all in" not in app.sub_title
+        # Every row left is in that schema, so the column collapses and the header carries it.
+        assert [str(column.label) for column in screen.query_one("#jobs", DataTable).columns.values()
+                ].count("Schema") == 0
+
+        box.value = ""  # cleared: the whole account is read again
+        await pilot.pause(0.3)
+        assert await _pause_until(pilot, lambda: screen._pushdown is None and not screen._refreshing,
+                                  seconds=10.0), screen._pushdown
+        assert screen._scope.narrowed == ""
+        await _settle(app, pilot)
+
+
+def test_a_whole_location_in_the_search_is_read_from_the_service():
+    asyncio.run(_run_a_whole_location_in_the_search_is_read_from_the_service())
+
+
+async def _run_a_search_that_cannot_narrow_reads_every_schema(text):
+    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:
+        screen, _table = await _account_list(app, pilot)
+        screen.query_one("#jobfilter", Input).value = text
+        await pilot.pause(0.3)
+        assert await _pause_until(pilot, lambda: not screen._refreshing, seconds=10.0)
+        # A partial match, a negation, or a schema with no database of its own: matched here, so
+        # the walk still reads every schema and the header still says so.
+        assert screen._pushdown is None, text
+        assert screen._scope.narrowed == ""
+        assert "narrowed to" not in app.sub_title, app.sub_title
+        await _settle(app, pilot)
+
+
+@pytest.mark.parametrize("text", ["schema:exper", "db!=TEAM_DB", "schema=EXPERIMENTS", "db:team"])
+def test_a_search_that_cannot_narrow_reads_every_schema(text):
+    asyncio.run(_run_a_search_that_cannot_narrow_reads_every_schema(text))
+
+
+async def _run_a_narrowing_with_no_jobs_says_so_rather_than_failing():
+    app = CortexTrainingLogTUI(DemoClient(), poll_interval=0.01)
+    async with app.run_test(size=(200, 40)) as pilot:
+        screen, _table = await _account_list(app, pilot)
+        screen.query_one("#jobfilter", Input).value = "db=NOPE schema=NOPE"
+        await pilot.pause(0.3)
+        assert await _pause_until(pilot, lambda: not screen._refreshing and screen._pushdown is not None,
+                                  seconds=10.0)
+        # No such database here, so the narrowed walk answers an empty page: the search says
+        # nothing matched rather than the list reading as a failure. (A service that refuses the
+        # name outright with a 400 is covered in tests/test_tui_account.py.)
+        assert screen._list_error is None, screen._list_error
+        assert not screen.query_one("#jobs", DataTable).display
+        await _settle(app, pilot)
+
+
+def test_a_narrowing_with_no_jobs_says_so_rather_than_failing():
+    asyncio.run(_run_a_narrowing_with_no_jobs_says_so_rather_than_failing())

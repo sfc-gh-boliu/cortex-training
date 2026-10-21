@@ -13,11 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The job details screen: its Logs tab, and the screen the Resources tab lives on.
+"""The job details screen: its Logs tab, and the screen the Resources and Checkpoints tabs live on.
 
-One screen holds both tabs, so the job's status, its sub-jobs and its downloads are
+One screen holds every tab, so the job's status, its sub-jobs and its downloads are
 read once. The Resources tab's own methods are ``ResourceTab``
-(tui/resource_view.py); everything here is the log tail, the filter, the saved
+(tui/resource_view.py), the Checkpoints tab's ``CheckpointTab``
+(tui/checkpoint_view.py); everything here is the log tail, the filter, the saved
 console and what the screen shares.
 """
 
@@ -45,6 +46,7 @@ from textual.containers import VerticalScroll
 from textual.content import Content
 from textual.css.query import NoMatches
 from textual.screen import Screen
+from textual.widgets import DataTable
 from textual.widgets import Header
 from textual.widgets import HelpPanel
 from textual.widgets import Input
@@ -58,11 +60,18 @@ from textual.widgets import TabPane
 from textual.worker import get_current_worker
 from cortex_training._artifact_download import DownloadCancelled
 from cortex_training._artifact_download import NoChunksError
+from cortex_training.tui import theme
 from cortex_training.tui import format as log_format
 from cortex_training.tui import views
+from cortex_training.tui.format import compact_stamp
+from cortex_training.tui.format import day_rule
+from cortex_training.tui.format import display_day
+from cortex_training._download_lock import DownloadLock
+from cortex_training.tui.detail_tabs import TrainingPane
 from cortex_training.tui.format import display_line
 from cortex_training.tui.widgets import _TimedTail
 from cortex_training.tui.widgets import _cache_job_id
+from cortex_training.tui.widgets import _download_options
 from cortex_training.tui.widgets import _quiet_download
 from cortex_training.tui.widgets import _result_warnings
 from cortex_training.tui.widgets import _sleep_until_cancelled
@@ -72,7 +81,6 @@ from cortex_training.tui.format import entry_matches
 from cortex_training.tui.format import format_log_entry
 from cortex_training.tui.format import one_line
 from cortex_training.tui.format import safe_text
-from cortex_training.tui.format import source_label
 from cortex_training.tui.format import wrap_log_line
 from cortex_training.tui.log_cache import LogCache
 from cortex_training.tui.log_cache import cached_log_pages
@@ -80,16 +88,21 @@ from cortex_training.tui.log_cache import catching_up
 from cortex_training.tui.log_cache import job_cache_dir
 from cortex_training.tui.log_cache import prune_consoles
 from cortex_training.tui.log_cache import touch_console
+from cortex_training.tui.log_style import DAY_KIND
+from cortex_training.tui.log_style import ERROR_KINDS
+from cortex_training.tui.log_style import ISSUE_KINDS
+from cortex_training.tui.log_style import NO_TRACEBACK
 from cortex_training.tui.log_style import LogHighlighter
+from cortex_training.tui.log_style import in_context
 from cortex_training.tui.log_style import line_kind
-from cortex_training.tui.log_style import sub_job_color
+from cortex_training.tui.log_style import next_line_of
+from cortex_training.tui.log_style import place_of
 from cortex_training.tui.resource import DEFAULT_RANGE
 from cortex_training.tui.resource import GPU
 from cortex_training.tui.resource import ResourceData
 from cortex_training.tui.resource import cached_metric_sources
 from cortex_training.tui.saved_log import committed_size
 from cortex_training.tui.saved_log import read_saved_tail
-from cortex_training.tui.widgets import ENDED_STYLE
 from cortex_training.tui.widgets import _ERROR_LOG
 from cortex_training.tui.widgets import log_traceback
 from cortex_training.tui.widgets import FittedFooter
@@ -107,10 +120,11 @@ from cortex_training.tui.widgets import fit_line
 from cortex_training.tui.widgets import is_shown
 from cortex_training.tui.widgets import on_stack
 from cortex_training.tui.resource_view import ResourceTab
+from cortex_training.tui.checkpoint_view import CheckpointTab
 
 
-class LogScreen(ResourceTab, FollowsPointer, Screen):
-    """Read-only Logs and Resource dashboard for one job."""
+class LogScreen(ResourceTab, CheckpointTab, FollowsPointer, Screen):
+    """Read-only Logs, Resource dashboard and Checkpoints for one job."""
 
     BINDINGS = [
         ("b", "back", "Back"),
@@ -122,6 +136,11 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         ("l", "cycle_level", "Level"),
         Binding("l", "show_tab('logs')", "Logs", show=False),
         Binding("L", "cycle_level", "Level", show=False),  # the key it had before
+        # Logs: the next error (a traceback is one), or the one before; n and N stop at warnings too.
+        Binding("e", "jump('error', 1)", "Error"),
+        Binding("E", "jump('error', -1)", "Prev error", show=False),
+        Binding("n", "jump('issue', 1)", "Next warning/error", show=False),
+        Binding("N", "jump('issue', -1)", "Prev warning/error", show=False),
         ("p", "toggle_pause", "Pause"),
         ("s", "save_log", "Save"),
         ("r", "refresh_sources", "Refresh"),
@@ -137,6 +156,12 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         Binding("comma", "resource_sub_job(-1)", "Prev sub-job", show=False),
         Binding("full_stop", "resource_sub_job(1)", "Next sub-job", show=False),
         Binding("g", "show_tab('resource')", "Resources", show=False),
+        Binding("m", "show_tab('training')", "Training metrics", show=False),
+        Binding("c", "show_tab('checkpoints')", "Checkpoints", show=False),
+        # Checkpoints: s and o sort the list (on Logs, s saves the log; see check_action).
+        Binding("s", "checkpoint_sort", "Sort"),
+        Binding("o", "checkpoint_order", "Order"),
+        Binding("d", "checkpoint_download", "Download"),
     ]
 
     # Auto-fit the source labels until [ or ], while preserving the log's minimum.
@@ -147,9 +172,15 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
     _LOG_MIN_WIDTH = 40
     _LEVEL_CYCLE = [None, "INFO", "WARNING", "ERROR"]
     _KEEP_CONSOLE_AFTER_SECONDS = 600
+    # A saved console can take minutes for a long job: the sub-job on screen first shows
+    # its last half hour (where a job's end, and its error, are), until the whole is in.
+    _CONSOLE_PREVIEW_SECONDS = 30 * 60
     _DATA_REFRESH_SECONDS = 30
     _STATUS_REFRESH_SECONDS = 60
-    _LOG_ONLY = {"save_log", "cycle_level", "toggle_pause", "shrink_sources", "grow_sources", "filter"}
+    _LOG_ONLY = {"save_log", "cycle_level", "toggle_pause", "shrink_sources", "grow_sources", "filter", "jump"}
+    # The tabs, in the order t cycles them, and their names.
+    _TABS = ("logs", "resource", "training", "checkpoints")
+    _TAB_NAMES = {"logs": "Logs", "resource": "Resources", "training": "Training metrics", "checkpoints": "Checkpoints"}
 
     class _Note(str):
         """A TUI-authored pane line distinguished by type, not text."""
@@ -174,6 +205,8 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         cache_job_id = _cache_job_id(client, job_id)
         self._cache = LogCache(cache_job_id)
         self._source_by_item: dict[str, str] = {}
+        self._source_items: dict[str, tuple[ListItem, Label]] = {}  # each sub-job's row (see _paint_sources)
+        self._source_labels: dict[str, str] = {}  # each sub-job's name in the list, from its record (job_type)
         self._logview: Log | None = None
         self._filter = ""  # grep substring for the log pane
         self._min_level = None  # None | INFO | WARNING | ERROR
@@ -195,12 +228,14 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         self._stdout_inflight = False
         self._stdout_ready = False
         self._stdout_have: set[str] = set()  # sub-jobs whose saved console is in while the rest download
+        self._stdout_preview: dict[str, Path] = {}  # sub-jobs showing their console's newest chunks until it is in
         self._stdout_first: str | None = None  # the sub-job a download fetches before the others
         self._stdout_others = False  # ... and whether the job has others
         self._stdout_failed = False
         self._held: tuple[list[str], bool] | None = None
         self._init_log_state()
-        self._active_tab = initial_tab if initial_tab in ("logs", "resource") else "logs"
+        self._active_tab = initial_tab if initial_tab in self._TABS else "logs"
+        self._init_checkpoint_state()
         self._log_focus_id = "sources"
         self._metrics_root = job_cache_dir(cache_job_id) / "metrics"
         # Per sub-job, what a download warned about (chunks it gave up on). The Logs
@@ -214,6 +249,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         self._resource_error: str | None = None
         self._resource_range = DEFAULT_RANGE
         self._resource_downloaded = False
+        self._resource_progress: dict[str, tuple[int, int]] = {}  # per sub-job, a download's (chunks done, of them)
         self._resource_ticker = None
         self._resource_pick: str | None = None
         self._resource_kind = GPU
@@ -236,7 +272,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         self._no_sources: str | None = None  # why the job has no sources to show (it couldn't be read, say)
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield Header(icon=theme.BRAND_ICON)
         yield Static("", id="summary")
         with JobTabs(initial=self._active_tab, id="job-tabs"):
             with TabPane("Logs", id="logs"):
@@ -247,14 +283,26 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
                 status = Static("", id="log-status")
                 status.display = False
                 yield status
-                yield Input(placeholder="filter logs…  (/ focus · Esc clear)", id="logfilter")
+                # One row under the pane: whether it follows the log (see _log_live), the filter
+                # box, and what a jump (e, n), the level and the filter found (see _log_chips).
+                with Horizontal(id="log-bar"):
+                    yield Static("", id="log-live")
+                    yield Input(placeholder="/ filter   Esc clears", id="logfilter")
+                    yield Static("", id="log-chips")
             with TabPane("Resources", id="resource"):
                 with Horizontal(id="resource-body"):
                     yield _ResourceList(id="resource-list")
                     with VerticalScroll(id="resource-pane"):
                         yield _ColoredLinks("Select Resource to load GPU metrics.", id="resource-status")
+                        yield Static("", id="resource-kpis")
                         yield Static("", id="resource-stats")
                         yield Static("", id="resource-charts")
+                yield _ColoredLinks("", id="resource-keys")  # the window selector, under the pane
+            with TabPane("Training metrics", id="training"):
+                yield TrainingPane(self._client, self._job_id, self._metrics_root, job=self._tab_job,
+                                   download=self._download_training_metrics, id="training-tab")
+            with TabPane("Checkpoints", id="checkpoints"):
+                yield from self._compose_checkpoint_tab()
         yield FittedFooter(id="footer")
 
     def on_mount(self) -> None:
@@ -265,6 +313,9 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         self._logview.auto_scroll = False
         self._logview.highlighter = LogHighlighter()
         self._logview.highlight = True
+        if isinstance(self._logview, _LogPane):
+            self._logview.on_scrolled = self._log_scrolled  # the bar says whether the reader follows the log
+            self._logview.copy_text = self._copied_text  # a highlight copies the lines as logged
         self._apply_sources_width()
         self._update_subtitle()
         self._load_sources()
@@ -276,7 +327,19 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
 
     def _focus_active_tab(self) -> None:
         try:
-            self.set_focus(self.query_one("#resource-list" if self._resource_active() else "#sources"))
+            # Queued at mount (see on_mount). A tab key pressed before it runs has
+            # already switched the tabs, and focusing the tab left behind would put the
+            # focus in a hidden pane, which re-activates that pane and undoes the key
+            # (the alternating activations on_tabbed_content_tab_activated guards
+            # against). That activation focuses its own pane, so there is nothing to do.
+            if (self.query_one("#job-tabs", TabbedContent).active or "logs") != self._active_tab:
+                return
+            pane = self._detail_pane()
+            if pane is not None:
+                pane.activate()  # it claims the focus itself (see detail_tabs.claim_focus)
+                return
+            focus = {"resource": "#resource-list", "checkpoints": "#checkpoint-table"}.get(self._active_tab, "#sources")
+            self.set_focus(self.query_one(focus))
         except Exception:  # noqa: BLE001 - not mounted yet
             pass
 
@@ -300,12 +363,48 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
     def _resource_active(self) -> bool:
         return self._active_tab == "resource"
 
+    def _detail_pane(self):
+        """The Training metrics tab's pane, when it is shown (see detail_tabs.py)."""
+        if self._active_tab != "training":
+            return None
+        try:
+            return self.query_one(f"#{self._active_tab}-tab")
+        except NoMatches:  # not mounted yet
+            return None
+
+    def _tab_job(self) -> dict:
+        """The job as this screen knows it, with its newest status, for the Training metrics tab."""
+        return {**self._job, "status": self._job_status or self._job.get("status")}
+
+    def _download_training_metrics(self, *, priority, on_commit, cancelled) -> bool:
+        """Worker thread. The Training metrics tab's download: the zone's own training rows,
+        into the same cache directory as the Resources tab's GPU file and under the same
+        :class:`DownloadLock`, so the two tabs (and the CLI) don't write that directory at
+        once. The streams are separate, so this fetches its own chunks. False when the
+        screen closed (or ``cancelled()``) before the lock was taken."""
+        lock = DownloadLock(self._metrics_root)
+        if not lock.acquire(lambda: self._screen_open and not cancelled()):
+            return False
+        try:
+            self._client.download_training_metrics(
+                self._job_id,
+                self._metrics_root,
+                resume=True,
+                priority=priority,
+                on_commit=on_commit,
+                **_quiet_download(self._client.download_training_metrics),
+            )
+        finally:
+            lock.release()
+        return True
+
     def action_show_tab(self, tab: str) -> None:
         self.query_one("#job-tabs", TabbedContent).active = tab
 
     def action_cycle_tab(self) -> None:
         tabs = self.query_one("#job-tabs", TabbedContent)
-        tabs.active = "resource" if self._active_tab == "logs" else "logs"
+        index = self._TABS.index(self._active_tab) if self._active_tab in self._TABS else -1
+        tabs.active = self._TABS[(index + 1) % len(self._TABS)]
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         # Ignore queued stale activations, which would re-activate each other.
@@ -315,13 +414,25 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         self.clear_selection()  # what was highlighted is on the tab left behind
         self.refresh_bindings()  # check_action scopes the footer's keys to the tab
         self._update_subtitle()  # the Logs tab's state shows only on Logs
+        focused = self.focused
+        if not self._logs_active() and focused is not None and focused.id in {"sources", "logview", "logfilter"}:
+            self._log_focus_id = focused.id
+        pane = self._detail_pane()
+        if pane is not None:
+            pane.activate()  # it claims the focus itself (see detail_tabs.claim_focus)
+            return
         if self._resource_active():
-            focused = self.focused
-            if focused is not None and focused.id in {"sources", "logview", "logfilter"}:
-                self._log_focus_id = focused.id
             self.set_focus(self.query_one("#resource-list", ListView))  # its arrows pick a view or unit
             self.call_after_refresh(self._render_resource)
             self._start_resource_refresh(force=False)
+            return
+        if self._checkpoints_active():
+            focused = self.focused
+            if focused is not None and focused.id in {"sources", "logview", "logfilter"}:
+                self._log_focus_id = focused.id
+            self.set_focus(self.query_one("#checkpoint-table", DataTable))
+            self._render_checkpoints()
+            self._start_checkpoint_refresh(force=False)
             return
         try:
             target = self.query_one(f"#{self._log_focus_id}")
@@ -337,7 +448,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         return max(self._SOURCES_MIN, width - self._LOG_MIN_WIDTH) if width else self._SOURCES_AUTO_MAX
 
     def _fitted_sources_width(self) -> int:
-        labels = [views.sub_job_label(sid) for sid in self._source_by_item.values()]
+        labels = [self._source_label(sid) for sid in self._source_by_item.values()]
         longest = max((views.cell_width(label) for label in labels), default=0) + 2  # with the "● " before it
         return min(self._SOURCES_AUTO_MAX, max(self._SOURCES_AUTO_MIN, longest + 4))
 
@@ -393,8 +504,15 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         self._rewrap_timer = self.set_timer(self._REWRAP_SETTLE_SECONDS, partial(after_refresh, self, self._rewrap))
 
     def action_refresh_sources(self) -> None:
+        pane = self._detail_pane()
+        if pane is not None:
+            pane.action_refresh()
+            return
         if self._resource_active():
             self._start_resource_refresh(force=True)
+            return
+        if self._checkpoints_active():
+            self._start_checkpoint_refresh(force=True)
             return
         if self._job_read_started is not None:
             # The job is still being read (a thread can't be cancelled): a second read
@@ -415,8 +533,8 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
 
     def _update_subtitle(self) -> None:
         # Dynamic status line: everything that changes over the session lives
-        # here, leaving the #summary line for static config only. The status
-        # comes first, so a narrow header still shows it.
+        # here, leaving the #summary line for the job's identity (its status badge
+        # aside). The status comes first, so a narrow header still shows it.
         if not self._screen_open or self.app.screen is not self:
             return  # a late tail update must not overwrite another screen's subtitle
         bits = []
@@ -439,6 +557,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         # Plain text (the header doesn't read markup), but service text could
         # still carry an escape sequence or a line break.
         self.app.sub_title = "  ·  ".join(" ".join(safe_text(bit).split()) for bit in bits)
+        self._render_log_bar()  # the pause, the filter and the level show there too
 
     def _source_warnings(self) -> list:
         """What the downloads warned about for the sub-job on screen, each warning once."""
@@ -466,30 +585,39 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
     _SUMMARY_LEAST = 12
 
     def _render_summary_line(self) -> None:
-        job = self._job
+        job = self._ended_job()  # the newest status and reason: the tail can see the job end first
         job_id = views.job_id_of(job) or self._job_id
-        # A sub-job's id starts with its job's (JOB_ID:TYPE:INDEX): name it once.
+        # A sub-job's id starts with its job's (JOB_ID:TYPE:INDEX): the chip names
+        # the rest, beside the job's id.
         if not self._sub_job_id:
-            ids = [job_id, "all sub-jobs"]
+            scope = "all sub-jobs"
         elif str(self._sub_job_id).startswith(f"{job_id}:"):
-            ids = [f"sub-job {self._sub_job_id}"]
+            scope = f"sub-job {str(self._sub_job_id)[len(job_id) + 1:]}"
         else:
-            ids = [job_id, f"sub-job {self._sub_job_id}"]
+            scope = f"sub-job {self._sub_job_id}"
         # Why the job is where it is, in the service's words: reason and reason_details,
         # or the sentence it sends when the job's status is unavailable.
         why = views.status_unavailable_text(job) if views.is_unknown(job) else views.reason_text(job)
         word = views.status_word(job.get("status"))
-        style = "red" if word == "failed" else "yellow" if views.is_live(job) else ENDED_STYLE
+        style = theme.ERR if word == "failed" else theme.WARN if views.is_live(job) else theme.ENDED
         # Where the job is (its calls go there), when the account-wide list says it is
         # somewhere other than the configured location.
         location = views.location_label(job) if self.app.job_elsewhere(job) else ""
         least = self._SUMMARY_LEAST
-        # The models are cut to keep the line on one row; the ids,
-        # the location and the reason stay whole.
-        segments = [*((text, "", None) for text in ids),
-                    (views.job_type_label(job), "", None), (", ".join(views.job_models(job)) or "—", "", least),
-                    *([(location, "", None)] if location else []), *([(why, style, None)] if why else [])]
-        self._set_summary(fit_line(segments, self._summary_width()))
+        # The job id in bold, its status badge, then chips for what the job is, and
+        # the reason. The models are cut to keep the line on one row; the rest stays whole.
+        segments = [(job_id, f"bold {theme.TEXT}", None, False), theme.status_badge(job.get("status")),
+                    (views.job_type_label(job), "", None, True),
+                    (", ".join(views.job_models(job)) or "—", "", least, True),
+                    (scope, "", None, True), *([(location, "", None, True)] if location else []),
+                    *([(why, style, None, False)] if why else [])]
+        width = self._summary_width()
+        line = fit_line(segments, width)
+        if "\n" in line.plain:
+            # The header's subtitle names the job too: a narrow line leaves the id
+            # out rather than wrap.
+            line = fit_line(segments[1:], width)
+        self._set_summary(line)
 
     def _summary_width(self) -> int:
         """The cells the summary line has: the screen's, less its padding, before the first layout."""
@@ -516,6 +644,8 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             return self._resource_active() and len(self._resource_sub_job_ids()) > 1
         if action == "cycle_window":
             return self._resource_active()
+        if action in ("checkpoint_sort", "checkpoint_order", "checkpoint_download"):
+            return self._checkpoints_active()
         return True
 
     def action_filter(self) -> None:
@@ -580,7 +710,14 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             self._resumed_at = time.monotonic()
             self._render_log_status()
             return
-        self._paused = not self._paused
+        # Scrolled up from the end of a log that goes on, the bar says p follows: it
+        # goes back to the end and follows again, as from a pause.
+        self._paused = not self._paused and not (self._tail_live and self._away_from_end())
+        if not self._paused:
+            self._unseen = 0
+            self._jump = None
+            if isinstance(self._logview, _LogPane):
+                self._logview.set_mark(None)
         # Resuming jumps to the end and follows again; pausing just stops
         # following (the user can scroll freely). A saved console that arrived
         # while paused replaces the pane now.
@@ -601,6 +738,60 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
                 self._logview.scroll_end(animate=False)
         self._update_subtitle()
 
+    _JUMPS = {"error": (ERROR_KINDS, "error"), "issue": (ISSUE_KINDS, "problem")}
+
+    def action_jump(self, which: str, step: int) -> None:
+        """e / E (n / N): the pane's next error, or the one before (warnings too), marked, a third
+        of the way down the view, and the reader's place kept there as if paused (p resumes). From
+        the end of the log, the newest one; round past either end, as a pager's search goes."""
+        lv = self._logview
+        if not self._logs_active() or which not in self._JUMPS or not isinstance(lv, _LogPane):
+            return
+        wanted, noun = self._JUMPS[which]
+        kinds = self._shown_kinds
+        if lv.mark is not None:
+            start = self._line_at_row(lv.mark[0])
+        elif self._away_from_end():
+            top = self._line_at_row(int(lv.scroll_offset.y))
+            start = None if top is None else top - 1 if step > 0 else top
+        else:
+            start, step = None, -1  # following the log: the newest one first
+        index = next_line_of(kinds, start, step, wanted)
+        if index is None:
+            self._jump = (noun, 0, 0)
+            self._render_log_bar()
+            return
+        n, total = place_of(kinds, index, wanted)
+        self._jump = (noun, n, total)
+        first, end = self._line_rows(index)
+        if not self._paused:
+            self._paused = True  # the reader stays here as lines come (p resumes)
+            self._update_subtitle()
+        lv.set_mark((first, end))
+        lv.scroll_to(y=max(0, first - lv.scrollable_content_region.height // 3), animate=False)
+        self._render_log_bar()
+
+    def _recount_jump(self) -> None:
+        """UI thread. The last jump's place among the lines the pane holds now: which of how many
+        the marked line is, or only how many once that line has left the pane."""
+        noun = self._jump[0]
+        wanted = next(kinds for kinds, name in self._JUMPS.values() if name == noun)
+        lv = self._logview
+        index = self._line_at_row(lv.mark[0]) if isinstance(lv, _LogPane) and lv.mark is not None else None
+        if index is None:
+            self._jump = (noun, 0, sum(kind in wanted for kind in self._shown_kinds))
+        else:
+            self._jump = (noun, *place_of(self._shown_kinds, index, wanted))
+
+    def _line_rows(self, index: int) -> tuple[int, int]:
+        """The pane rows [start, end) of line ``index`` of _shown_lines: its own, not its day's rule."""
+        first = sum(self._shown_rows[:index])
+        rows = self._shown_rows[index]
+        kinds = getattr(self._logview, "row_kinds", [])
+        if rows > 1 and 0 <= first < len(kinds) and kinds[first] == DAY_KIND:
+            first, rows = first + 1, rows - 1
+        return first, first + rows
+
     def _refilter(self) -> None:
         """Apply the filter and level to what this view already has; never re-tail.
 
@@ -616,7 +807,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         self._held = None
         self._paused = False
         self._update_subtitle()
-        if self._saved_shown(self._current_source):
+        if self._console_shown(self._current_source):
             self._paint_saved()
         else:
             # Older lines may have left the buffer before this repaint.
@@ -777,15 +968,18 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
     def action_copy_text(self) -> None:
         """ctrl+c, on every tab: what the mouse highlighted, else
         everything the tab holds: the log (its newest lines, up to the cap) on Logs; on
-        Resources the panel, the header, every stats row and every chart."""
+        Resources the panel, the header, every stats row and every chart; on Checkpoints the
+        list and the highlighted checkpoint's details."""
         if self.app.copy_highlight(self):
             return
         if self.query(HelpPanel):
             self.app.copy_everything(self)  # the key list, with the tab beside it
         elif self._logs_active():
             self._copy_log()
+        elif self._checkpoints_active():
+            self.app.copy_everything(self, "the Checkpoints tab")
         else:
-            self.app.copy_everything(self, "the Resources tab")
+            self.app.copy_everything(self, f"the {self._TAB_NAMES[self._active_tab]} tab")
 
     def _load_sources(self) -> None:
         """UI thread. Read the job, then show its sub-jobs (see _read_sources)."""
@@ -923,6 +1117,8 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         lv = self.query_one("#sources", ListView)
         await lv.clear()  # await removal before re-appending src-* ids (see _populate)
         self._source_by_item = {}
+        self._source_items = {}
+        self._source_labels = {}
         self._sources_ready = True
         self._sub_job_missing = False
         self._no_sources = why[1] if why is not None else None
@@ -958,10 +1154,11 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             sid = s["sub_job_id"]
             item_id = f"src-{i}"
             self._source_by_item[item_id] = sid
-            label = views.sub_job_label(s)
-            # A dot in the colour of the sub-job's tag on its log lines; the name stays
-            # plain, readable under the highlight.
-            lv.append(ListItem(Label(Content.assemble(("● ", sub_job_color(label)), label)), id=item_id))
+            self._source_labels[sid] = views.sub_job_label(s)  # its type as the preview and Resources name it
+            label = Label(self._source_text(sid))
+            item = ListItem(label, id=item_id)
+            self._source_items[sid] = (item, label)  # (the label, before the item mounts it)
+            lv.append(item)
         self._apply_sources_width()  # fitted to these labels
         self.refresh_bindings()  # < and > need two or more sub-jobs
         if not items:
@@ -975,6 +1172,25 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             self._render_resource()
             self._start_resource_refresh(force=False)
 
+    def _source_label(self, sid: str) -> str:
+        return self._source_labels.get(sid) or views.sub_job_label(sid)
+
+    def _source_text(self, sid: str) -> Content:
+        """A sub-job's row in the list: its status's glyph and name, and its status under them
+        (the name bold for the one the pane shows)."""
+        word = self._tail_status(sid)
+        look = theme.status_look(word)
+        shown = sid == self._current_source
+        return Content.assemble((f"{look.glyph} ", look.color),
+                                (self._source_label(sid), f"bold {theme.TEXT}" if shown else ""),
+                                ("\n  " + word, theme.TEXT if shown else theme.FAINT))
+
+    def _paint_sources(self) -> None:
+        """UI thread. Draw the sub-job list again: which one the pane shows, and each one's status."""
+        for sid, (item, label) in self._source_items.items():
+            item.set_class(sid == self._current_source, "-shown")
+            label.update(self._source_text(sid))
+
     def _display(self, line: str) -> str:
         """How a buffered line is shown: a log line's display text (see
         ``format.display_line``), the TUI's own notes only made safe to draw.
@@ -986,14 +1202,14 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             text = self._display_cache[line] = display_line(line)
         return text
 
+    # A log line's later rows (wrapped, or a record's traceback) start under the end of its
+    # time ("HH:MM:SS "), so the times stay one column down the pane's left edge.
+    _HANGING_INDENT = " " * 9
+
     def _line_prefixes(self) -> tuple[str, str]:
-        # Tag every log line with the sub-job being tailed, and line its later
-        # rows (wrapped, or a traceback's lines) up under its text; the TUI's
-        # own status lines stay as they are (_prefixes).
-        if not self._current_source:
-            return "", ""
-        tag = one_line(safe_text(source_label(self._current_source).replace(" #", ":")))
-        return f"{tag} │ ", f"{' ' * views.cell_width(tag)} │ "
+        """What starts the first row of a log line, and each row after it. No sub-job tag:
+        the pane shows one sub-job, the one selected beside it."""
+        return "", self._HANGING_INDENT
 
     def _prefixes(self, line: str) -> tuple[str, str]:
         """The row prefixes of ``line``: none for the TUI's own notes."""
@@ -1002,7 +1218,10 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
     def _wrap(self, line: str, width: int) -> list[str]:
         """The rows ``line`` takes in a pane ``width`` cells wide."""
         first, rest = self._prefixes(line)
-        return wrap_log_line(self._display(line), width, first=first, rest=rest, max_rows=self._MAX_ROWS_PER_LINE)
+        text = self._display(line)
+        if not isinstance(line, self._Note):
+            text = compact_stamp(text)  # the date is on the day's rule (see in_context)
+        return wrap_log_line(text, width, first=first, rest=rest, max_rows=self._MAX_ROWS_PER_LINE)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if not self._screen_open:
@@ -1052,6 +1271,10 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         or this sub-job's was fetched first while the rest download."""
         return self._stdout_ready or (source is not None and source in self._stdout_have)
 
+    def _console_shown(self, source: str | None) -> bool:
+        """Whether ``source`` shows a saved console: the whole, or its newest chunks while it downloads."""
+        return self._saved_shown(source) or (source is not None and source in self._stdout_preview)
+
     def _kept_console(self) -> bool:
         """A complete saved console from an earlier open of this same (finished) job."""
         if self._live() or not self._job_created_at:
@@ -1091,7 +1314,8 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         try:
             self._console_dir.parent.mkdir(parents=True, exist_ok=True)
             tmp = Path(tempfile.mkdtemp(prefix=".console-", dir=str(self._console_dir.parent)))
-            shutil.copytree(plan.root, tmp, dirs_exist_ok=True)
+            # The preview (see _console_preview) isn't the console's: the whole is beside it.
+            shutil.copytree(plan.root, tmp, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".preview"))
             (tmp / ".complete").write_text(str(plan.created_at), encoding="utf-8")
             shutil.rmtree(self._console_dir, ignore_errors=True)
             os.replace(tmp, self._console_dir)
@@ -1107,6 +1331,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
     def _cleanup_stage(self) -> None:
         stage = self._stage
         self._stage = None
+        self._stdout_preview.clear()  # its files go with the stage
         if stage is not None:
             stage.cleanup()
 
@@ -1142,6 +1367,8 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         self._display_cache: dict[str, str] = {}  # raw line -> what the pane shows (see _display)
         self._export_note: str | None = None  # what s last did
         self._download_note: str | None = None  # the saved console's download progress, or its failure
+        self._download_chunks: tuple[str, int, int] | None = None  # (sub-job, chunks done, of) for the bar
+        self._log_bar_key: tuple | None = None  # what the bar under the pane last drew (see _render_log_bar)
         self._tail_error: str | None = None  # the live tail stopped on this error (the status line says so)
         self._tail_request: tuple[int, float] | None = None  # (tail gen, monotonic start) of the call in flight
         self._behind_note: str | None = None  # full pages: the tail is catching up
@@ -1149,7 +1376,14 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         self._repainting = False  # a saved console's repaint is being prepared off the UI thread
         self._paint_gen = 0  # bumped by each _paint_saved; an older paint's result is dropped
         self._saved_matched_none = False  # the saved console has lines, but none pass the filter and level
+        self._saved_matched = 0  # the saved console's lines that pass them, kept or not
         self._shown_rows: list[int] = []  # wrapped rows of each _shown_lines line
+        self._shown_kinds: list[str | None] = []  # the kind of each _shown_lines line (see in_context)
+        self._last_day: str | None = None  # the day of the newest dated line in the pane (it has the rule)
+        self._in_traceback = NO_TRACEBACK  # where a traceback stands after the newest log line (see traceback_kind)
+        self._unseen = 0  # log lines written since the reader left the end (paused, or scrolled up)
+        # The last jump (e, n): (what it stops at, which of them, of how many); the line is the pane's mark.
+        self._jump: tuple[str, int, int] | None = None
         self._rows_total = 0
         self._shown_logs = 0  # the log lines among _shown_lines (the rest are the TUI's notes)
         self._repaint_job: LogScreen._Repaint | None = None
@@ -1303,7 +1537,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
 
     @work(thread=True, exclusive=True, group="paint")
     def _prepare_saved(self, gen: int, source: str, path: Path, query: str, level, width: int,
-                       prefixes: tuple[str, str], recent: bool) -> None:
+                       prefixes: tuple[str, str], recent: bool, *, preview: bool = False) -> None:
         """Worker thread. Read, filter and wrap the saved console for the pane;
         _apply_saved shows it. A long console takes a while, and the UI keeps
         answering keys meanwhile."""
@@ -1340,10 +1574,14 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         chunks, displays, cut = log_format.wrap_lines(
             lines, width, first=first, rest=rest, max_lines=self._MAX_LINES, max_rows=self._MAX_ROWS,
             max_rows_per_line=self._MAX_ROWS_PER_LINE)
+        # Their kinds and context here too, not on the UI thread: a console can be 20,000 lines.
+        texts = [displays[line] for line, _, _ in chunks]
+        chunks, kinds, row_kinds, day, in_block = in_context(chunks, [line_kind(text) for text in texts], texts, width)
         if worker.is_cancelled:
             return
         self._post(self._apply_saved, gen, source, console, chunks, displays, cut, width,
-                   matched, total, len(lines), newer, gap)
+                   matched, total, len(lines), newer, gap, kinds=kinds, context=(row_kinds, day, in_block),
+                   preview=preview)
 
     def _ended_job(self) -> dict:
         """This view's copy of the job with the newest status and reason (the tail
@@ -1394,22 +1632,31 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         self._cancel_repaint()  # what a repaint on its way would show, this paint replaces
         self._paint_gen += 1
         self._repainting = True
-        self._prepare_saved(self._paint_gen, source, self._stdout_path(source), self._filter, self._min_level,
-                            self._content_width(), self._line_prefixes(), self._stdout_recent)
+        # Until its whole console is in, a sub-job with a preview shows that.
+        preview = not self._saved_shown(source) and source in self._stdout_preview
+        self._prepare_saved(self._paint_gen, source, self._stdout_preview[source] if preview else self._stdout_path(source),
+                            self._filter, self._min_level, self._content_width(), self._line_prefixes(),
+                            self._stdout_recent and not preview, preview=preview)
         self._render_log_status()
 
     def _apply_saved(self, gen: int, source: str, console: bool, chunks: list, displays: dict, cut: bool,
-                     width: int, matched: int, total: int, kept: int, newer: list[str], gap: bool = False) -> None:
-        """UI thread. Show a saved console _prepare_saved read and wrapped, unless a newer paint superseded it."""
-        if gen != self._paint_gen or source != self._current_source or not self._saved_shown(source) \
-                or not self._screen_open:
+                     width: int, matched: int, total: int, kept: int, newer: list[str], gap: bool = False, *,
+                     kinds: list | None = None, context: tuple | None = None, preview: bool = False) -> None:
+        """UI thread. Show a saved console _prepare_saved read and wrapped, unless a newer paint superseded it.
+        ``preview``: only its newest chunks, while the rest downloads (see _console_preview)."""
+        shown = self._saved_shown(source) or (preview and source in self._stdout_preview)
+        if gen != self._paint_gen or source != self._current_source or not shown or not self._screen_open:
             return
         self._repainting = False
         self._display_cache.update(displays)
+        self._saved_matched = matched  # the filter's count, over the whole console (see _log_chips)
         # The TUI's own lines (shown untagged), after the console's.
         # A job that never got GPUs has no saved logs still to come.
         notes = ([self._Note(self._recent_console_note(console=console, newer=len(newer)))]
-                 if self._stdout_recent and not views.never_started(self._ended_job()) else [])
+                 if self._stdout_recent and not preview and not views.never_started(self._ended_job()) else [])
+        # Above a preview: its first line isn't the console's.
+        head = ([self._Note(f"— the saved console's last {self._CONSOLE_PREVIEW_SECONDS // 60} minutes; "
+                            "the older lines are still downloading —")] if preview else [])
         empty = False
         if console:
             self._saved_dropped = matched - kept
@@ -1430,11 +1677,13 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             self._saved_matched_none = total > 0 and not chunks
         if self._paused:
             # Shown once the pause ends (p).
-            self._held = ([line for line, _, _ in chunks] + extra + notes, empty)
+            self._held = (head + [line for line, _, _ in chunks] + extra + notes, empty)
         else:
             self._held = None
             self._clear_pane()
-            self._write_chunks(chunks, width, cut=cut)
+            if head:
+                self._write_lines(head)
+            self._write_chunks(chunks, width, cut=cut, kinds=kinds, context=context)
             if extra or notes:
                 self._write_lines(extra + notes)
             elif not chunks and empty:
@@ -1453,7 +1702,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             return
         self._stdout_inflight = False
         self._stdout_first = None
-        self._download_note = None
+        self._download_note = self._download_chunks = None
         if not ok:
             self._stdout_failed = True
             if self._current_source in self._stdout_have:
@@ -1474,6 +1723,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         self._stdout_recent = recent
         self._stdout_again = False
         self._stdout_have.clear()
+        self._stdout_preview.clear()
         if painted:
             self._render_log_status()
         else:
@@ -1484,6 +1734,8 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         if reason is not None:
             self._job_reason = reason
         self._update_subtitle()
+        self._render_summary_line()  # the status badge, and the reason beside it
+        self._paint_sources()
         if self._resource_active():
             self._render_resource()
 
@@ -1542,6 +1794,11 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             return
         if self._resource_active() and self._resource_waiting() is None:
             self._start_resource_refresh(force=True)
+        elif self._checkpoints_active():
+            self._start_checkpoint_refresh(force=True)
+        pane = self._detail_pane()
+        if pane is not None:
+            pane.refresh_live()
 
     def _next_job_read(self) -> int:
         """Any thread. The number of a get_job about to be sent: a read sent later has a larger one."""
@@ -1584,6 +1841,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         if job.get("status"):
             self._job_reason = job.get("reason")
         self._render_summary_line()
+        self._paint_sources()  # its sub-jobs' statuses
         return True
 
     def _tail_status(self, sub_job_id: str | None) -> str:
@@ -1739,6 +1997,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         self._paint_gen += 1
         self._repainting = False
         self._update_subtitle()
+        self._paint_sources()  # the list marks the sub-job shown
         self._clear_pane()
         if not self._stdout_ready and self._kept_console():
             self._stdout_ready = True  # finished long ago and downloaded before: replay it
@@ -1746,7 +2005,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         live = self._live()
         if self._stdout_ready or not live:
             self._idle_paused = False  # nothing polls now, so nothing is paused
-        if self._saved_shown(sub_job_id):
+        if self._console_shown(sub_job_id):
             self._paint_saved()
             if not self._stdout_ready and not live and self._claim_stdout():
                 # The other sub-jobs' consoles, again after they failed (r).
@@ -1843,7 +2102,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         """UI thread. One page of the tail started as ``gen`` (or its cache replay)."""
         # Checked here, on the UI thread, so a page of an older tail, or one that
         # was in flight when the saved console replaced the pane, is dropped.
-        if gen != self._tail_gen or self._saved_shown(self._current_source) or not self._screen_open:
+        if gen != self._tail_gen or self._console_shown(self._current_source) or not self._screen_open:
             return
         if kind == "partial":
             # Older lines of this log are neither here nor coming (the tail read only its end).
@@ -2014,8 +2273,11 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         except NoMatches:
             return
         idle = self._idle_note() if self._idle_paused and self._tail_live else None
+        # A download's chunk count shows on the bar (see _log_live), unless the sub-job on
+        # screen has its console already and the count is the other sub-jobs'.
+        download = None if self._download_shown() else self._download_note
         notes = (self._job_read_note(), self._waiting_note, self._tail_error, self._no_answer_note(),
-                 self._behind_note, idle, self._restart_note, self._download_note, self._no_match_note(),
+                 self._behind_note, idle, self._restart_note, download, self._no_match_note(),
                  self._scrollback_note(), self._export_note)
         bits = [bit for bit in notes if bit]
         # One row: a reason or id from the service can carry a line break or an
@@ -2037,6 +2299,110 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             changed = True
         if changed and following:
             after_refresh(self, lv.scroll_end, animate=False)
+        self._render_log_bar()
+
+    # ─── the bar under the pane ──────────────────────────────────────────
+    _PROGRESS_CELLS = 12  # the download's bar (see _log_live)
+
+    def _download_shown(self) -> bool:
+        """Whether the bar shows a saved-console download's progress: the sub-job on screen's own."""
+        return (self._download_chunks is not None and self._stdout_inflight
+                and not self._saved_shown(self._current_source))
+
+    def _away_from_end(self) -> bool:
+        """The reader isn't following the log: paused (p, or a jump), or scrolled up from its end."""
+        lv = self._logview
+        return self._paused or (lv is not None and bool(self._shown_lines) and not lv.is_vertical_scroll_end)
+
+    @staticmethod
+    def _bar_state(glyph: str, word: str, color: str, detail: str = "") -> Content:
+        return Content.assemble((f"{glyph} {word}", f"bold {color}"), (f" · {detail}" if detail else "", theme.MUTED))
+
+    def _log_live(self) -> Content:
+        """The bar's left end: what the pane shows, and whether it follows the log.
+        ``● LIVE · following``, ``⏸ PAUSED · 12 new lines · p resumes``, ``✓ SAVED CONSOLE``,
+        a download's progress, or the wait the status line above explains."""
+        source = self._current_source
+        state = self._bar_state
+        if not source:
+            return state("◌", "READING", theme.MUTED, "the job") if self._job_read_started is not None else Content("")
+        if self._saved_shown(source):
+            if self._repainting:
+                return state("◌", "SAVED CONSOLE", theme.MUTED, "loading")
+            held = "a newer copy came · p shows it" if self._held is not None else ""
+            return state("✓", "SAVED CONSOLE", theme.ENDED, held)
+        if self._download_shown():
+            name, done, total = self._download_chunks
+            filled = round(self._PROGRESS_CELLS * done / total) if total else 0
+            return Content.assemble(("↓ DOWNLOADING", f"bold {theme.INFO}"), (f" {name} ", theme.MUTED),
+                                    ("━" * filled, theme.INFO), ("━" * (self._PROGRESS_CELLS - filled), theme.FAINT),
+                                    (f" {done:,}/{total:,} chunks", theme.MUTED))
+        if self._stdout_inflight:
+            return state("↓", "DOWNLOADING", theme.INFO, "saved console")
+        if self._waiting:
+            return state("○", "WAITING", theme.WARN)
+        if self._tail_live:
+            if self._idle_paused:
+                return state("⏸", "PAUSED", theme.WARN, "no input · p resumes")
+            if self._away_from_end():
+                new = f"{self._count(self._unseen, 'new line')} · " if self._unseen else ""
+                # Paused (p, or a jump) as the subtitle says, or only scrolled up from the end.
+                if self._paused:
+                    return state("⏸", "PAUSED", theme.WARN, f"{new}p resumes")
+                return state("↑", "SCROLLED UP", theme.WARN, f"{new}p follows")
+            return state("●", "LIVE", theme.OK, "catching up" if self._behind_note else "following")
+        if self._tail_error:
+            return state("✕", "STOPPED", theme.ERR, "r retries")
+        return state("◌", "CACHED", theme.MUTED, "saved on this machine")
+
+    @staticmethod
+    def _chip(text: str, color: str) -> tuple[str, str]:
+        return f" {text} ", f"{color} on {theme.PANEL}"
+
+    def _log_chips(self) -> Content:
+        """The bar's right end: what the last jump (e, n) found, the level, and the filter's matches."""
+        chips: list[tuple[str, str]] = []
+        if self._jump is not None:
+            noun, n, total = self._jump
+            place = f"{n:,}" if n else "–"  # (the marked line has left the pane)
+            chips.append(self._chip(f"{noun} {place}/{total:,}" if total else f"no {noun}s",
+                                    theme.ERR if noun == "error" else theme.WARN))
+        if self._min_level:
+            chips.append(self._chip(f"≥ {self._min_level}", theme.ERR if self._min_level == "ERROR" else
+                                    theme.WARN if self._min_level == "WARNING" else theme.INFO))
+        if self._filter:
+            if self._repainting or self._repaint_job is not None:
+                chips.append(self._chip("filtering…", theme.MUTED))
+            else:
+                count = self._saved_matched if self._saved_shown(self._current_source) else self._shown_logs
+                words = f"{count:,} match" + ("" if count == 1 else "es") if count else "no matches"
+                chips.append(self._chip(words, theme.ACCENT if count else theme.WARN))
+        parts: list = []
+        for chip in chips:
+            parts += [chip, " "]
+        return Content.assemble(*parts[:-1])
+
+    def _render_log_bar(self) -> None:
+        """UI thread. Draw the bar under the pane again, when what it says changed."""
+        try:
+            live = self.query_one("#log-live", Static)
+            chips = self.query_one("#log-chips", Static)
+        except NoMatches:
+            return
+        shown = (self._log_live(), self._log_chips())
+        key = tuple((content.plain, tuple(content.spans)) for content in shown)
+        if key != self._log_bar_key:  # it is asked after every page and every scroll
+            self._log_bar_key = key
+            live.update(shown[0])
+            chips.update(shown[1])
+
+    def _log_scrolled(self) -> None:
+        """UI thread. The pane scrolled (keys, the mouse, or following the log): back at its end,
+        the lines that came meanwhile have been seen."""
+        lv = self._logview
+        if lv is not None and self._unseen and not self._paused and lv.is_vertical_scroll_end:
+            self._unseen = 0
+        self._render_log_bar()
 
     def _report_tail_error(self, sub_job_id: str, exc: BaseException, gen: int, *, label: str | None = None) -> None:
         """Worker thread. ``label``: what the error log calls the traceback."""
@@ -2148,7 +2514,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             return "wait", label
         # The job ended: show its saved console now.
         if not self._claim_stdout():
-            if self._saved_shown(self._current_source):
+            if self._console_shown(self._current_source):
                 self._paint_saved()
             return None
         return "download", self._current_source or ""
@@ -2234,10 +2600,14 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             self._console_warnings(results, plan.root)
             return True
         # Resumed in this view's own directory: a sub-job fetched already only gets newer chunks.
+        # Its newest chunks come first, shown until its whole console is in.
+        preview = _download_options(self._client.download_stdout_logs, {
+            "preview_seconds": self._CONSOLE_PREVIEW_SECONDS,
+            "on_preview": lambda entry: self._console_preview(entry, plan.root)})
         try:
             results = self._client.download_stdout_logs(
                 self._job_id, plan.root, sub_job_ids=[plan.first], resume=True,
-                on_chunk=self._download_progress(first=True, others=plan.others), **quiet)
+                on_chunk=self._download_progress(first=True, others=plan.others), **quiet, **preview)
             self._console_warnings(results, plan.root)
         except NoChunksError:
             pass  # the sub-job on screen saved no console (yet): the others still come
@@ -2249,6 +2619,33 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             on_chunk=self._download_progress(first=False, others=plan.others), **quiet)
         self._console_warnings(results, plan.root)
         return True
+
+    def _console_preview(self, entry: dict, root: str) -> None:
+        """Worker thread. The client's preview of the sub-job on screen, its console's newest
+        chunks: kept in this view's directory (the client removes its own copy) and shown
+        until the whole console is in."""
+        source = entry.get("sub_job_id")
+        if not source or not root or not self._screen_open:
+            return
+        target = Path(root) / ".preview" / source / "stdout.log"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(entry["path"], target)
+        except (OSError, KeyError, TypeError):
+            return  # no preview: the whole console shows once it is in
+        try:
+            self._post(self._show_console_preview, source, target)
+        except self._CallbackError:
+            # A bug in showing it must not fail the download it previews.
+            log_traceback("showing a saved console's newest lines failed (a bug in the TUI)")
+
+    def _show_console_preview(self, source: str, path: Path) -> None:
+        """UI thread. A sub-job's newest saved-console lines, while the rest downloads."""
+        if not self._screen_open or self._saved_shown(source):
+            return
+        self._stdout_preview[source] = path
+        if source == self._current_source:
+            self._paint_saved()
 
     def _console_warnings(self, results, root) -> None:
         """Worker thread. Pass a saved-console download's warnings to the UI thread."""
@@ -2323,7 +2720,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             else:
                 text = f"downloading the other sub-jobs' saved consoles: {name}, chunk {done:,} of {total:,}"
             try:
-                self._post(self._show_download_note, text)
+                self._post(self._show_download_note, text, (name, done, total))
             except self._CallbackError:
                 # A bug in drawing the count: it must not fail the download, which this call is part of.
                 last[0] = -1.0  # no more counts
@@ -2331,9 +2728,11 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
 
         return progress
 
-    def _show_download_note(self, text: str | None) -> None:
-        if self._screen_open and text != self._download_note:
+    def _show_download_note(self, text: str | None, chunks: tuple[str, int, int] | None = None) -> None:
+        """UI thread. ``chunks``: (sub-job, chunks done, of them), drawn as a bar (see _log_live)."""
+        if self._screen_open and (text, chunks) != (self._download_note, self._download_chunks):
             self._download_note = text
+            self._download_chunks = chunks
             self._render_log_status()
 
     def _first_console_in(self, source: str, recent: bool) -> None:
@@ -2341,9 +2740,11 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         if not self._screen_open:
             return
         self._stdout_have.add(source)
+        self._stdout_preview.pop(source, None)  # the whole console replaces its newest lines
         self._stdout_recent = recent
         # Until the others' first chunk is counted (their listing can take a while).
         self._download_note = "downloading the other sub-jobs' saved consoles" if self._stdout_others else None
+        self._download_chunks = None
         if source == self._current_source:
             self._paint_saved()
         else:
@@ -2497,9 +2898,13 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             self.clear_selection()
         self._shown_lines = []
         self._shown_rows = []
+        self._shown_kinds = []
         self._rows_total = 0
         self._shown_logs = 0
         self._pane_truncated = False
+        self._last_day, self._in_traceback = None, NO_TRACEBACK
+        self._unseen = 0
+        self._jump = None
         if self._logview is not None:
             self._logview.clear()
             self._logview.max_lines = self._MAX_ROWS
@@ -2509,8 +2914,8 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             # empty pane starts at its top, which is also its end.
             self._logview.scroll_home(animate=False, immediate=True, force=True)
 
-    def _trim_shown(self) -> None:
-        """Drop the oldest shown lines past _MAX_LINES lines or _MAX_ROWS wrapped rows."""
+    def _trim_shown(self) -> int:
+        """Drop the oldest shown lines past _MAX_LINES lines or _MAX_ROWS wrapped rows; how many went."""
         lines, rows = self._shown_lines, self._shown_rows
         drop = max(0, len(lines) - self._MAX_LINES)
         total = self._rows_total - sum(rows[:drop])
@@ -2522,9 +2927,36 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             self._shown_logs -= self._log_lines(lines[:drop])
             del lines[:drop]
             del rows[:drop]
+            del self._shown_kinds[:drop]
             if not self._pane_truncated:
                 self._pane_truncated = True
                 self._render_log_status()
+        return drop
+
+    # How far down the pane the first dated line is looked for, to put its day's rule back.
+    _RULE_LOOK_AHEAD = 50
+
+    def _rule_the_top(self, width: int) -> None:
+        """UI thread, once the oldest lines went with the day's rule above the first of them:
+        put the rule back above the first dated line left, so the pane's top still says the day.
+        A list insert and a check a page, and only while a long log keeps the pane full."""
+        lv = self._logview
+        if not isinstance(lv, _LogPane) or len(lv.lines) != self._rows_total:
+            return
+        row = 0
+        for index, line in enumerate(self._shown_lines[:self._RULE_LOOK_AHEAD]):
+            day = None if isinstance(line, self._Note) else display_day(self._display(line))
+            if day:
+                if lv.row_kinds[row] != DAY_KIND:
+                    following = not self._paused and lv.is_vertical_scroll_end
+                    lv.insert_row(row, day_rule(day, width), DAY_KIND)
+                    self._shown_rows[index] += 1
+                    self._rows_total += 1
+                    lv.max_lines = self._rows_total
+                    if following:
+                        lv.scroll_end(animate=False, immediate=True, x_axis=False)
+                return
+            row += self._shown_rows[index]
 
     def _write_lines(self, lines: list[str]) -> None:
         lv = self._logview
@@ -2555,10 +2987,11 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         self._write_chunks(chunks, w, cut=len(chunks) < len(lines))
 
     def _write_chunks(self, chunks: list[tuple[str, list[str], int]], width: int, *, cut: bool = False,
-                      kinds: list | None = None) -> None:
+                      kinds: list | None = None, context: tuple | None = None) -> None:
         """UI thread. Append lines already wrapped to ``width``: (line, its rows, row count) each.
-        ``cut``: older lines of the same batch didn't fit; ``kinds``: each line's row kind, when
-        it was worked out with the wrapping (see _write_rows)."""
+        ``cut``: older lines of the same batch didn't fit. ``kinds`` and ``context``: each line's
+        kind, and (each row's kind, the newest day, where a traceback stands), when they were
+        worked out with the wrapping for an empty pane (see in_context); else here."""
         lv = self._logview
         if lv is None or not chunks or not self._screen_open:
             return
@@ -2567,6 +3000,30 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             # keeps one unbroken run of the newest lines.
             self._clear_pane()
         fresh = not self._shown_lines
+        if context is not None and not fresh:
+            # Worked out for an empty pane, which this isn't (its callers clear it first): the
+            # rules it put in go, and the kinds are worked out again after the lines on screen.
+            rows, at = context[0], 0
+            unruled = []
+            for line, pieces, count in chunks:
+                ruled = count > 1 and at < len(rows) and rows[at] == DAY_KIND
+                unruled.append((line, pieces[1:], count - 1) if ruled else (line, pieces, count))
+                at += count
+            chunks = unruled
+            kinds = context = None
+        if context is None:
+            if kinds is None:
+                kinds = [line_kind(self._display(line), note=isinstance(line, self._Note)) for line, _, _ in chunks]
+            texts = [None if isinstance(line, self._Note) else self._display(line) for line, _, _ in chunks]
+            chunks, kinds, row_kinds, day, in_block = in_context(chunks, kinds, texts, width, self._last_day,
+                                                                 self._in_traceback)
+        else:
+            row_kinds, day, in_block = context
+        self._last_day, self._in_traceback = day, in_block
+        # The lines that come while the reader is away from the end (see _log_live); not a
+        # pane drawn anew (a re-wrap while paused), whose lines were there already.
+        if not fresh and (self._paused or not lv.is_vertical_scroll_end):
+            self._unseen += self._log_lines(line for line, _, _ in chunks)
         # Always stick to the tail so every viewer sees the newest lines on
         # open and as they stream — cache replay and live alike. Pause is the
         # one escape hatch: it stops following so the user can scroll back.
@@ -2579,37 +3036,37 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         added = sum(rows for _, _, rows in chunks)
         self._shown_lines.extend(line for line, _, _ in chunks)
         self._shown_rows.extend(rows for _, _, rows in chunks)
+        self._shown_kinds.extend(kinds)
         self._shown_logs += self._log_lines(line for line, _, _ in chunks)
         self._rows_total += added
         if cut and not self._pane_truncated:
             self._pane_truncated = True
             self._render_log_status()
-        self._trim_shown()
+        dropped = self._trim_shown()
         # The widget keeps exactly the rows of the lines kept above.
         before = len(lv.lines)
         lv.max_lines = max(1, self._rows_total)
         # One write_lines call per page keeps the UI responsive under
         # high-velocity logs (vs. a cross-thread hop + write per line).
-        self._write_rows(lv, wrapped, chunks, scroll_end=follow, kinds=kinds)
+        self._write_rows(lv, wrapped, row_kinds, scroll_end=follow)
         if follow and before + added > lv.max_lines:
             # Once full, Log drops its oldest rows and repaints only the rows past
             # its old end, which that has moved out of view, and a view already
             # at the end doesn't scroll: repaint it, or the newest lines don't show.
             lv.refresh()
+        if dropped:
+            self._rule_the_top(width)
+        if self._jump is not None:
+            self._recount_jump()  # lines came (or went): the chip's count follows them
         if len(self._display_cache) > 4 * self._MAX_LINES:
             self._prune_display_cache()
 
-    def _write_rows(self, lv: Log, rows: list[str], chunks, *, scroll_end: bool, kinds: list | None = None) -> None:
-        """Write ``rows`` (the pieces of ``chunks``: (line, its rows, row count) each) to the pane.
-        ``kinds``: each chunk's row kind (see line_kind), worked out here when not given."""
+    @staticmethod
+    def _write_rows(lv: Log, rows: list[str], row_kinds: list, *, scroll_end: bool) -> None:
+        """Write ``rows`` to the pane, with each one's kind (see in_context)."""
         if not isinstance(lv, _LogPane):
             lv.write_lines(rows, scroll_end=scroll_end)
             return
-        if kinds is None:
-            kinds = [line_kind(self._display(line), note=isinstance(line, self._Note)) for line, _, _ in chunks]
-        row_kinds: list[str | None] = []
-        for kind, (_line, _pieces, count) in zip(kinds, chunks):
-            row_kinds += [kind] * count
         lv.write_rows(rows, row_kinds, scroll_end=scroll_end)
 
     def _prune_display_cache(self) -> None:
@@ -2630,7 +3087,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         if job is not None:
             # A repaint is on its way (a new filter's, say): it is made again for this width.
             self._repaint(job.pairs, job.query, job.level, rewrap=job.rewrap, truncated=job.truncated, top=job.top,
-                          keep_pending=True)
+                          keep_pending=True, mark=job.mark)
         elif not self._shown_lines:
             self._wrap_width = w  # nothing to wrap
         else:
@@ -2640,8 +3097,12 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             if self._paused:
                 top = self._pending_top if self._pending_top is not None else self._line_at_row(
                     int(lv.scroll_offset.y))
+            # And the line a jump (e) marked stays marked, its place among the others too.
+            mark = None
+            if isinstance(lv, _LogPane) and lv.mark is not None and self._jump is not None:
+                mark = (self._line_at_row(lv.mark[0]), self._jump)
             self._repaint([(None, line) for line in self._shown_lines], rewrap=True, truncated=self._pane_truncated,
-                          top=top)
+                          top=top, mark=mark)
 
     # ─── repaints: the pane's lines filtered and wrapped off the UI thread ──
     @dataclass(frozen=True)
@@ -2655,9 +3116,10 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         rewrap: bool  # the lines on screen, at a new width (a highlight on them stays, as it always has)
         truncated: bool  # the pane doesn't hold the source's oldest lines, whatever this repaint fits
         top: int | None  # a paused reader's line (an index into pairs), back at the top of the view after
+        mark: tuple | None = None  # (the line a jump marked, an index into pairs; what _jump said of it)
 
     def _repaint(self, pairs: list, query: str = "", level=None, *, rewrap: bool = False, truncated: bool = False,
-                 top: int | None = None, keep_pending: bool = False) -> None:
+                 top: int | None = None, keep_pending: bool = False, mark: tuple | None = None) -> None:
         """UI thread. Show the ``pairs`` ((entry, line) each, oldest first, the TUI's notes among
         them) that pass ``query`` and ``level``, filtered and wrapped off the UI thread
         (_prepare_rows) and shown by _apply_rows: the pane's 20,000 lines take a while, and keys
@@ -2670,7 +3132,8 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         if not keep_pending:
             self._repaint_pending = []
         self._repaint_gen += 1
-        self._repaint_job = job = self._Repaint(pairs, query, level, self._content_width(), rewrap, truncated, top)
+        self._repaint_job = job = self._Repaint(pairs, query, level, self._content_width(), rewrap, truncated, top,
+                                                mark)
         # The worker reads none of the view's state: what it needs is passed as it is now.
         self._prepare_rows(self._repaint_gen, job, self._line_prefixes(), dict(self._display_cache))
 
@@ -2693,16 +3156,19 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
 
     @classmethod
     def _wrap_pairs(cls, pairs: list, query: str, level, width: int, prefixes: tuple[str, str], known: dict,
-                    cancelled) -> tuple[list, list, dict, bool] | None:
+                    cancelled) -> tuple[list, list, tuple, dict, bool] | None:
         """Any thread. The newest of ``pairs`` that pass ``query`` and ``level`` (the TUI's notes
         always do), wrapped to ``width`` from the newest back as far as the pane's line and row
-        budgets reach. Returns ``(chunks, kinds, displays, cut)`` for _write_chunks: each kept
-        line's rows and row kind (see line_kind), the display text of the log lines ``known``
-        lacked, and whether an older line that passes didn't fit; None once ``cancelled()``."""
+        budgets reach. Returns ``(chunks, kinds, context, displays, cut)`` for _write_chunks: each
+        kept line's rows and kind (see line_kind and in_context), the context they leave the pane
+        in (each row's kind, the newest day, where a traceback stands), the display text of the
+        log lines ``known`` lacked, and whether an older line that passes didn't fit; None once
+        ``cancelled()``."""
         first, rest = prefixes
         query = query.lower()
         chunks: list[tuple[str, list[str], int]] = []
         kinds: list[str | None] = []
+        texts: list[str | None] = []
         displays: dict[str, str] = {}
         total = 0
         cut = False
@@ -2715,7 +3181,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
             if len(chunks) >= cls._MAX_LINES:
                 cut = True
                 break
-            if note:  # as _display and _prefixes show it
+            if note:  # as _display, _wrap and _prefixes show it
                 text = safe_text(line)
                 pieces = wrap_log_line(text, width, max_rows=cls._MAX_ROWS_PER_LINE)
             else:
@@ -2724,19 +3190,24 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
                     text = displays.get(line)
                     if text is None:
                         text = displays[line] = display_line(line)
-                pieces = wrap_log_line(text, width, first=first, rest=rest, max_rows=cls._MAX_ROWS_PER_LINE)
+                pieces = wrap_log_line(compact_stamp(text), width, first=first, rest=rest,
+                                       max_rows=cls._MAX_ROWS_PER_LINE)
             rows = cls._row_count(pieces)
             if chunks and total + rows > cls._MAX_ROWS:
                 cut = True
                 break
             chunks.append((line, pieces, rows))
             kinds.append(line_kind(text, note=note))
+            texts.append(None if note else text)
             total += rows
         chunks.reverse()
         kinds.reverse()
-        return chunks, kinds, displays, cut
+        texts.reverse()
+        # The pane is drawn anew from these: their context starts with them (see in_context).
+        chunks, kinds, row_kinds, day, in_block = in_context(chunks, kinds, texts, width)
+        return chunks, kinds, (row_kinds, day, in_block), displays, cut
 
-    def _apply_rows(self, gen: int, chunks: list, kinds: list, displays: dict, cut: bool) -> None:
+    def _apply_rows(self, gen: int, chunks: list, kinds: list, context: tuple, displays: dict, cut: bool) -> None:
         """UI thread. Show what _prepare_rows filtered and wrapped, then the lines written meanwhile,
         unless a newer repaint, or a clear, superseded it."""
         job = self._repaint_job
@@ -2749,7 +3220,7 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         self._reset_pane(keep_selection=job.rewrap)
         self._wrap_width = job.width
         # One write for the whole buffer: a call per row took seconds at 20,000 lines.
-        self._write_chunks(chunks, job.width, cut=cut, kinds=kinds)
+        self._write_chunks(chunks, job.width, cut=cut, kinds=kinds, context=context)
         if job.truncated and not self._pane_truncated:
             self._pane_truncated = True  # older lines had left the view before this repaint
         self._write_lines(pending)
@@ -2761,6 +3232,12 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         elif job.top is not None:
             self._pending_top = max(0, job.top - (len(job.pairs) - len(chunks)))
             after_refresh(self, self._scroll_to_pending_top)
+        if job.mark is not None and job.mark[0] is not None:
+            index = job.mark[0] - (len(job.pairs) - len(chunks))  # (unless the line was dropped)
+            if 0 <= index < len(self._shown_lines) and isinstance(lv, _LogPane):
+                lv.set_mark(self._line_rows(index))
+                self._jump = job.mark[1]
+                self._recount_jump()
         if job.width != self._content_width():
             after_refresh(self, self._rewrap)  # the pane changed width meanwhile
         self._render_log_status()
@@ -2770,6 +3247,25 @@ class LogScreen(ResourceTab, FollowsPointer, Screen):
         top, self._pending_top = self._pending_top, None
         if top is not None and self._logview is not None:
             self._logview.scroll_to(y=sum(self._shown_rows[:top]), animate=False)
+
+    def _copied_text(self, start: tuple[int, int] | None, end: tuple[int, int] | None) -> str:
+        """UI thread (a copy). What a highlight from ``start`` to ``end`` copies: each line it
+        covers whole as it was logged (what ``s`` saves: its whole time, no day's rule, no
+        indent), and the highlighted part of one it covers in part (see format.copied_text)."""
+        lines = self._shown_lines
+        lv = self._logview
+        rows = list(lv.lines) if lv is not None else []
+        if len(rows) != sum(self._shown_rows):  # (never, but a copy must not fail): as drawn
+            return "\n".join(rows)
+
+        def shown(index: int) -> str:  # the text the line's rows were wrapped from (see _wrap)
+            line = lines[index]
+            return self._display(line) if isinstance(line, self._Note) else compact_stamp(self._display(line))
+
+        kinds = getattr(lv, "row_kinds", [])
+        rules = {row for row, kind in enumerate(kinds) if kind == DAY_KIND}
+        return log_format.copied_text(rows, self._shown_rows, lambda index: lines[index], shown, start, end,
+                                      indent=self._line_prefixes()[1], rules=rules)
 
     def _line_at_row(self, row: int) -> int | None:
         """The index in ``_shown_lines`` of the line drawn on pane row ``row``."""

@@ -10,6 +10,12 @@ point `train.py`, its dataset helpers in `task.py`, its identity evaluation in
 `identity.py`, its metadata in `example.yaml`, and its bundled data under
 `data/`. The entry point calls the shared SFT loop in `runner.py`.
 
+The same engine also runs [DARE-Bench agent SFT](dare/README.md). It
+fine-tunes all parameters of Qwen3-8B on DARE-Bench's multi-turn data-science
+agent traces, in which the model calls a `python_executor` tool, and scores
+the result on the benchmark's eval split with a local agent loop. 
+Setup, results, and configuration are in its README.
+
 ## Hardware
 
 Training GPUs are `n_gpus` in the job's training file (`NUM_TRAINING_GPUS`).
@@ -292,14 +298,16 @@ a Snowflake experiment; results are viewable in Snowsight under
 [Snowflake ML Experiments docs](https://docs.snowflake.com/en/developer-guide/snowflake-ml/experiments).
 
 Each step logs `train_nll` (the server's `avg_loss`) and `loss_weight_sum`, the
-sum of `loss_mask` over the batch. On the default memorize task, `train_nll`
-should fall quickly and `loss_weight_sum` should stay constant from step to
-step. After save, the example prints one generate command whose `model=`,
-`context=`, `hardware=` and `lora=` pick the catalog inference file that serves
-the checkpoint: the run's model, hardware and mode, with the same adapter for
-LoRA, at the run's context or, when the model has no such file there, at the
-other one (some models have standard training files but only long inference
-files). When no catalog file fits, the command has
+sum of `loss_mask` over the batch. A task with a held-out set
+(`load_eval_dataset()`, as in [`dare/`](dare/README.md)) also logs `valid_nll`
+every `eval_every` steps, and after the last step. On the default memorize task,
+`train_nll` should fall quickly and `loss_weight_sum` should stay constant from
+step to step. After save, the example prints one generate command whose
+`model=`, `context=`, `hardware=` and `lora=` pick the catalog inference file
+that serves the checkpoint: the run's model, hardware and mode, with the same
+adapter for LoRA, at the run's context or, when the model has no such file
+there, at the other one (some models have standard training files but only long
+inference files). When no catalog file fits, the command has
 `job_config=INFERENCE_JOB_CONFIG` instead, and a warning says what that
 inference job needs. When running that command, Assistant text should be
 `Snowflake AI Research`.

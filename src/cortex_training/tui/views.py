@@ -41,6 +41,7 @@ from cortex_training.tui.format import _num as compact_number
 from cortex_training.tui.format import cut_cells
 from cortex_training.tui.format import _subjob_config as subjob_config
 from cortex_training.tui.format import format_created_at
+from cortex_training.tui.format import local_time
 from cortex_training.tui.format import parse_ts  # noqa: F401 - views.parse_ts for the screens
 from cortex_training.tui.format import printable
 from cortex_training.tui.format import source_label
@@ -80,6 +81,51 @@ def fmt_ago(raw: Any, now: datetime) -> str:
             return "just now"
         return f"{fmt_duration(-seconds)} ahead of this computer's clock"
     return f"{fmt_duration(seconds)} ago"
+
+
+# The job list's times are read at a glance, so they are coarse: one unit, in a
+# column 8 cells wide. Each helper also says how many seconds its text stays
+# the same, so the list rebuilds a row only once its text would change.
+
+
+def list_age(seconds: Optional[float]) -> tuple[str, float]:
+    """How long ago, as the job list's Created and Updated show it (``just now``,
+    ``12m ago``, ``3h ago``, ``45d ago``), and the seconds until that reads
+    differently; ``—`` (never changing) without a time.
+
+    A time slightly ahead of this computer's clock (see :data:`CLOCK_SKEW_SECONDS`)
+    is ``just now``; one further ahead reads ``in 2h``.
+    """
+    if seconds is None:
+        return "—", math.inf
+    if seconds < 0:
+        if -seconds <= CLOCK_SKEW_SECONDS:
+            return "just now", 60 - seconds  # until a minute after it
+        return f"in {list_age(-seconds)[0].removesuffix(' ago')}", 60.0
+    s = int(seconds)
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= size:
+            return f"{s // size}{unit} ago", size - seconds % size
+    return "just now", 60 - seconds
+
+
+def list_span(seconds: Optional[float]) -> tuple[str, float]:
+    """A job's run so far or its whole run, as the job list's Duration shows it
+    (``40s``, ``12m``, ``3h 05m``, ``2d 4h``), and the seconds until a span that
+    goes on growing reads differently; ``—`` without one."""
+    if seconds is None or seconds < 0:
+        return "—", math.inf
+    s = int(seconds)
+    d, rest = divmod(s, 86400)
+    h, rest = divmod(rest, 3600)
+    m, sec = divmod(rest, 60)
+    if d:
+        return f"{d}d {h}h", 3600 - seconds % 3600
+    if h:
+        return f"{h}h {m:02d}m", 60 - seconds % 60
+    if m:
+        return f"{m}m", 60 - seconds % 60
+    return f"{sec}s", 1 - seconds % 1
 
 
 def status_word(status: Any) -> str:
@@ -470,32 +516,154 @@ def subjob_config_summary(sj: dict) -> str:
     return " · ".join(bits)
 
 
-def summary_fields(job: dict, now: datetime) -> list:
-    """(label, value) rows for the job preview, in display order."""
-    models = job_models(job)
-    elapsed = job_elapsed(job, now)
-    # Elapsed runs from creation, so it includes any time spent queued or placing.
-    if is_unknown(job):
-        note = "includes queue time; status unavailable"
-    elif is_live(job):
-        note = f"includes queue time; {status_word(job.get('status'))}, so far"
-    else:
-        note = "includes queue time"
+def preview_facts(job: dict, now: datetime) -> list:
+    """(label, value) facts for the job preview's grid, in display order.
+
+    The id, status and elapsed time head the preview, and its lifecycle has a
+    row of its own, so they are not here. A time the job record lacks is ``—``,
+    with no "ago" after it.
+    """
     location = location_label(job)
     # The age only beside a time that is shown: a dash has none.
     updated, ago = format_created_at(job.get("updated_at")) or "—", fmt_ago(job.get("updated_at"), now)
     return [
-        ("Job ID", job_id_of(job)),
-        *([("Location", location)] if location else []),
-        ("Status", status_word(job.get("status")).upper()),
-        ("Model", ", ".join(models) or "—"),
+        ("Model", ", ".join(job_models(job)) or "—"),
         ("Type", job_type_label(job)),
-        ("Owner", owner(job)),
         ("GPUs", gpu_request_text(job)),
+        ("Owner", owner(job)),
         ("Created", format_created_at(job.get("created_at")) or "—"),
-        ("Elapsed", fmt_duration(elapsed) + (f"  ({note})" if elapsed is not None else "")),
         ("Last update", f"{updated}  ({ago})" if "—" not in (updated, ago) else updated),
+        *([("Schema", location)] if location else []),
     ]
+
+
+def elapsed_text(job: dict, now: datetime) -> str:
+    """The time beside the preview's status: ``12m 04s so far`` while the job is
+    live, ``lasted 1h 20m`` once it ended, ``""`` without a creation time.
+
+    It runs from creation (:func:`job_elapsed`), so it includes any time spent
+    queued or placing: "lasted", not "ran", since a job may never have run.
+    """
+    seconds = job_elapsed(job, now)
+    if seconds is None:
+        return ""
+    return f"{fmt_duration(seconds)} so far" if is_live(job) else f"lasted {fmt_duration(seconds)}"
+
+
+def short_time(raw: Any, now: datetime) -> str:
+    """A local ``YYYY-MM-DD HH:MM``, without the date when it is the same local
+    day as ``now`` (``15:14``, or ``2026-10-12 16:02``); ``—`` without a time."""
+    dt = raw if isinstance(raw, datetime) else parse_ts(raw)
+    text = local_time(dt) if dt else ""
+    if not text:
+        return "—"
+    return text[11:] if text[:10] == local_time(now)[:10] else text
+
+
+@dataclass(frozen=True)
+class LifeStep:
+    """One step of a job's lifecycle on the preview."""
+
+    status: str  # a status word (drawn with its glyph and color), or "created" / "now"
+    label: str
+    at: str = ""  # when the step began, "" when the job record has no time for it
+    then: str = ""  # how long until the next step, "" when the record can't tell
+
+
+def lifecycle(job: dict, now: datetime) -> list:
+    """The :class:`LifeStep` s from the job's creation to its current state, and on
+    to now while it is live.
+
+    The job record has two times: ``created_at`` and ``state_changed_at``, when
+    it entered its current status. So there are no steps for the states between
+    (a running job's time pending and placing is in its first gap), and none for
+    a time the record lacks; an ended job's current state began when it ended.
+    An ``unknown`` job's state has no time: the service could not read it.
+    """
+    created = parse_ts(job.get("created_at"))
+    word = status_word(job.get("status"))
+    changed = parse_ts(job.get("state_changed_at")) if word != "unknown" else None
+    steps = []
+    if created:
+        gap = (changed - created).total_seconds() if changed else None
+        steps.append(LifeStep("created", "Created", short_time(created, now),
+                              fmt_duration(gap) if gap is not None and gap >= 1 else ""))
+    if word == "unknown":
+        return [*steps, LifeStep("unknown", "status unavailable")]
+    name = word.capitalize()
+    if not changed:
+        return [*steps, LifeStep(word, name)]
+    if not is_live(job):
+        return [*steps, LifeStep(word, name, f"{short_time(changed, now)} ({fmt_ago(changed, now)})")]
+    so_far = (now - changed).total_seconds()
+    if created and abs((changed - created).total_seconds()) < 1:
+        # In this state since it was created (a job still pending): one step says both.
+        steps, name = [], f"Created, {word}"
+    return [*steps, LifeStep(word, f"{name} since", short_time(changed, now),
+                             f"{fmt_duration(so_far)} so far" if so_far >= 0 else ""),
+            LifeStep("now", "now")]
+
+
+# What a waiting job is doing, by state, when the service sends no reason_details.
+WAITING_TEXT = {
+    "pending": "waiting to be placed on GPUs",
+    "queued": "waiting to be placed on GPUs",
+    "creating": "waiting to be placed on GPUs",
+    "placing": "waiting for its GPUs to come up",
+    "initializing": "placed on GPUs; loading the model and starting the engines",
+}
+_NO_LOGS = "It never got GPUs, so no sub-job started or wrote logs."
+
+
+@dataclass(frozen=True)
+class Callout:
+    """Why a job is where it is, for the preview's callout box."""
+
+    tone: str  # "failed", "waiting", "starting", "running", "ended" or "unknown": its color
+    status: str  # the status word whose glyph leads the title
+    title: str
+    reason: str = ""  # the service's reason code
+    details: str = ""  # the service's reason_details, or what the state means
+    hint: str = ""  # where to look next
+
+
+def health_callout(job: dict) -> Optional[Callout]:
+    """The preview's callout for ``job``, or ``None`` for a running job the
+    service says nothing more about (its status pill says it all).
+
+    The service's ``reason`` and ``reason_details`` show the same way for every
+    state; a failure always gets a reason (``not reported``).
+    """
+    word = status_word(job.get("status"))
+    reason, details = collapse(job.get("reason") or ""), collapse(job.get("reason_details") or "")
+    no_logs = _NO_LOGS if never_started(job) else ""
+    if word == "failed":
+        if no_logs:
+            return Callout("failed", word, "Failed before it got GPUs", reason or "not reported", details, no_logs)
+        return Callout("failed", word, "Why it failed", reason or "not reported", details,
+                       "l opens Logs: pick the failing sub-job on the left.")
+    if word in ("cancelled", "canceled"):
+        return Callout("ended", word, "Cancelled", reason, details, no_logs)
+    if word == "terminated":
+        return Callout("ended", word, "Terminated by the platform", reason, details, no_logs)
+    if word in ("succeeded", "completed", "done"):
+        return Callout("ended", word, "Completed", reason, details)
+    if word in WAITING_TEXT:
+        # The service says why a job waits (e.g. quota_filled) and, often, how far
+        # off it is; without that, what the state means.
+        title = "Starting up" if word == "initializing" else "Placing on GPUs" if word == "placing" \
+            else "Why it's waiting"
+        return Callout("starting" if word == "initializing" else "waiting", word, title, reason,
+                       details or WAITING_TEXT[word])
+    if word == "unknown":
+        # The service could not read the job's live state: it may still be running,
+        # unless the service says the control plane has no record of the job.
+        hint = "" if job_not_found(job) else "The job may still be running."
+        return Callout("unknown", word, "Status unavailable", details=status_unavailable_text(job), hint=hint)
+    if word == "running":
+        return Callout("running", word, "Running", reason, details) if reason or details else None
+    # A status this client doesn't know: the service's reason, if it sent one.
+    return Callout("unknown", word, word.capitalize(), reason, details) if reason or details else None
 
 
 def reason_text(job: dict) -> str:
@@ -574,8 +742,8 @@ SEARCH_FIELDS = {
     "lora_r": "LoRA rank",
     "lora_alpha": "LoRA alpha",
     "dtype": "dtype",
-    "db": "database name (= and != by SQL identifier rules)",
-    "schema": "schema name (= and != by SQL identifier rules)",
+    "db": "database name, or DB.SCHEMA (db=NAME reads that database from the server)",
+    "schema": "schema name, or DB.SCHEMA as the Schema column shows it",
 }
 # Fields that name where a job is. A row without a location (the configured
 # schema's own list) is in the configured database and schema, which the
@@ -833,12 +1001,48 @@ def search_haystack(job: dict) -> str:
     return fold(" ".join(str(b) for b in bits))
 
 
-def location_words(job: dict) -> list:
-    """A location folded both as displayed and bare."""
-    names = location_names(job)
+def location_words(job: dict, *, home: Optional[tuple] = None) -> list:
+    """A location folded both as displayed and bare.
+
+    A row that names no location (the configured schema's own list) is in ``home``, the same
+    fallback the ``db`` and ``schema`` filters use, so a word matches that schema's own name
+    there too.
+    """
+    names = location_names(job) or home
     if names is None:
         return []
-    return list(dict.fromkeys((fold(location_label(job)), fold(printable(f"{names[0]}.{names[1]}")))))
+    shown = printable(f"{sql_identifier(names[0])}.{sql_identifier(names[1])}")
+    return list(dict.fromkeys((fold(shown), fold(printable(f"{names[0]}.{names[1]}")))))
+
+
+def split_location(value: str) -> Optional[tuple]:
+    """``(database, schema)`` of a whole location as the Schema column shows it
+    (``TEAM_DB.EXPERIMENTS``, ``"ml"."dev"``); None when ``value`` names one part only.
+
+    Only a dot outside quotes divides the two, so a single quoted name holding one
+    (``"my.db"``) stays one name.
+    """
+    text = value.strip()
+    parts, held, quoted, at = [], [], False, 0
+    while at < len(text):
+        char = text[at]
+        if char == '"':
+            if quoted and text[at:at + 2] == '""':  # an escaped quote inside a quoted name
+                held.append('""')
+                at += 2
+                continue
+            quoted = not quoted
+        elif char == "." and not quoted:
+            parts.append("".join(held))
+            held = []
+            at += 1
+            continue
+        held.append(char)
+        at += 1
+    parts.append("".join(held))
+    if quoted or len(parts) != 2 or not all(parts):
+        return None  # unbalanced quotes, one name, or more dots than a location has
+    return parts[0], parts[1]
 
 
 def _starts_a_name(term: str, words: list) -> bool:
@@ -857,6 +1061,21 @@ def _same_name(stored: str, wanted: str) -> bool:
     return wanted == stored or identifier_name(wanted) == stored
 
 
+def _location_matches(job: dict, side: str, op: str, name: str, home: Optional[tuple]) -> bool:
+    """Whether ``job``'s database (``side`` ``db``) or schema satisfies one side of a location filter.
+
+    ``=`` and ``!=`` read ``name`` by SQL identifier rules (see :func:`_same_name`); every other
+    operator keeps its usual meaning over the name as stored and as SQL quotes it, so ``:``
+    matches part of it.
+    """
+    stored = _location_name(job, side, home)
+    if stored is None:
+        return False
+    if op in ("=", "!="):
+        return _same_name(stored, name)
+    return any(_compare(held, op, name) for held in (stored, sql_identifier(stored)))
+
+
 def job_matches_query(job: dict, query: Query, *, home: Optional[tuple] = None,
                       hay: Optional[str] = None) -> bool:
     """Whether ``job`` matches every term and filter, using ``home`` if unlocated."""
@@ -866,13 +1085,20 @@ def job_matches_query(job: dict, query: Query, *, home: Optional[tuple] = None,
         return True
     if hay is None:
         hay = search_haystack(job)
-    places = location_words(job)
+    places = location_words(job, home=home)
     if any(t not in hay and not _starts_a_name(t, places) for t in query.terms):
         return False
     for key, op, value in query.filters:
-        if key in _LOCATION_FIELDS and op in ("=", "!="):
-            stored = _location_name(job, key, home)
-            if (stored is not None and _same_name(stored, value)) != (op == "="):
+        if key in _LOCATION_FIELDS and (op in ("=", "!=") or split_location(value)):
+            # A dotted value is a whole location, as the Schema column shows it, so what that
+            # column holds can be searched for exactly as it reads, with any operator:
+            # ``schema=TEAM_DB.EXPERIMENTS`` asks for both names whole and
+            # ``schema:team_db.exper`` for part of each, while ``schema=EXPERIMENTS`` and
+            # ``schema:exper`` go on asking about the schema alone.
+            pair = split_location(value)
+            wanted = (("db", pair[0]), ("schema", pair[1])) if pair else ((key, value),)
+            matched = all(_location_matches(job, side, op, name, home) for side, name in wanted)
+            if matched == (op == "!="):
                 return False
             continue
         values = field_values(job, key, home=home)
@@ -885,8 +1111,68 @@ def job_matches_query(job: dict, query: Query, *, home: Optional[tuple] = None,
     return True
 
 
+def pushdown_location(query: Query) -> Optional[tuple]:
+    """``(database, schema)`` the account-wide list can ask the server for; None to read it whole.
+
+    Only a whole ``db=NAME``, and with it a whole ``schema=NAME``, narrows at the server: the
+    account-level route takes those two filters and no others, and it refuses a schema without
+    a database. ``schema`` is None when the database alone narrows. A dotted value names a whole
+    location (``schema=TEAM_DB.EXPERIMENTS``, as the Schema column shows it) and pins both.
+
+    Everything else stays here, matched by :func:`job_matches_query` over what the walk read: a
+    partial match (``schema:exp``), a negation (``schema!=X``), an ordering op, a bare word, and
+    a ``schema=`` with no ``db=`` of its own (the configured database is not implied, and
+    assuming it would hide the same schema name in another database).
+
+    A name narrows only in the form the service resolves it to (see :func:`narrowable_name`), so
+    narrowing never drops a row the search would have kept. The client-side filter runs over the
+    answer either way.
+    """
+    if query.errors:
+        return None  # a typo'd field matches nothing; narrowing on it would ask for the wrong rows
+    pinned: dict = {"db": set(), "schema": set()}
+    for key, op, value in query.filters:
+        if key not in _LOCATION_FIELDS or op != "=":
+            continue
+        pair = split_location(value)  # a whole location pins both sides at once
+        if pair:
+            pinned["db"].add(pair[0].strip())
+            pinned["schema"].add(pair[1].strip())
+        else:
+            pinned[key].add(value.strip())
+
+    def whole(side: str) -> Optional[str]:
+        """The one name ``side`` is pinned to by an ``=`` and can be narrowed on; else None."""
+        wanted = pinned[side]
+        if len(wanted) != 1:
+            return None  # nothing to narrow on, or two names at once (which matches nothing)
+        name = next(iter(wanted))
+        return name if name and narrowable_name(name) else None
+
+    database = whole("db")
+    if database is None:
+        return None  # a schema needs its database with it
+    return database, whole("schema")
+
+
+def narrowable_name(name: str) -> bool:
+    """Whether the service, asked for ``name``, returns every row ``name=`` keeps here.
+
+    ``=`` keeps a row whose name is ``name`` as stored *or* the name SQL resolves ``name`` to
+    (see :func:`_same_name`), while a walk narrowed to ``name`` only reads the second. The two
+    agree when ``name`` is already in its resolved form (``TEAM_DB``), and when it is quoted
+    (``"ml"``, which no stored name is spelled as, so only the resolved ``ml`` can match).
+
+    An unquoted ``ml`` or ``team_db`` resolves to ``ML`` / ``TEAM_DB`` but would also match a
+    database stored under that exact lowercase spelling, which a narrowed walk would never read.
+    Such a name is matched here instead, as it was before narrowing existed -- never worse than
+    reading every schema, and the form the Schema column shows is always narrowable.
+    """
+    return name == identifier_name(name) or _QUOTED_IDENTIFIER.fullmatch(name) is not None
+
+
 def no_match_message(text: str, query: Query, searched: int, *, cut: str = "", older: Iterable[str] = (),
-                     location: str = "", widen: bool = False) -> str:
+                     location: str = "", widen: bool = False, narrow: bool = False) -> str:
     """Explain an empty search, including truncated, old, or wider matches."""
     older = list(older)
     if cut:
@@ -901,6 +1187,11 @@ def no_match_message(text: str, query: Query, searched: int, *, cut: str = "", o
                      f"jobs older than 6 months): cortex-training tui {older[0]} opens {'the newest' if many else 'it'}.")
     if widen:
         lines.append("  a searches every database and schema.")
+    if narrow:
+        # The list is cut short and nothing narrowed it, so the jobs looked for may simply not be
+        # among the ones read. A whole name is asked of the service instead (see pushdown_location).
+        lines.append("  db=NAME, or db=NAME schema=NAME, reads that whole database from the service "
+                     "rather than only the jobs loaded here.")
     if query.errors:
         lines.append("  " + "; ".join(query.errors) + ".")
         lines.append("  Fields: " + ", ".join(SEARCH_FIELDS) + "; any other key reads that member of a job, its "
@@ -910,7 +1201,8 @@ def no_match_message(text: str, query: Query, searched: int, *, cut: str = "", o
             lines.append("  To search for text with a colon in it, quote it: \"training:0\".")
     if query.terms:
         lines.append("  Words match id, sub-job id, status, owner, GPU type, job type, model, and "
-                     "the start of a location's database or schema name (case-insensitive).")
+                     "the start of a location's database or schema name (case-insensitive): "
+                     "db:TEXT matches anywhere in the name, db=NAME the whole name.")
     if query.filters:
         lines.append("  Filters must all match; try fewer, or ':' for a partial match (model:qwen).")
     lines.append("  Esc clears the search.")
@@ -960,6 +1252,7 @@ def sort_job_list(jobs: Iterable[dict], key: str = "created", descending: bool =
 
 
 _PLAIN_IDENTIFIER = re.compile(r"[A-Z_][A-Z0-9_$]*")
+_QUOTED_IDENTIFIER = re.compile(r'"(?:[^"]|"")*"')
 
 
 def sql_identifier(name: str) -> str:
@@ -1012,6 +1305,14 @@ def location_label(job: Any) -> str:
     if names is None:
         return ""
     return printable(f"{sql_identifier(names[0])}.{sql_identifier(names[1])}")
+
+
+def location_filter_text(location: Optional[tuple]) -> str:
+    """``DB.SCHEMA`` (or ``DB`` alone) of a narrowing, each name as the server resolves it and
+    SQL quotes it (``db=team_db`` reads ``TEAM_DB``; ``db="ml"`` reads ``"ml"``); "" without one."""
+    if not location:
+        return ""
+    return printable(".".join(sql_identifier(identifier_name(name)) for name in location if name))
 
 
 def cli_options(*, database: Optional[str] = None, schema: Optional[str] = None,

@@ -16,4 +16,10 @@ with its trainer on a CPU driver and training and sampling in Cortex sub-jobs.
 Its GSM8K example lives in the Arctic Platform repository and has its own
 install.
 
+To train a model inside an agent you already have, see
+[Bring your own agent](../../../examples/frameworks/bring-your-own-agent.md). The agent
+keeps its own loop and sends model calls to a per-rollout endpoint; SkyRL and
+Cortex do the training. [OpenHands](../../../examples/frameworks/openhands.md) is the
+worked example.
+
 Additional code, tool-use, and multi-agent RL examples are planned.

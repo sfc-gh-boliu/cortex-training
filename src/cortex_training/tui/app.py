@@ -16,7 +16,7 @@
 """Read-only Textual TUI for Cortex Training job logs and GPU resources.
 
 Flow: open → a list of jobs with their status (via the SDK's list_jobs) →
-pick one → its preview, then its Logs and Resources dashboard. Pass a job_id on the command line
+pick one → its preview, then its Logs, Resources and Checkpoints tabs. Pass a job_id on the command line
 to jump straight to that dashboard and skip the picker.
 
 Imports ``textual`` at module load. The interface is strictly read-only and
@@ -52,6 +52,7 @@ from textual.widgets import Input
 from textual.widgets._toast import Toast
 from textual.widgets._toast import ToastRack
 
+from cortex_training.tui import theme
 from cortex_training.tui.account import JobClients
 from cortex_training.tui.job_list import JobListScreen
 from cortex_training.tui.logs import LogScreen
@@ -218,30 +219,66 @@ class CortexTrainingLogTUI(App):
     job_id is supplied."""
 
     CSS = """
+    /* A quiet title bar: the brand mark in the accent, the title over the screen's status. */
+    Header { background: $surface; color: $text-muted; }
+    Header HeaderIcon { color: $accent; }
+    Header HeaderTitle { color: $text; }
     #jobs { height: 1fr; }
     #listinfo { padding: 0 1; height: auto; }
     #nomatch-box { height: 1fr; scrollbar-gutter: stable; }
     #nomatch { padding: 1 2; color: $warning; height: auto; }
     #jobs > .datatable--fixed { background: $surface; }
+    /* The fixed Job ID column matches the row: no focus tint (the cursor's color says it has focus). */
+    #jobs:focus { background-tint: $foreground 0%; }
+    #searchhelp { padding: 0 1 0 2; height: auto; background: $panel; }
     #sources { width: 16; border-right: solid $panel; }
-    #job-tabs, #job-tabs ContentSwitcher, #logs, #resource, #logs-body {
+    #job-tabs, #job-tabs ContentSwitcher, #logs, #resource, #logs-body,
+    #training, #checkpoints, #training-tab {
         height: 1fr;
     }
     #logview { height: 1fr; padding: 0 1; }
     #log-status { height: auto; padding: 0 1; color: $warning; }
+    #log-bar { height: 1; background: $surface; }
+    #log-live, #log-chips { width: auto; padding: 0 1; }
+    /* The sub-job the Logs pane shows: an accent edge, on the cursor's highlight or off it. */
+    #sources > ListItem { border-left: blank; }
+    #sources > ListItem.-shown { border-left: outer $accent; }
     #summary { color: $text-muted; padding: 0 1; }
-    #logfilter { border: tall $panel; }
-    #jobfilter { border: tall $panel; }
+    #logfilter { border: none; height: 1; width: 1fr; padding: 0 1; background: $surface; }
+    #logfilter:focus { background: $panel; }
+    /* One row, a bar at its left that turns the accent while it has focus. */
+    #jobfilter { border: none; border-left: tall $panel; height: 1; padding: 0 1; background: $surface; }
+    #jobfilter:focus { border: none; border-left: tall $accent; background: $panel; }
     #resource-body { height: 1fr; }
     #resource-list { width: 16; border-right: solid $panel; scrollbar-size-vertical: 1; }
     #resource-pane { height: 1fr; padding: 0 1; scrollbar-gutter: stable; scrollbar-size-vertical: 1; }
     #resource-status { color: $text-muted; height: auto; dock: top; }
+    #resource-kpis { height: auto; margin-top: 1; text-wrap: nowrap; text-overflow: clip; }
     #resource-stats { height: auto; margin-top: 1; }
+    #resource-stats.-empty { border: round $panel-lighten-2; padding: 1 2; }
     #resource-charts { height: auto; margin-top: 1; text-wrap: nowrap; text-overflow: clip; }
-    #summary-body { padding: 1 1; scrollbar-gutter: stable; }
-    #health { height: auto; margin: 1 0; }
-    #subjobs-title { height: auto; margin-top: 1; }
-    #subjobs { height: auto; max-height: 12; margin: 0 1; }
+    #resource-keys { height: 1; padding: 0 1; text-wrap: nowrap; text-overflow: clip; link-style: none; }
+    /* The job preview's layout is JobSummaryScreen.DEFAULT_CSS (screens.py). */
+    /* The Checkpoints tab, in the preview's cards: round borders, titles in the top border, hints in the bottom. */
+    #checkpoint-list-card { height: auto; max-height: 45%; margin: 0 1; padding: 0 1; border: round $border;
+                            border-title-align: left; border-subtitle-align: right; }
+    #checkpoint-status { height: auto; }
+    #checkpoint-table { height: auto; }
+    #checkpoint-table > .datatable--header { background: $surface; color: $text-muted; }
+    #checkpoint-pane { height: 1fr; padding: 0 1; scrollbar-gutter: stable; scrollbar-size-vertical: 1; }
+    #checkpoint-card { height: auto; margin-top: 1; padding: 0 1; border: round $border; }
+    #checkpoint-hero, #checkpoint-detail, #checkpoint-origin, #checkpoint-action-status { height: auto; }
+    #checkpoint-actions { height: 1; margin-top: 1; text-wrap: nowrap; text-overflow: clip; link-style: none; }
+    #checkpoint-action-status { margin-bottom: 1; }
+    #checkpoint-copied { height: auto; margin-top: 1; padding: 0 1; border-title-align: left;
+                         border-subtitle-align: right; }
+    #checkpoint-origin-card { height: auto; margin-top: 1; padding: 0 1; border: round $border;
+                              border-title-align: left; }
+    /* The Training metrics tab (detail_tabs.py): a header on top, as on Resources. */
+    #training-status { color: $text-muted; height: auto; padding: 0 1; }
+    #training-pane { height: 1fr; padding: 0 1; scrollbar-gutter: stable; scrollbar-size-vertical: 1; }
+    #training-stats { height: auto; margin-top: 1; text-wrap: nowrap; text-overflow: clip; }
+    #training-charts { height: auto; text-wrap: nowrap; text-overflow: clip; }
     LogScreen > .screen--selection {
         background: $block-cursor-blurred-background;
         color: $block-cursor-blurred-foreground;
@@ -260,6 +297,8 @@ class CortexTrainingLogTUI(App):
         """Every job record read through ``client`` and its per-location clients comes back printable
         (:mod:`cortex_training.tui.untrusted`)."""
         super().__init__()
+        self.register_theme(theme.CORTEX_THEME)
+        self.theme = theme.CORTEX_THEME.name
         client = printable_client(client)
         self._client = client
         self._job_id = job_id

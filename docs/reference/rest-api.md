@@ -2899,11 +2899,74 @@ The same file also carries one host row per worker per scrape, with
 | `cpu_count` | Logical CPUs on the host |
 | `mem_used_bytes` / `mem_total_bytes` | Host memory in use and installed |
 
-A row without `kind` is a GPU row; a later GPU row may carry `kind: "gpu"`.
-Consumers should select rows by `kind` and ignore kinds they do not support.
-The TUI's Resource tab uses GPU rows only.
+### 12.5 Training metrics download
 
-### 12.5 Zone scheduling events
+`download_training_metrics(job_id, output_dir, ...)` takes the same options as
+`download_metrics` and reconstructs a training sub-job's **training metrics**:
+what its `/fwd-bwd` and `/step` calls returned, written by the zone to its own
+file and staged beside the GPU chunks as
+`training.YYYYMMDD-HHMMSS.UUID.gz` under `_metrics/{sub_job_id}/`. It writes
+`<output_dir>/<sub_job_id>/training.jsonl`, with its own manifest, so the two
+downloads can share an output directory and neither stream's rows reach the
+other's file. `cortex-training download-metrics` runs both and reports them as
+`metrics` and `training_metrics`.
+
+Only training sub-jobs have these rows, and only where the deployment saves
+them; a job opts out by setting `training_config.save_training_metrics` to
+`false`. So, unlike the GPU stream, a sub-job with saved stdout and no training
+chunks is not warned about, and a sub-job named in `sub_job_ids` without
+training chunks is left out of the result rather than raising `NoChunksError`.
+
+The zone appends one row per successful `/fwd-bwd` call and one per successful
+`/step`, with `"kind": "training"` and `record_version` `2`. Each row holds the
+numbers its call's result carries, as the client receives them; nothing is
+combined or computed:
+
+```json
+{"kind": "training", "record_version": 2, "sub_job_id": "JOB_ID:training:0",
+ "sample_ts": "2026-10-16T18:02:14Z", "seq": 84, "seq_epoch": "...",
+ "op": "fwd_bwd", "step": 3, "call": 1, "request_id": "REQUEST_ID",
+ "metrics": {"avg_loss": 2.0419, "rank": 0, "sft_model_calls": 1, "sft_packed_rows": 1}}
+{"kind": "training", "record_version": 2, "sub_job_id": "JOB_ID:training:0",
+ "sample_ts": "2026-10-16T18:02:15Z", "seq": 86, "seq_epoch": "...",
+ "op": "step", "step": 3, "call": null, "request_id": "REQUEST_ID",
+ "metrics": {"global_steps": 3.0, "grad_norm": 84.37, "last_lr": 0.0001,
+             "update_successful": 1.0, "weight_delta_norm_rank0_sample": 0.1447}}
+```
+
+| Field | Meaning |
+|---|---|
+| `kind` | `"training"` |
+| `record_version` | `2` |
+| `sub_job_id`, `seq`, `seq_epoch` | As for GPU rows; a gap in `seq` means rows were lost |
+| `sample_ts` | When the call completed |
+| `op` | `"fwd_bwd"` (one `/fwd-bwd` call) or `"step"` (one `/step`) |
+| `step` | On a `step` row, the step's `global_steps`. On a `fwd_bwd` row, the step the call counts toward: the previous `/step`'s `global_steps` + 1, or `null` when the zone doesn't know it yet: before it has seen a `/step` (a job's first calls, or the first after the zone restarted), and after a `load-checkpoint` moves the job to another step. Such a call belongs to the `step` row that follows it. A `/fwd-bwd` retried and answered from the first run's cached result is saved once |
+| `call` | On a `fwd_bwd` row, the call's place among its step's calls, from 1; `null` on a `step` row |
+| `request_id` | The call's request id |
+| `metrics` | Every finite number in the result, by its own name |
+
+A `fwd_bwd` row's `metrics` are the result's top-level numbers (`avg_loss`,
+that call's own loss) and every number in its `metrics` (`rank`,
+`sft_model_calls`, `sft_packed_rows`, or whatever the loss function reports);
+a top-level field wins over a nested metric of the same name. A `step` row's
+`metrics` are every number in the `/step` result (`global_steps`, `grad_norm`,
+`last_lr`, `update_successful`, `weight_delta_*`, ...). Text (such as
+`job_id`), lists, booleans, `null`, NaN and infinities are left out, and a row
+keeps at most 256 metrics with names of at most 200 bytes.
+
+A step's loss is not saved as such: whether it is the sum or the mean of its
+calls' `avg_loss` depends on how the loss was scaled, so each call's own
+`avg_loss` is saved and the choice is left to the reader. A `/step` that fails
+saves no row, and calls made before it count toward the same step as the retry's
+calls. The metrics a loss function returns vary, so consumers should read
+whatever names a row has.
+
+In the GPU file, a row without `kind` is a GPU row; a later GPU row may carry
+`kind: "gpu"`. Consumers should select rows by `kind` and ignore kinds they do
+not support. The TUI's Resources tab uses GPU and system rows.
+
+### 12.6 Zone scheduling events
 
 The client contains `tail_events()` and `stream_events()`, but the server does
 not accept their operation type. See

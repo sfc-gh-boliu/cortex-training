@@ -107,6 +107,13 @@ _STDOUT_CHUNK_RE = re.compile(
 _GPU_METRICS_CHUNK_RE = re.compile(
     r"^gpu\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
 )
+# Training metrics share the ``_metrics/`` root with the GPU chunks but are their
+# own stream: the training runtime writes them to a file of its own, which is
+# staged and reconstructed separately. They must never be matched with the GPU
+# chunks, which would concatenate the two kinds of rows into one file.
+_TRAINING_METRICS_CHUNK_RE = re.compile(
+    r"^training\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
+)
 _STREAM_COPY_BUFFER_BYTES = 1024 * 1024
 
 # Env var that unlocks create-job debug options. These are an internal-only
@@ -3700,6 +3707,8 @@ class CortexTrainingClient:
         *,
         max_workers: int,
         temporary_prefix: str,
+        stream: str,
+        label: str | None = None,
         progress: Callable[[str], None] | None = None,
         on_chunk: Callable[[str, int, int, int], None] | None = None,
         strict: bool = False,
@@ -3729,7 +3738,12 @@ class CortexTrainingClient:
         cancel = threading.Event()
         # A resumed plan starts from output an earlier download saved.
         saved_progress = any(plan.known for plan in plans)
-        spool_prefix = f"cortex-training-{artifact_name}-artifacts-"
+        # What progress calls this stream. Both metric streams are staged under
+        # ``_metrics/``, so artifact_name alone would label them the same.
+        shown = label or artifact_name
+        # Per stream, not per stage root: Spool.sweep() removes stale directories under
+        # this prefix, so two streams sharing it could sweep a live sibling's spool.
+        spool_prefix = f"cortex-training-{stream}-artifacts-"
         _artifact_download.Spool.sweep(spool_prefix, self._TEMP_ORPHAN_MIN_AGE_SECONDS)
         with _artifact_download.Spool(spool_prefix) as spool:
             spool_root = spool.path
@@ -3753,7 +3767,7 @@ class CortexTrainingClient:
                         )
                     if not new_total:
                         self._report_artifact_progress(
-                            progress, f"{artifact_name}: no new chunks for {plan.sub_job_id}\n"
+                            progress, f"{shown}: no new chunks for {plan.sub_job_id}\n"
                         )
 
                     def report(done: int, plan=plan, new_total=new_total) -> None:
@@ -3761,7 +3775,7 @@ class CortexTrainingClient:
                             self._report_artifact_progress(
                                 progress,
                                 self._artifact_progress_status(
-                                    artifact_name, done, new_total, plan.sub_job_id
+                                    shown, done, new_total, plan.sub_job_id
                                 ),
                             )
 
@@ -4018,6 +4032,9 @@ class CortexTrainingClient:
         wanted: set[str] | None,
         stale_after_seconds: float | None,
         cancel: threading.Event | None = None,
+        label: str = "",
+        check_missing: bool = False,
+        warn_if_stalled: bool = True,
     ) -> dict[str, list[str]]:
         """Warn when a running job's uploads look stalled; never raises.
 
@@ -4034,20 +4051,23 @@ class CortexTrainingClient:
         For metrics of a job that has ended, a sub-job with saved stdout but no
         metrics gets a warning saying why there may be none, so an empty
         result is not silent.
+
+        ``warn_if_stalled`` false skips the first sign: a stream written only
+        when the job is asked to do something goes quiet whenever it isn't. The
+        warning for a job that ended moments ago is still given.
         """
         if stale_after_seconds is None:
             return {}
         local_now = self._wall_clock()
         candidates: dict[str, float] = {}
         for sub_job_id, paths in chunks_by_sub_job.items():
-            if wanted is not None and sub_job_id not in wanted:
+            if not warn_if_stalled or (wanted is not None and sub_job_id not in wanted):
                 continue
             newest = self._chunk_time(chunk_pattern, paths[-1])
             if newest is not None and local_now - newest > max(
                 stale_after_seconds - self._STALE_PRECHECK_SKEW_SECONDS, 0
             ):
                 candidates[sub_job_id] = newest
-        check_missing = artifact_name == "metrics"
         # A chunk this recent means the job may have only just ended.
         recent_cutoff = local_now - self._RECENTLY_ENDED_SECONDS - self._STALE_PRECHECK_SKEW_SECONDS
         recently_active = any(
@@ -4065,7 +4085,7 @@ class CortexTrainingClient:
         status = self._normalize_job_status(job.get("status"))
         if status in _ENDED_JOB_STATES:
             warnings = self._recently_ended_warnings(
-                job, local_now if server_now is None else server_now, artifact_name, chunks_by_sub_job, wanted
+                job, local_now if server_now is None else server_now, label, chunks_by_sub_job, wanted
             )
             if check_missing:
                 for sub_job_id, messages in self._ended_without_metrics_warnings(
@@ -4092,7 +4112,6 @@ class CortexTrainingClient:
             starts = [t for t in (running_since, started) if t is not None]
             return now - max(starts) if starts else None
 
-        label = "stdout output" if artifact_name == "stdout" else "GPU metrics"
         warnings: dict[str, list[str]] = {}
         for sub_job_id, newest in candidates.items():
             age = now - newest
@@ -4148,7 +4167,7 @@ class CortexTrainingClient:
         self,
         job: Mapping[str, Any],
         now: float,
-        artifact_name: str,
+        label: str,
         chunks_by_sub_job: Mapping[str, list[str]],
         wanted: set[str] | None,
     ) -> dict[str, list[str]]:
@@ -4156,7 +4175,6 @@ class CortexTrainingClient:
         ended_at = self._parse_api_time(job.get("state_changed_at"))
         if ended_at is None or now - ended_at >= self._RECENTLY_ENDED_SECONDS:
             return {}
-        label = "stdout output" if artifact_name == "stdout" else "GPU metrics"
         warnings: dict[str, list[str]] = {}
         for sub_job_id in sorted(chunks_by_sub_job):
             if wanted is not None and sub_job_id not in wanted:
@@ -4209,6 +4227,12 @@ class CortexTrainingClient:
         chunk_pattern: re.Pattern[str],
         destination_name: str,
         temporary_prefix: str,
+        stream: str,
+        progress_label: str,
+        label: str | None = None,
+        check_missing: bool | None = None,
+        warn_if_stalled: bool = True,
+        skip_missing: bool = False,
         resume: bool = False,
         max_workers: int | None = None,
         progress: Callable[[str], None] | None = None,
@@ -4234,7 +4258,25 @@ class CortexTrainingClient:
         Sub-jobs are written in id order, those named in ``priority`` first
         (in that order); the returned list stays in id order. ``on_commit``
         gets a copy of each sub-job's result entry once its file is committed.
+
+        ``stream`` names the reconstructed file's stream: it keeps one stream's
+        temporary spool apart from another's and is recorded with the operation.
+        ``progress_label`` is what progress and a missing sub-job's error call it.
+        The two metric streams share a stage root, so neither can be derived from
+        ``artifact_name``. ``warn_if_stalled`` false skips the warning for a
+        running job whose newest chunk is old, for a stream that is written only
+        when the job is asked to do something. ``skip_missing`` true leaves out a
+        sub-job named in ``sub_job_ids`` that has no chunks instead of raising
+        :class:`NoChunksError`, for a stream only some sub-jobs write.
         """
+        # What the warnings call this stream, and whether a sub-job with saved stdout
+        # but none of these chunks is worth a warning. Only the GPU stream is: every
+        # sub-job with GPUs uploads it, while training metrics are written by training
+        # sub-jobs alone, and only when the deployment saves them.
+        if label is None:
+            label = "stdout output" if artifact_name == "stdout" else "GPU metrics"
+        if check_missing is None:
+            check_missing = artifact_name == "metrics"
         if max_workers is None:
             max_workers = self._DOWNLOAD_DEFAULT_WORKERS
         if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
@@ -4261,7 +4303,7 @@ class CortexTrainingClient:
             raise ValueError("transfer_timeout_seconds must be a positive number or None")
         values = self._operation_values()
         values.update(
-            artifact=artifact_name,
+            artifact=stream,
             max_workers=max_workers,
             resume=bool(resume),
             resume_mode="none",
@@ -4307,6 +4349,9 @@ class CortexTrainingClient:
                         wanted,
                         stale_after_seconds,
                         stall_cancel,
+                        label,
+                        check_missing,
+                        warn_if_stalled,
                     ),
                     name="cortex-training-stall-check",
                 )
@@ -4316,15 +4361,15 @@ class CortexTrainingClient:
                     return {}
                 return stall_check.result(self._STALL_CHECK_WAIT_SECONDS, {})
 
-            if wanted is not None and wanted - set(chunks_by_sub_job):
+            if wanted is not None and wanted - set(chunks_by_sub_job) and not skip_missing:
                 # A named sub-job without chunks is fine only if it has a warning.
                 unsaved = set(stale_warnings()) - set(chunks_by_sub_job)
                 missing = sorted(wanted - set(chunks_by_sub_job) - unsaved)
                 if missing:
                     available = sorted(chunks_by_sub_job)
                     raise NoChunksError(
-                        f"no {artifact_name} chunks for sub-job(s) "
-                        f"{', '.join(missing)}; sub-jobs with {artifact_name}: "
+                        f"no {progress_label} chunks for sub-job(s) "
+                        f"{', '.join(missing)}; sub-jobs with {progress_label}: "
                         f"{', '.join(available) or 'none'}",
                         sub_job_ids=missing,
                         available=available,
@@ -4356,7 +4401,7 @@ class CortexTrainingClient:
             values["resume_mode"] = modes.pop() if len(modes) == 1 else "mixed" if modes else "none"
             results: list[dict[str, Any]] = []
             if not plans:
-                self._report_artifact_progress(progress, f"{artifact_name}: found 0 chunks\n")
+                self._report_artifact_progress(progress, f"{progress_label}: found 0 chunks\n")
             else:
                 started = time.monotonic()
                 try:
@@ -4367,6 +4412,8 @@ class CortexTrainingClient:
                         plans,
                         max_workers=max_workers,
                         temporary_prefix=temporary_prefix,
+                        stream=stream,
+                        label=progress_label,
                         progress=progress,
                         on_chunk=on_chunk,
                         strict=strict,
@@ -4468,6 +4515,8 @@ class CortexTrainingClient:
             chunk_pattern=_STDOUT_CHUNK_RE,
             destination_name="stdout.log",
             temporary_prefix=".stdout-",
+            stream="stdout",
+            progress_label="stdout",
             resume=resume,
             max_workers=max_workers,
             progress=progress,
@@ -4517,6 +4566,69 @@ class CortexTrainingClient:
             chunk_pattern=_GPU_METRICS_CHUNK_RE,
             destination_name="gpu.jsonl",
             temporary_prefix=".gpu-metrics-",
+            stream="metrics",
+            progress_label="metrics",
+            resume=resume,
+            max_workers=max_workers,
+            progress=progress,
+            on_chunk=on_chunk,
+            sub_job_ids=sub_job_ids,
+            strict=strict,
+            stale_after_seconds=stale_after_seconds,
+            transfer_timeout_seconds=transfer_timeout_seconds,
+            priority=priority,
+            on_commit=on_commit,
+        )
+
+    @_track_operation("download_training_metrics")
+    def download_training_metrics(
+        self,
+        job_id: str,
+        output_dir: str | os.PathLike[str],
+        *,
+        resume: bool = False,
+        max_workers: int | None = None,
+        progress: Callable[[str], None] | None = None,
+        on_chunk: Callable[[str, int, int, int], None] | None = None,
+        sub_job_ids: Iterable[str] | None = None,
+        strict: bool = False,
+        stale_after_seconds: float | None = _DOWNLOAD_STALE_AFTER_SECONDS,
+        transfer_timeout_seconds: float | None = _DOWNLOAD_TRANSFER_TIMEOUT_SECONDS,
+        priority: Iterable[str] = (),
+        on_commit: Callable[[dict[str, Any]], None] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Reconstruct staged training-metric chunks into one JSONL file per sub-job.
+
+        The training metrics a job's ``/fwd-bwd`` and ``/step`` calls returned,
+        written by the zone to its own file and staged beside the GPU chunks as
+        ``training.*.gz``, reconstructed as
+        ``<output_dir>/<sub_job_id>/training.jsonl``. Takes the same options as
+        :meth:`download_metrics`, and the two can share an output directory:
+        each writes its own file and manifest.
+
+        Only training sub-jobs have these rows, and only where the deployment
+        saves them (a job opts out with ``training_config.save_training_metrics``
+        false), so a sub-job without them is not warned about, unlike a sub-job
+        with no GPU metrics. For the same reason, a sub-job named in
+        ``sub_job_ids`` without them is left out of the result rather than
+        raising :class:`NoChunksError`.
+        """
+        return self._download_gzip_artifacts(
+            job_id,
+            output_dir,
+            artifact_name="metrics",
+            chunk_pattern=_TRAINING_METRICS_CHUNK_RE,
+            destination_name="training.jsonl",
+            temporary_prefix=".training-metrics-",
+            stream="training-metrics",
+            progress_label="training metrics",
+            label="training metrics",
+            check_missing=False,
+            # Rows are written only when the job is asked for /fwd-bwd or /step, so an
+            # idle session or a long rollout between steps is not a stall.
+            warn_if_stalled=False,
+            # Only training sub-jobs write them: naming a sampling sub-job is not an error.
+            skip_missing=True,
             resume=resume,
             max_workers=max_workers,
             progress=progress,

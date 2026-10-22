@@ -98,6 +98,11 @@ _DATABASE_HELP = (
     f"We recommend a dedicated one: {DEFAULT_DATABASE}."
 )
 
+_CHECK_NEW_PROFILE = (
+    "Cortex Training can now sign in with it to check that it works: that Cortex Training is\n"
+    "enabled on the account, and that the database is ready. This only reads; nothing is changed."
+)
+
 _NO_TERMINAL = (
     "cortex-training login is interactive, so it needs a terminal. To connect from CI or a "
     f"script, set {_picker.HOST_ENV} and {_picker.PAT_ENV} instead (they're used when no "
@@ -114,6 +119,14 @@ class ProfileFailed(LoginCancelled):
 
     def __init__(self, profile: str, message: str) -> None:
         super().__init__(message)
+        self.profile = profile
+
+
+class NotChecked(Exception):
+    """The user chose not to check a profile that login just saved."""
+
+    def __init__(self, profile: str) -> None:
+        super().__init__(profile)
         self.profile = profile
 
 
@@ -415,6 +428,8 @@ class _Login:
         self.s = prompter.style
         self.open_client = open_client
         self.created_profiles: list[str] = []
+        # Profiles login saved this time and already asked to check.
+        self.check_asked: set[str] = set()
         self.created_database = False
         self.clients: list[Any] = []
         self.introduced = False
@@ -765,9 +780,20 @@ class _Login:
             self.p.say(self.s.red(f"Profile {names[index]} can't be used: {reason}. Pick another."))
 
     def settle(self, profile: str) -> Check:
-        """Check ``profile`` and resolve an unusable database; return the final, usable check."""
+        """Check ``profile`` and resolve an unusable database; return the final, usable check.
+
+        A profile login just saved is checked only if the user agrees; otherwise
+        this raises :class:`NotChecked`.
+        """
+        if profile in self.created_profiles and profile not in self.check_asked:
+            self.check_asked.add(profile)
+            self.p.say()
+            self.p.say(_CHECK_NEW_PROFILE)
+            if not self.p.confirm("Check it now?", default=True):
+                raise NotChecked(profile)
         check = self.check(profile)
         if check.error:
+            self.offer_delete(profile, signed_in=check.client is not None)
             raise ProfileFailed(profile, check.error)
         values = self.profiles()[profile]
         # A profile's own database may be a shared work database, so offer a
@@ -846,7 +872,21 @@ class _Login:
                 f"Cortex Training can't find database {check.database} or schema {check.schema} "
                 f"with profile {check.profile}: {_first_line(exc)}"
             )
+            self.p.say(f"  {self.s.bad(reason)}")
+            self.offer_delete(check.profile, signed_in=True)
             raise ProfileFailed(check.profile, reason) from exc
+
+    def offer_delete(self, profile: str, *, signed_in: bool) -> None:
+        """Offer to delete a profile login saved this time that turned out not to work."""
+        if profile not in self.created_profiles:
+            return
+        self.p.say()
+        if not signed_in:
+            self.p.say("Please check the account, user, and PAT you entered.")
+        if self.p.confirm(f"Delete profile {profile} for now?", default=True):
+            _profiles.remove_profile(profile)
+            self.created_profiles.remove(profile)
+            self.p.say(f"  {self.s.ok(f'Deleted profile {profile}')}")
 
 
 def run_login(
@@ -906,23 +946,28 @@ def run_login(
                 prompter.say()
             profile = login.pick(current)
         failed: dict[str, str] = {}
+        unchecked: str | None = None
         while True:
             try:
                 if check is None:
                     check = login.settle(profile)
                 login.verify_service(check)
                 break
+            except NotChecked as exc:
+                unchecked = exc.profile
+                break
             except ProfileFailed as exc:
                 if name is not None:
                     raise
-                # Nothing was saved for this profile; let the user pick another.
+                # This profile isn't used; let the user pick another.
                 failed[exc.profile] = str(exc)
                 prompter.say()
                 prompter.say(f"Profile {style.bold(exc.profile)} can't be used. Pick another one, or create a new one.")
                 prompter.say()
                 check = None
                 profile = login.pick(current, failed)
-        saved = _picker.save_profile(check.profile)
+        chosen = unchecked or check.profile
+        saved = _picker.save_profile(chosen)
     except KeyboardInterrupt:
         stderr.write("\nlogin cancelled. Nothing more was changed.\n")
         _note_created(login, stderr)
@@ -937,22 +982,29 @@ def run_login(
     prompter.rule()
     if not style.decorate:
         prompter.say()
-    prompter.say(style.green(style.bold("You're all set.")) + f" Cortex Training will use profile {style.bold(check.profile)}.")
-    prompter.say(style.dim(f"(Saved in {_home(saved)}.)"))
-    prompter.say()
-    prompter.say(f"Try it:  {style.cyan('cortex-training capacity')}")
+    if unchecked:
+        prompter.say(f"Saved, but not checked. Cortex Training will use profile {style.bold(chosen)}.")
+        prompter.say(style.dim(f"(Saved in {_home(saved)}.)"))
+        prompter.say()
+        prompter.say(f"To check it later, run:  {style.cyan('cortex-training login')}")
+    else:
+        prompter.say(style.green(style.bold("You're all set.")) + f" Cortex Training will use profile {style.bold(chosen)}.")
+        prompter.say(style.dim(f"(Saved in {_home(saved)}.)"))
+        prompter.say()
+        prompter.say(f"Try it:  {style.cyan('cortex-training capacity')}")
     remind_environment(prompter, findings, shell)
     if not getattr(stdout, "isatty", lambda: False)():
-        values = _profiles.read_profiles().get(check.profile, {})
+        values = _profiles.read_profiles().get(chosen, {})
         json.dump(
             {
-                "profile": check.profile,
+                "profile": chosen,
                 "profile_file": str(_profiles.profile_file()),
                 "account": values.get("account"),
                 "user": values.get("user"),
-                "role": check.role,
-                "database": check.database,
-                "schema": check.schema,
+                "role": check.role if check else values.get("role"),
+                "database": check.database if check else values.get("database", DEFAULT_DATABASE),
+                "schema": check.schema if check else values.get("schema", DEFAULT_SCHEMA),
+                "checked": unchecked is None,
                 "config": str(saved),
                 "created_profiles": login.created_profiles,
                 "created_database": login.created_database,

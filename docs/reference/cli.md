@@ -286,6 +286,10 @@ cortex-training login training   # use or create the profile "training"
    After you pick, login signs in and asks Cortex Training right away. If the
    profile can't sign in, or Cortex Training isn't enabled on its account,
    login says why and returns to the list before anything is created.
+   A profile you create is saved first, and login asks before signing in to
+   check it. If you say no, login uses it unchecked and says so. If the check
+   fails, login says why and offers to delete the new profile; it never
+   offers to delete a profile it didn't create.
 3. It shows the database Cortex Training will keep jobs and checkpoints in (the
    profile's) and offers a separate one; `CORTEX_TRAINING_DB` is recommended.
 4. If that database is missing or the role can't access it, login offers
@@ -293,7 +297,8 @@ cortex-training login training   # use or create the profile "training"
    Otherwise it offers a new profile with the same sign-in and its own database,
    and creates the database only after showing the SQL and asking.
 5. It checks the result with one more capacity request, then saves the profile
-   name. Nothing is saved until a profile passes.
+   name. The name is saved only when a profile passes, or when you chose not
+   to check a new one.
 
 Login never changes an existing profile. New profiles go to the file the
 Snowflake Connector reads: `connections.toml`, or `config.toml` when your

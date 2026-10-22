@@ -11,28 +11,44 @@ for a specific workload.
 |---|---|---|---|---|
 | `Qwen/Qwen3-0.6B` | dense | standard | standard | — |
 | `Qwen/Qwen3-1.7B` | dense | standard | standard | — |
+| `Qwen/Qwen3-4B-Instruct-2507` | dense | standard, long | standard, long | 262,144 |
 | `Qwen/Qwen3-8B` | dense | standard | standard | — |
 | `Qwen/Qwen3.5-4B` | dense | standard, long | standard, long | 262,144 |
 | `Qwen/Qwen3.5-9B` | dense | long | long | 65,536 |
-| `Qwen/Qwen3.6-35B-A3B` | MoE | standard, long | standard, long | 262,144 |
 | `Qwen/Qwen3.8-27B` | dense | standard, long | standard, long | 65,536 |
+| `Qwen/Qwen3-30B-A3B` | MoE | standard | standard | — |
+| `Qwen/Qwen3.6-35B-A3B` | MoE | standard, long | standard, long | 262,144 |
+| `Qwen/Qwen3.8-Flash-Next` | MoE | standard, long | standard, long | 262,144 |
 | `deepseek-ai/DeepSeek-V4-Flash-0731` | MoE | — | long | 1,048,576 |
 | `openai/gpt-oss-120b` | MoE | — | long | 131,072 |
+| `google/gemma-3-4b-it` | dense | standard, long | standard, long | 131,072 |
+| `google/gemma-4-31B-it` | dense | standard, long | standard, long | 262,144 |
+| `google/medgemma-1.5-4b-it` | dense | standard, long | standard, long | 131,072 |
+| `google/medgemma-4b-it` | dense | standard, long | standard, long | 131,072 |
+| `zai-org/GLM-4.5-Air` | MoE | standard, long | standard, long | 131,072 |
 | `zai-org/GLM-5.2` | MoE | — | standard | — |
 | `zai-org/GLM-5.2-FP8` | MoE | — | long | 1,048,576 |
 | `zai-org/GLM-5.3` | MoE | — | long | 720,896 |
+| `zai-org/GLM-5.3-Flash` | MoE | standard, long | standard, long | 262,144 |
+| `zai-org/GLM-5.3-Flash-BF16` | MoE | standard, long | standard, long | 262,144 |
+| `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
+| `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
 
-Standard context is a `max_seq_len` of up to 32,768 tokens. Models with
-training files have LoRA and full files for both training and inference; the
-inference-only models have full-weight files. The examples pick a file with
+Standard context is a `max_seq_len` of up to 32,768 tokens. Most models with
+training files have both LoRA and full files for training and inference, and the
+inference-only models have full-weight files; some newer families ship only a
+subset (full-weight only, or LoRA only), so the model's folder in the catalog is
+the authority on which files a given model has. The examples pick a file with
 `model=`, `context=`, `hardware=` and `lora=` (see
 [Run an example](../../examples/README.md#run-an-example)).
 
 The examples that tokenize prompts pick a chat renderer from tinker-cookbook,
 with thinking off by default (`examples.inference.serve` needs none).
-tinker-cookbook lists no renderer for Qwen3-0.6B, Qwen3-1.7B, DeepSeek V4 or
-GLM 5.2, so pass `renderer_name=` for those. GLM 5.3 and gpt-oss have only
-thinking renderers, so pass `enable_thinking=true` or `renderer_name=`.
+tinker-cookbook lists no renderer for Qwen3-0.6B, Qwen3-1.7B, Qwen3.8-Flash-Next,
+the Gemma and MedGemma models, DeepSeek V4, GLM 4.5 Air, GLM 5.2 or GLM 5.3 Flash
+BF16, so pass `renderer_name=` for those. Qwen3-4B-Instruct, GLM 5.3, GLM 5.3
+Flash and gpt-oss have only thinking renderers, so pass `enable_thinking=true` or
+`renderer_name=`.
 
 ## Model notes
 

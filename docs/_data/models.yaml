@@ -10,11 +10,87 @@
 #   resolve gets no example entries.
 # - last_validated: the latest date in the model's model.json, or null.
 models:
+  - id: deepseek-ai/DeepSeek-V4-Flash-0731
+    training: false
+    inference: true
+    last_validated: 2026-09-01
+  - id: google/gemma-3-4b-it
+    training: true
+    inference: true
+    last_validated: null
+  - id: google/gemma-4-31B-it
+    training: true
+    inference: true
+    last_validated: null
+  - id: zai-org/GLM-4.5-Air
+    training: true
+    inference: true
+    last_validated: null
+  - id: zai-org/GLM-5.2
+    training: false
+    inference: true
+    last_validated: null
+  - id: zai-org/GLM-5.2-FP8
+    training: false
+    inference: true
+    last_validated: 2026-09-01
+  - id: zai-org/GLM-5.3
+    training: false
+    inference: true
+    last_validated: null
+  - id: zai-org/GLM-5.3-Flash
+    training: true
+    inference: true
+    last_validated: null
+  - id: zai-org/GLM-5.3-Flash-BF16
+    training: true
+    inference: true
+    last_validated: null
+  - id: openai/gpt-oss-120b
+    training: false
+    inference: true
+    last_validated: null
+  - id: google/medgemma-1.5-4b-it
+    training: true
+    inference: true
+    last_validated: null
+  - id: google/medgemma-4b-it
+    training: true
+    inference: true
+    last_validated: null
+  - id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    training: true
+    inference: true
+    examples:
+      - conversational-sft
+      - inference-endpoint
+      - math-grpo
+    last_validated: null
+  - id: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+    training: true
+    inference: true
+    examples:
+      - conversational-sft
+      - inference-endpoint
+      - math-grpo
+    last_validated: null
   - id: Qwen/Qwen3-0.6B
     training: true
     inference: true
     last_validated: null
   - id: Qwen/Qwen3-1.7B
+    training: true
+    inference: true
+    last_validated: null
+  - id: Qwen/Qwen3-30B-A3B
+    training: true
+    inference: true
+    examples:
+      - conversational-sft
+      - inference-endpoint
+      - math-grpo
+    last_validated: null
+  - id: Qwen/Qwen3-4B-Instruct-2507
     training: true
     inference: true
     last_validated: null
@@ -58,23 +134,7 @@ models:
       - inference-endpoint
       - math-grpo
     last_validated: 2026-09-02
-  - id: deepseek-ai/DeepSeek-V4-Flash-0731
-    training: false
-    inference: true
-    last_validated: 2026-09-01
-  - id: openai/gpt-oss-120b
-    training: false
-    inference: true
-    last_validated: null
-  - id: zai-org/GLM-5.2
-    training: false
-    inference: true
-    last_validated: null
-  - id: zai-org/GLM-5.2-FP8
-    training: false
-    inference: true
-    last_validated: 2026-09-01
-  - id: zai-org/GLM-5.3
-    training: false
+  - id: Qwen/Qwen3.8-Flash-Next
+    training: true
     inference: true
     last_validated: null

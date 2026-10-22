@@ -52,4 +52,5 @@ shared rather than restating it:
 Records `id`, `title`, `status`, `task`, `methods`, `datasets`, `precision`,
 `provenance` (when adapted), and `last_validated`: the date of the last verified
 run, or `null` if the example has changed since. Leave out `models` and
-`default_training_gpus`, since the model catalog owns those.
+`default_training_gpus`, since the model catalog owns those. Distillation is
+the exception: it lists its student and teacher models.

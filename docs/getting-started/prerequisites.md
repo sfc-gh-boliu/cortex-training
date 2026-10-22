@@ -2,7 +2,7 @@
 
 Before running a training example, you need:
 
-- Python 3.10 or later
+- Python 3.10 or later (3.11 or later to run the examples)
 - [uv](https://docs.astral.sh/uv/) (or `pip`) to install the client
 - Access to a Snowflake account with the Cortex Training endpoint enabled
 - A programmatic access token

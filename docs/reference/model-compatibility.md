@@ -34,14 +34,10 @@ for a specific workload.
 | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
 | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
 
-A model's `standard` and `long` files are its smaller and larger `max_seq_len`
-tiers; the boundary is per model, not a fixed cutoff, so one model's standard
-window can exceed another's (the `Long-context max_seq_len` column shows each
-model's larger tier). Most models with
-training files have both LoRA and full files for training and inference, and the
-inference-only models have full-weight files; some newer families ship only a
-subset (full-weight only, or LoRA only), so the model's folder in the catalog is
-the authority on which files a given model has. The examples pick a file with
+`standard` and `long` are each model's smaller and larger `max_seq_len` tiers,
+so the boundary differs between models. Most trainable models have LoRA and full
+files; some have only one, and inference-only models have full-weight files. The
+model's catalog folder lists exactly which files it has. The examples pick a file with
 `model=`, `context=`, `hardware=` and `lora=` (see
 [Run an example](../../examples/README.md#run-an-example)).
 
@@ -49,7 +45,9 @@ The examples that tokenize prompts pick a chat renderer from tinker-cookbook,
 with thinking off by default (`examples.inference.serve` needs none).
 tinker-cookbook lists no renderer for Qwen3-0.6B, Qwen3-1.7B, Qwen3.8-Flash-Next,
 the Gemma and MedGemma models, DeepSeek V4, GLM 4.5 Air, GLM 5.2 or GLM 5.3 Flash
-BF16, so pass `renderer_name=` for those. Qwen3-4B-Instruct, GLM 5.3, GLM 5.3
+BF16, so pass `renderer_name=` for those (SFT, distillation and the inference
+`generate`/`evaluate` commands accept it; Math GRPO does not, so it can't run
+these models). Qwen3-4B-Instruct, GLM 5.3, GLM 5.3
 Flash and gpt-oss have only thinking renderers, so pass `enable_thinking=true` or
 `renderer_name=`.
 

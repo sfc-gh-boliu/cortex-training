@@ -69,7 +69,7 @@ To add a dataset, edit `conversational/task.py`:
 - For Hugging Face rows that need mapping, write a `*_row_to_messages` function
   and add a `MappedHfDataset`, as GSM8K does.
 
-To list the dataset in the catalog, also add it to `conversational/example.yaml`.
+Also list it under `datasets` in the example's metadata, `conversational/example.yaml`.
 
 ## Expected results
 

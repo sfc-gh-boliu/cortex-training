@@ -13,12 +13,11 @@ python -m examples.sft.conversational.train \
   lora=true
 ```
 
-LoRA is available only for a model and context that has LoRA files in the
-catalog: `lora=true` (or `make_config(lora=True)`) picks them, with the adapter
-rank and learning rate in each file. Many models ship LoRA files, but some are
-full-only, so `lora=true` on those raises an error naming the files the model
-has; the [model catalog](../../../model-catalog/README.md) is the authority on
-which models and contexts offer LoRA.
+`lora=true` (or `make_config(lora=True)`) picks the model's LoRA files, which
+set the adapter rank and learning rate. Some models are full-only; for those,
+`lora=true` fails with a list of the files the model has. The
+[model catalog](../../../model-catalog/README.md) shows which models and
+contexts have LoRA files.
 
 To change the adapter (`peft_config.r`, `lora_alpha`, or `target_modules` for
 dense Qwen models), add it to the example's `overrides.json`, or write the job

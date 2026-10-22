@@ -82,7 +82,7 @@ Held-out test accuracy, logged every 20 steps, rose from 0.544 at step 0 to
 | rubric | Supported |
 | chat supervised learning, sl-basic, prompt distillation | Supported |
 | on-policy distillation | Supported |
-| code RL, Harbor, search, verifiers | Supported |
+| code RL, Harbor, search, verifiers | Not validated (need external tools or graders) |
 | `rl_loop`, `sl_loop` | Not yet supported |
 | DPO, SDFT | Not yet supported |
 | off-policy distillation | Not yet supported |

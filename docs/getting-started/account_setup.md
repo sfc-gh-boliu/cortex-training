@@ -51,7 +51,8 @@ You verify the connection after installing the client in the next step.
 
 ## Step 4: Install the Client and Example Dependencies
 
-Requires Python 3.10 or later and [uv](https://docs.astral.sh/uv/) (or `pip`).
+Requires [uv](https://docs.astral.sh/uv/) (or `pip`) and Python 3.10 or later
+for the client, or 3.11 or later for the examples (tinker-cookbook needs it).
 
 Clone the repository and install:
 

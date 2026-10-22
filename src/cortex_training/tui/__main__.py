@@ -21,6 +21,7 @@ import argparse
 import math
 import os
 import re
+import sys
 from pathlib import Path
 
 _CONNECT_HINT = ("to connect, run 'cortex-training login config.json', set CORTEX_TRAINING_CONFIG, pass "
@@ -97,6 +98,11 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
         ),
     )
     p.add_argument(
+        "--ct-config",
+        metavar="PATH",
+        help="Cortex Training settings file to use instead of ~/.config/cortex-training/config.json.",
+    )
+    p.add_argument(
         "--connection",
         "-c",
         default=os.environ.get("CORTEX_TRAINING_CONNECTION"),
@@ -155,6 +161,9 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
 
     import cortex_training._cli as cli
 
+    # The flags as typed, for the picker. The TUI's --poll-interval paces its log
+    # polls, and its --poll-timeout has no effect, so neither goes to the client.
+    typed = {**cli._typed_settings(args), "poll_interval": None, "poll_timeout": None}
     # Reuse the CLI's resolution: --config / login state / env / defaults.
     try:
         args = cli._resolve_args(args)
@@ -174,6 +183,12 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
         args = cli._normalize_connection_args(args)
     except ValueError as exc:
         parser.error(str(exc))
+    if args.use_connection_profile and not args.base_url:
+        try:
+            args = cli._pick(args, typed)
+        except ValueError as exc:
+            parser.exit(2, f"{parser.prog}: error: {_escaped(str(exc))}\n{_CONNECT_HINT}\n")
+        sys.stderr.write(cli.target_line(args.resolution, sys.stderr))
     if not args.use_connection_profile and not args.database:
         parser.error("provide --database or set CORTEX_TRAINING_DATABASE/SNOWFLAKE_DATABASE")
     if (

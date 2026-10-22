@@ -23,6 +23,7 @@ import logging
 import threading
 import time
 from datetime import date
+import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -3295,6 +3296,12 @@ def test_direct_connection_flags_do_not_read_login_state(tmp_path, monkeypatch):
     assert rc == 0
 
 
+def _write_profiles(*names: str) -> None:
+    """Write minimal profiles to the temporary Snowflake folder (see conftest)."""
+    text = "".join(f'[{name}]\naccount = "ACME"\nuser = "ME"\n' for name in names)
+    (Path(os.environ["SNOWFLAKE_HOME"]) / "connections.toml").write_text(text)
+
+
 def test_no_legacy_config_falls_back_to_default_snowflake_profile(
     tmp_path, monkeypatch
 ):
@@ -3308,21 +3315,29 @@ def test_no_legacy_config_falls_back_to_default_snowflake_profile(
         "SNOWFLAKE_HOST",
         "CORTEX_TRAINING_PAT",
         "SNOWFLAKE_PAT",
+        "CORTEX_TRAINING_DATABASE",
+        "CORTEX_TRAINING_SCHEMA",
     ):
         monkeypatch.delenv(name, raising=False)
+    snowflake = Path(os.environ["SNOWFLAKE_HOME"])
+    (snowflake / "connections.toml").write_text('[default]\naccount = "ACME"\nuser = "ME"\ndatabase = "TRAIN_DB"\n')
     seen = {}
 
     def make_client(args):
         seen.update(vars(args))
         return FakeClient()
 
-    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
+    stderr = io.StringIO()
+    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO(), stderr=stderr)
 
     assert rc == 0
     assert seen["use_connection_profile"] is True
     assert seen["connection"] is None
-    assert seen["database"] is None
-    assert seen["schema"] is None
+    assert seen["resolution"].profile == "default"
+    assert (seen["database"], seen["schema"]) == ("TRAIN_DB", "PUBLIC")
+    assert stderr.getvalue() == (
+        "→ profile default (Snowflake default profile) · database TRAIN_DB (from profile default) · schema PUBLIC\n"
+    )
 
 
 @pytest.mark.parametrize(
@@ -3348,6 +3363,7 @@ def test_incomplete_direct_environment_falls_back_to_default_profile(
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(environment_name, environment_value)
+    _write_profiles("default")
     seen = {}
 
     def make_client(args):
@@ -3365,6 +3381,7 @@ def test_named_connection_bypasses_invalid_login_state(tmp_path, monkeypatch):
     login_state = tmp_path / "login.json"
     login_state.write_text("not json", encoding="utf-8")
     monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
+    _write_profiles("training-profile")
     seen = {}
 
     def make_client(args):
@@ -3408,6 +3425,7 @@ def test_missing_remembered_config_falls_back_to_profile(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
+    _write_profiles("default")
     seen = {}
 
     def make_client(args):
@@ -3436,20 +3454,29 @@ def test_build_client_uses_named_snowflake_connection(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing.json")
     )
+    _write_profiles("training-profile")
     args = cli.parse_args(["--connection", "training-profile", "list"])
     client_cls = MagicMock()
     connected = object()
-    client_cls._from_profile.return_value = connected
+    client_cls._from_resolution.return_value = connected
 
     assert cli.build_client(args, client_cls) is connected
-    client_cls._from_profile.assert_called_once_with(
-        connection_name="training-profile",
-        database=None,
-        schema=None,
-        endpoint="cortex-training",
-        poll_interval=0.5,
-        poll_timeout=1800.0,
-        verify_ssl=True,
+    # Only typed flags are passed, so config.json's settings and the client's defaults apply.
+    client_cls._from_resolution.assert_called_once_with(args.resolution)
+    assert args.resolution.profile == "training-profile"
+    client_cls._from_profile.assert_not_called()
+
+
+def test_build_client_passes_typed_flags_over_config_json(tmp_path, monkeypatch):
+    _write_profiles("training-profile")
+    args = cli.parse_args(
+        ["--connection", "training-profile", "--endpoint", "ct", "--poll-timeout", "60", "--no-verify-ssl", "list"]
+    )
+    client_cls = MagicMock()
+
+    cli.build_client(args, client_cls)
+    client_cls._from_resolution.assert_called_once_with(
+        args.resolution, endpoint="ct", poll_timeout=60.0, verify_ssl=False
     )
 
 
@@ -3459,12 +3486,13 @@ def test_build_client_forwards_read_bounds_only_when_set(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing.json")
     )
+    _write_profiles("training-profile")
     args = cli.parse_args(["--connection", "training-profile", "list"])
     args.max_retries, args.request_timeout = 2, (10.0, 45.0)
     client_cls = MagicMock()
 
     cli.build_client(args, client_cls)
-    kwargs = client_cls._from_profile.call_args.kwargs
+    kwargs = client_cls._from_resolution.call_args.kwargs
     assert (kwargs["max_retries"], kwargs["request_timeout"]) == (2, (10.0, 45.0))
 
 
@@ -3630,3 +3658,78 @@ def test_download_lock_paths_are_resolved(tmp_path, monkeypatch):
     root.release()
     with cli._output_dir_lock(Path("/")):
         pass
+
+
+# ─── The picker and the target line (2s) ────────────────────────────────────
+
+
+class _Terminal(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def test_the_target_line_names_each_source(monkeypatch):
+    monkeypatch.delenv("CORTEX_TRAINING_DATABASE", raising=False)
+    monkeypatch.delenv("CORTEX_TRAINING_SCHEMA", raising=False)
+    _write_profiles("prod", "train")
+    stderr = io.StringIO()
+    rc = cli.main(
+        ["--connection", "train", "--database", "MY_DB", "--schema", "RUNS", "list"],
+        client_factory=lambda args: FakeClient(),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+    assert rc == 0
+    assert stderr.getvalue().splitlines()[0] == (
+        "→ profile train (from --connection) · database MY_DB (from --database) · schema RUNS (from --schema)"
+    )
+
+
+def test_the_target_line_uses_config_json_and_flags_a_variable_in_yellow(monkeypatch):
+    _write_profiles("prod")
+    config = Path(os.environ["XDG_CONFIG_HOME"]) / "cortex-training" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text('{"profile": "prod"}')
+    monkeypatch.setenv("CORTEX_TRAINING_DATABASE", "SANDBOX_DB")
+    monkeypatch.delenv("CORTEX_TRAINING_SCHEMA", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    stderr = _Terminal()
+    cli.main(["list"], client_factory=lambda args: FakeClient(), stdout=io.StringIO(), stderr=stderr)
+    line = stderr.getvalue().splitlines()[0]
+    assert "\033[1mprod\033[0m \033[2m(from config.json)\033[0m" in line
+    assert "\033[1mSANDBOX_DB\033[0m \033[33m(from CORTEX_TRAINING_DATABASE)\033[0m" in line
+
+
+def test_the_target_line_is_plain_with_no_color(monkeypatch):
+    _write_profiles("default")
+    monkeypatch.setenv("NO_COLOR", "1")
+    stderr = _Terminal()
+    cli.main(["list"], client_factory=lambda args: FakeClient(), stdout=io.StringIO(), stderr=stderr)
+    assert "\033[" not in stderr.getvalue()
+
+
+def test_ct_config_picks_the_settings_file(tmp_path):
+    _write_profiles("default", "project")
+    settings = tmp_path / "project-config.json"
+    settings.write_text('{"profile": "project", "endpoint": "ct"}')
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    stderr = io.StringIO()
+    rc = cli.main(["--ct-config", str(settings), "list"], client_factory=make_client, stdout=io.StringIO(), stderr=stderr)
+    assert rc == 0
+    assert seen["resolution"].profile == "project"
+    assert seen["resolution"].settings == {"endpoint": "ct"}
+    assert f"(from {settings})" in stderr.getvalue()
+
+
+def test_a_named_profile_that_does_not_exist_is_an_error():
+    _write_profiles("prod")
+    stderr = io.StringIO()
+    rc = cli.main(["--connection", "nope", "list"], client_factory=lambda args: FakeClient(), stderr=stderr)
+    assert rc == 1
+    assert "Snowflake connection profile 'nope' (passed in) does not exist; known profiles: prod." in stderr.getvalue()

@@ -1981,6 +1981,15 @@ class CortexTrainingClient:
             connection=connection, ct_config=ct_config, database=database, schema=schema
         )
         logger.info("Cortex Training target: %s", resolution.describe())
+        return cls._from_resolution(resolution, **kwargs)
+
+    @classmethod
+    def _from_resolution(cls, resolution: Any, **kwargs: Any) -> "CortexTrainingClient":
+        """Create the client a :class:`~cortex_training._picker.Resolution` describes.
+
+        For callers that resolve first, such as the CLI, which shows the target
+        before connecting. Keyword arguments win over the settings in ``config.json``.
+        """
         settings = dict(resolution.settings)
         verify_ssl = kwargs.pop("verify_ssl", settings.pop("verify_ssl", True))
         options = {**settings, **kwargs}

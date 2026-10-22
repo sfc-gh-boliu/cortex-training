@@ -3455,6 +3455,39 @@ def test_quit_without_job_id_derives_it_from_sub_job_id_and_reports_crashes(monk
         tui_main.run(["--sub-job-id", "not-a-sub-job-id", "--base-url", "http://localhost:1", "--database", "DB"])
 
 
+def test_the_tui_uses_the_picker_and_shows_the_target(monkeypatch, capsys):
+    import os
+    from pathlib import Path
+
+    (Path(os.environ["SNOWFLAKE_HOME"]) / "connections.toml").write_text('[train]\naccount = "ACME"\nuser = "ME"\n')
+    for name in ("CORTEX_TRAINING_CONFIG", "CORTEX_TRAINING_CONNECTION", "CORTEX_TRAINING_DATABASE", "CORTEX_TRAINING_SCHEMA"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", "/nonexistent/login.json")
+    seen = {}
+
+    class FakeApp:
+        return_code = 0
+
+        def __init__(self, client, job_id, *, sub_job_id=None, poll_interval=1.0):
+            seen["poll_interval"] = poll_interval
+
+        def run(self):
+            pass
+
+    def build_client(args, cls):
+        seen["resolution"] = args.resolution
+        seen["typed"] = args.typed
+        return MagicMock()
+
+    monkeypatch.setattr("cortex_training.tui.app.CortexTrainingLogTUI", FakeApp)
+    monkeypatch.setattr("cortex_training._cli.build_client", build_client)
+    assert tui_main.run(["--connection", "train", "--poll-interval", "9"]) == 0
+    assert seen["resolution"].profile == "train"
+    # --poll-interval paces the TUI's log polls; it never reaches the client.
+    assert seen["poll_interval"] == 9 and seen["typed"]["poll_interval"] is None
+    assert capsys.readouterr().err.startswith("→ profile train (from --connection) · database CORTEX_TRAINING_DB (default)")
+
+
 @pytest.mark.parametrize(
     "config, message, usage",
     [

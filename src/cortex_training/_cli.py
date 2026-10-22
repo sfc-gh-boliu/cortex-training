@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 from typing import Callable
 from typing import Iterator
+from typing import Mapping
 from typing import TextIO
 
 _CONFIG_KEYS = {
@@ -326,6 +327,14 @@ def build_parser(
         "--config",
         default=_env("CORTEX_TRAINING_CONFIG"),
         help="Path to a reusable Cortex Training CLI config JSON file.",
+    )
+    parser.add_argument(
+        "--ct-config",
+        metavar="PATH",
+        help=(
+            "Cortex Training settings file to use instead of "
+            "~/.config/cortex-training/config.json (for example, one per project)."
+        ),
     )
     parser.add_argument(
         "--connection",
@@ -898,6 +907,55 @@ def _normalize_connection_args(args: argparse.Namespace) -> argparse.Namespace:
     )
 
 
+# Settings the user typed as flags. The picker's result and config.json fill
+# the rest, so these are kept before the old resolution fills in defaults.
+_TYPED_SETTINGS = ("database", "schema", "endpoint", "poll_interval", "poll_timeout", "no_verify_ssl")
+
+
+def _typed_settings(args: argparse.Namespace) -> dict[str, Any]:
+    return {name: getattr(args, name, None) for name in _TYPED_SETTINGS}
+
+
+def _pick(args: argparse.Namespace, typed: Mapping[str, Any]) -> argparse.Namespace:
+    """Choose the profile, database, and schema with the picker, as ``from_configs()`` does."""
+    from cortex_training import _picker
+
+    args.resolution = _picker.resolve(
+        connection=args.connection,
+        ct_config=getattr(args, "ct_config", None),
+        database=typed["database"],
+        schema=typed["schema"],
+    )
+    args.typed = dict(typed)
+    args.database, args.schema = args.resolution.database, args.resolution.schema
+    return args
+
+
+def target_line(resolution: Any, stream: TextIO) -> str:
+    """One line naming the profile, database, and schema a command uses, and where each came from."""
+    from cortex_training._login import _Style
+
+    style = _Style(stream)
+    flags = {"profile": "--connection", "database": "--database", "schema": "--schema"}
+
+    def source(key: str) -> str:
+        text = resolution.sources[key]
+        if text == "passed in":
+            text = f"from {flags[key]}"
+        label = f"({text})"
+        # A variable left set in the shell is the source people miss.
+        return style.yellow(label) if text.startswith("from CORTEX_TRAINING_") else style.dim(label)
+
+    if resolution.profile is not None:
+        who = f"profile {style.bold(resolution.profile)} {source('profile')}"
+    else:
+        who = f"host {style.bold(resolution.host)} {source('host')}"
+    schema = f"schema {style.bold(resolution.schema)}"
+    if resolution.sources["schema"] != "default":
+        schema += f" {source('schema')}"
+    return f"→ {who} · database {style.bold(resolution.database)} {source('database')} · {schema}\n"
+
+
 def parse_args(
     argv: list[str] | None = None,
     *,
@@ -918,12 +976,13 @@ def parse_args(
         return args
 
     dry_run = args.command == "submit" and args.dry_run
+    typed = _typed_settings(args)
     args = _resolve_args(args, load_login=not dry_run)
     if dry_run:
         return args
     args = _normalize_connection_args(args)
     if args.use_connection_profile:
-        return args
+        return _pick(args, typed)
     if not args.database:
         parser.error("provide --database or set CORTEX_TRAINING_DATABASE/SNOWFLAKE_DATABASE")
     if args.base_url is None and (args.host is None or args.pat is None):
@@ -947,6 +1006,16 @@ def build_client(args: argparse.Namespace, cortex_training_client_cls):
             kwargs[option] = value
     if args.base_url:
         return cortex_training_client_cls(base_url=args.base_url, **kwargs)
+    resolution = getattr(args, "resolution", None)
+    if resolution is not None:
+        typed = args.typed
+        options = {name: typed[name] for name in ("endpoint", "poll_interval", "poll_timeout") if typed[name] is not None}
+        if typed["no_verify_ssl"]:
+            options["verify_ssl"] = False
+        for option in ("max_retries", "request_timeout"):
+            if option in kwargs:
+                options[option] = kwargs[option]
+        return cortex_training_client_cls._from_resolution(resolution, **options)
     if args.use_connection_profile:
         return cortex_training_client_cls._from_profile(
             connection_name=args.connection,
@@ -1719,6 +1788,8 @@ def main(
     args = None
     try:
         args = parse_args(argv, prog=prog, include_tui=include_tui)
+        if getattr(args, "resolution", None) is not None:
+            stderr.write(target_line(args.resolution, stderr))
         dry_run = args.command == "submit" and args.dry_run
         no_client = dry_run or args.command == "login"
         if client_factory is None and not no_client:

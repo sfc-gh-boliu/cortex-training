@@ -23,7 +23,7 @@ state.
 
 From a repository checkout, use `cluster-status.py` for a summary of running
 jobs and GPU usage. It shells out to `cortex-training list`, so configure
-[CLI login](../../reference/cli.md#login) first.
+[CLI login](../../reference/cli.md#legacy-login) first.
 
 ```bash
 python cluster-status.py            # Live view, refreshed every 5 seconds

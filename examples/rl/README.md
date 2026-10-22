@@ -1,169 +1,79 @@
 # Math GRPO
 
-Train a model with grouped policy optimization on Hendrycks MATH and evaluate
-against MATH-500. The example creates colocated training and sampling sub-jobs,
-generates rollouts, scores them, trains, and synchronizes weights. After the
-final save it logs a `python -m examples.inference.evaluate` command.
-The example lives in `math_grpo/`: its entry point `train.py`, its MATH
-prompting, scoring and evaluation in `task.py`, and its metadata in
-`example.yaml`. The entry point calls the shared GRPO loop in `runner.py`.
-
-## Hardware
-
-The default job requests four training GPUs and two sampling GPUs (Qwen3-8B
-LoRA at standard context on H200). Other models and contexts take the GPU
-counts of their catalog files; verify capacity before submission:
-
-```bash
-cortex-training capacity
-```
+Train a model on Hendrycks MATH with grouped policy optimization, and evaluate on
+MATH-500. Each run creates one job with colocated training and sampling
+sub-jobs. The loop generates rollouts, scores them, trains, and syncs weights to
+the sampler. The example is in `math_grpo/`: `train.py` is the entry point and
+`task.py` holds the prompt, scoring and evaluation. It runs on the shared loop
+in `runner.py`.
 
 ## Run
 
+The default is Qwen3-8B LoRA at standard context on H200: 4 training GPUs and 2
+sampling GPUs. Check capacity first with `cortex-training capacity`.
+
 ```bash
-# Qwen3-8B LoRA (default)
-python -m examples.rl.math_grpo.train \
-  config=/path/to/config.json
+python -m examples.rl.math_grpo.train config=/path/to/config.json
+```
 
+Other models:
+
+```bash
 # Qwen3-8B full-parameter
-python -m examples.rl.math_grpo.train \
-  config=/path/to/config.json \
-  lora=false
+python -m examples.rl.math_grpo.train config=/path/to/config.json lora=false
 
-# Qwen3.6-35B-A3B LoRA
-python -m examples.rl.math_grpo.train \
-  config=/path/to/config.json \
-  model=Qwen/Qwen3.6-35B-A3B context=long lora=true \
-  max_tokens=2048
-
-# Qwen3.6-35B-A3B full-parameter
-python -m examples.rl.math_grpo.train \
-  config=/path/to/config.json \
-  model=Qwen/Qwen3.6-35B-A3B context=long lora=false \
-  max_tokens=2048
+# Qwen3.6-35B-A3B (MoE) LoRA; add lora=false for full-parameter
+python -m examples.rl.math_grpo.train config=/path/to/config.json \
+  model=Qwen/Qwen3.6-35B-A3B context=long lora=true max_tokens=2048
 
 # Qwen3.8-27B full-parameter
-python -m examples.rl.math_grpo.train \
-  config=/path/to/config.json \
+python -m examples.rl.math_grpo.train config=/path/to/config.json \
   model=Qwen/Qwen3.8-27B context=long lora=false \
-  weight_sync_bucket_size=3221225472 \
-  max_tokens=2048
+  max_tokens=2048 weight_sync_bucket_size=3221225472
 ```
 
-`config=` is the Snowflake connection file. Adapt from
-`docs/getting-started/connection.json.template`.
+## Options
 
-The default job is `Qwen/Qwen3-8B` LoRA at standard context on H200. The
-default run will be finished within 1h.
+| Argument | Default | Meaning |
+|---|---|---|
+| `model=`, `context=`, `hardware=`, `lora=` | `Qwen/Qwen3-8B`, `standard`, `h200`, `true` | Which catalog files to use |
+| `lr=`, `train_batch_size=`, `max_seq_len=` | from the job | Override the job for this run (`max_seq_len` applies to both sub-jobs) |
+| `problems_per_batch=`, `group_size=` | 64, 16 | Rollouts per step = problems × group size |
+| `max_tokens=`, `temperature=` | 4096, 1.0 | Rollout sampling |
+| `max_steps=` | 10 | Training steps |
+| `eval_every=`, `n_test=` | 10, all | MATH-500 eval cadence (`0` skips it) and size |
+| `weight_sync_bucket_size=` | server default | Weight-sync transfer bucket in bytes. Set it above the largest single tensor |
+| `job_config=` | none | Use this job file instead of the catalog and `overrides.json`; `lr=`, `train_batch_size=` and `max_seq_len=` still apply |
+| `wandb_project=`, `sf_tracking=` | off | [Experiment tracking](../../docs/guides/operations/wandb.md) |
 
-## Choose the job
+## How the job is built
 
-The example builds its job on every run, from the
-[model catalog](../../model-catalog/README.md), in three layers, each
-overriding the one before:
-
-1. The model's training and inference files for `model=` (the exact model ID),
-   `context=` (`standard` or `long`), `hardware=` (`h200`, `b200` or `b300`;
-   default `h200`) and `lora=` (default `true`), combined into one job with a
-   training and a sampling sub-job. Both come from the same hardware prefix.
-2. `rl/overrides.json`, which the example ships and applies to every RL run, in
-   any model.
-3. The command line: `lr=`, `train_batch_size=` and `max_seq_len=` (the last
-   applies to both sub-jobs). Each defaults to `None`, which keeps the value
-   from the layers below.
-
-The job is logged before it is submitted. A combination the catalog does not
-have fails with the list of files that exist for that model: an RL job needs a
-training and an inference file of the same context, hardware and mode.
-Overrides merge by the rules in
+The job is built as described in
 [How an example builds its job](../README.md#how-an-example-builds-its-job).
+For RL, the model's training and inference files are combined into one job, and
+[`rl/overrides.json`](overrides.json) adds the RL tuning that every model
+shares: optimizer betas `(0.9, 0.95)`, `mb_spec.max_tokens_per_mb` 10240, and
+ZeRO `reduce_scatter`. Edit that file to change these for every run.
 
-Each generated run writes the job it built to
-`examples/rl/configs/<slug>-<context>-<hw>-<lora|full>.json`, for example
-`examples/rl/configs/qwen3-8b-standard-h200-lora.json`, before it submits the
-job, replacing the file of the previous run with the same selection. The file
-is the body this run generated, so it always reflects this run's `model`,
-`context`, `hardware`, `lora` and command-line settings, and can't go stale.
-A run that fails before submitting still leaves its own generated
-body (not the previous run's), and it keeps the debug image tag when
-`debug_image_tag=` was set. A run attached to an existing job with `job_id=`
-writes nothing, and a `job_config=` run uses its file as is and generates
-nothing. The folder is not committed. The file is a starting point: copy it,
-edit it, and pass it back with `job_config=JOB_CONFIG`. The example then uses
-the file as is, plus `lr=`, `train_batch_size=` and `max_seq_len=`; the runner
-reads the router replay `max_cache_bytes` from that file. A record that carries
-a debug block does not re-enable create-job debug options on its own when you
-pass it back with `job_config=`: loading a body never opens the internal-only
-gate. To rebuild on that image, re-authorize debug explicitly for the run —
-pass `debug_image_tag=` again (which sets the gate for that run) or set
-`CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS` yourself. To build the same job without running
-the example, see
-[Create a job config from the command line](../README.md#create-a-job-config-from-the-command-line).
-
-### The default job's shape
-
-RL is built from the catalog's training and inference files, so the default
-job, Qwen3-8B LoRA at standard context on H200, composes to 4 training GPUs and
-2 sampling GPUs at tensor-parallel size 1. The RL config this example used
-before had 4 training plus 4 sampling GPUs at tensor-parallel size 4.
-
-The catalog files carry the SFT optimizer betas `(0.9, 0.999)`, but the example
-ships [`rl/overrides.json`](overrides.json), applied to every RL run (layer 2
-below), which restores the three training settings that were identical across
-all of the pre-restructure RL configs:
-
-```json
-{"sub_job_configs": [{"job_type": "training", "training_config": {
-  "optimizer": {"betas": [0.9, 0.95]},
-  "mb_spec": {"max_tokens_per_mb": 10240},
-  "ds_config": {"zero_optimization": {"reduce_scatter": true}}}}]}
-```
-
-One override is correct for every model because those three values were the same
-in all of the earlier RL configs; the per-model settings (GPU counts, sampler
-tensor parallelism, and the lower full-parameter RL learning rate) stay at their
-catalog values. So the default RL job trains with optimizer betas `(0.9, 0.95)`,
-packing `max_tokens_per_mb` 10240, and ZeRO `reduce_scatter`, all from the
-committed `rl/overrides.json`. `lr=` changes only the learning rate for one run;
-to change the betas, packing, or `reduce_scatter`, edit `rl/overrides.json` (for
-every run) or pass a saved job file back with `job_config=` (for one run).
-
-`rl/overrides.json` also carries a reserved `_comment` key -- a free-text note
-describing the file -- which the override loader strips before merging, so it
-never reaches the job body. (JSON has no comments; every example's
-`overrides.json` uses this convention.)
+Each run that creates its job from the catalog (not with `job_config=` or
+`job_id=`) writes the job it built to
+`examples/rl/configs/<slug>-<context>-<hw>-<lora|full>.json`, which is
+gitignored. To customize a run beyond the command-line options, copy that file,
+edit it, and pass it back with `job_config=`.
 
 ## Router replay
 
-For an MoE model (`architecture` is `moe` in the model's `model.json`, as for
-`Qwen/Qwen3.6-35B-A3B`), the example fills in `router_replay` on both
-sub-jobs after the three layers are merged. An override that changes
-`model_name` is filled in for the model it names (a dense one gets no router
-replay), and both sub-jobs must name the same model. It sets:
+For MoE models (`architecture: moe` in `model.json`, such as
+Qwen3.6-35B-A3B), router replay is turned on for both sub-jobs with fixed caps,
+unless you pass `job_config=`:
 
-- Training sub-job: `{"enabled": true, "mode": "strict", "max_cache_bytes": 5368709120}`
-  (5 GiB per data-parallel shard).
-- Sampling sub-job: `{"enabled": true, "max_cache_bytes": 21474836480}` (20 GiB
-  per sampling replica), with no `mode`, which the service rejects there.
+| Sub-job | Setting |
+|---|---|
+| Training | `{"enabled": true, "mode": "strict", "max_cache_bytes": 5368709120}` (5 GiB per data-parallel shard) |
+| Sampling | `{"enabled": true, "max_cache_bytes": 21474836480}` (20 GiB per sampling replica) |
 
-These caps are **fixed defaults**: the same 5 GiB training / 20 GiB sampling for
-every model, context, hardware and rollout batch. They are not derived from the
-job, so `--rollout-batch-size` of `python -m examples.utils` no longer sizes
-them (it is kept only for backward compatibility). vLLM's
-`gpu_memory_utilization` is not changed. Dense models get no router replay.
-`make_config(..., router_replay=True)` and `python -m examples.utils
---router-replay` fail for a dense model even when an override sets both caps,
-and so does an override that turns router replay on for a model the catalog
-lists as dense.
-
-To size a cap to a particular job instead of taking the fixed default, use the
-[capacity planner](#router-replay-capacity-planning) below (it is still shipped
-in `examples/utils.py`) and set the value you get with an override, as here.
-
-Overrides stay in control. Only keys an override did not set are filled in,
-so an explicit `max_cache_bytes` or `mode` wins, and
-`"router_replay": {"enabled": false}` on either sub-job turns router replay
-off and nothing is filled in:
+Any value you set in `rl/overrides.json` wins. For example, to use different
+caps and best-effort mode:
 
 ```json
 {"sub_job_configs": [
@@ -171,308 +81,66 @@ off and nothing is filled in:
   {"job_type": "sampling", "inference_config": {"router_replay": {"max_cache_bytes": 17179869184}}}]}
 ```
 
-```json
-{"sub_job_configs": [{"job_type": "training", "training_config": {"router_replay": {"enabled": false}}}]}
-```
-
-Put either in `rl/overrides.json`, or in a file passed to
-`python -m examples.utils --override`. A `job_config=` file is used as is, so
-its router replay settings are the ones that run.
-
-## Customizability
-
-```bash
-python -m examples.rl.math_grpo.train \
-  config=/path/to/config.json \
-  model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA \
-  lr=LEARNING_RATE \
-  train_batch_size=TRAIN_BATCH_SIZE \
-  max_seq_len=MAX_SEQ_LEN \
-  max_tokens=MAX_TOKENS \
-  problems_per_batch=PROBLEMS_PER_BATCH \
-  group_size=GROUP_SIZE \
-  max_steps=MAX_STEPS \
-  n_test=N_TEST \
-  weight_sync_bucket_size=WEIGHT_SYNC_BUCKET_SIZE_BYTES \
-  wandb_project=WANDB_PROJECT \
-  sf_tracking=SF_TRACKING
-```
-
-LoRA, GPU counts, sequence length, and MoE come from the job (see
-[Choose the job](#choose-the-job)). Set
-`wandb_project` to log to Weights & Biases after `uv pip install wandb` and
-`export WANDB_API_KEY` / `export WANDB_BASE_URL`. Set `sf_tracking=True` to log
-to Snowflake experiment tracking after
-`uv pip install "snowflake-ml-python>=1.19.0"`.
-
-`weight_sync_bucket_size` optionally overrides the transfer-bucket size in
-bytes. When omitted, the example leaves the field out and uses the server
-default. Set it above the largest individual model tensor.
-
-The example submits one create-job body with colocated training and sampling
-sub-jobs, which is also the shape of a file you pass with
-`job_config=JOB_CONFIG`.
-
-```json
-{
-  "hardware": HARDWARE,
-  "sub_job_configs": [
-    {
-      "job_type": "training",
-      "model_name": MODEL_NAME,
-      "dtype": DTYPE,
-      "seed": SEED,
-      "training_config": {
-        "n_gpus": NUM_TRAINING_GPUS,
-        "max_seq_len": MAX_SEQ_LEN,
-        "train_batch_size": TRAIN_BATCH_SIZE,
-        "sp_size": SEQUENCE_PARALLEL_SIZE,
-        "gradient_clipping": GRADIENT_CLIPPING,
-        "model_provider": MODEL_PROVIDER, // Use prime_rl for MoE
-        "attn_implementation": "flash_attention_3",
-        "optimizer": {
-          "name": "AdamW",
-          "lr": LEARNING_RATE,
-          "weight_decay": WEIGHT_DECAY,
-          "betas": [ADAM_BETA1, ADAM_BETA2],
-          "eps": ADAM_EPS
-        },
-        "ds_config": {
-          "zero_optimization": {
-            "stage": ZERO_STAGE
-          },
-          "bf16": {
-            "enabled": true
-          }
-        },
-
-        // Optional packing: the most real tokens per model call (server default 10240).
-        "mb_spec": {"max_tokens_per_mb": MAX_TOKENS_PER_MB},
-
-        // Optional LoRA. Omit for full-parameter.
-        "peft_config": {
-          "peft_type": "Lora",
-          "r": LORA_RANK,
-          "lora_alpha": LORA_RANK,
-          "lora_dropout": 0.0,
-          "bias": "none",
-          "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-        },
-
-        // Optional expert parallelism for MoE. NUM_TRAINING_GPUS must be a multiple of EP_SIZE.
-        "ac_config": {"mode": "full", "freq": 1},
-        "prime_rl": {
-          "fused_lm_head_token_chunk_size": 8192,
-          "fused_cross_entropy": false
-        },
-        "ep_size": EP_SIZE,
-
-        // Router replay for MoE training, filled in for MoE models. Set
-        // "mode": "best_effort" to route rows the sampler no longer holds (e.g.
-        // after a sampler restart) with the trainer's own gate instead of
-        // failing the step.
-        "router_replay": {"enabled": true, "mode": "strict", "max_cache_bytes": TRAINING_CACHE_BYTES}
-      }
-    },
-    {
-      "job_type": "sampling",
-      "model_name": MODEL_NAME,
-      "dtype": DTYPE,
-      "seed": SEED,
-      "inference_config": {
-        "max_seq_len": MAX_SEQ_LEN,
-        "n_gpus": NUM_SAMPLING_GPUS,
-        "vllm_config": {
-          "tensor_parallel_size": TENSOR_PARALLEL_SIZE,
-          "gpu_memory_utilization": GPU_MEMORY_UTILIZATION
-        },
-
-        // Optional LoRA. Omit for full-parameter. Keep in sync with training.
-        "peft_config": {
-          "peft_type": "Lora",
-          "r": LORA_RANK,
-          "lora_alpha": LORA_RANK,
-          "lora_dropout": 0.0,
-          "bias": "none",
-          "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-        },
-
-        // Router replay for MoE training, filled in for MoE models. A sampling
-        // sub-job takes no "mode".
-        "router_replay": {"enabled": true, "max_cache_bytes": SAMPLING_CACHE_BYTES}
-      }
-    }
-  ]
-}
-```
-
-The `prime_rl` entries in the config above are deprecated but keep working. On
-server versions that support `model_options`, and with `EP_SIZE` > 1, the
-same settings can be written inside `training_config`, in place of the
-`prime_rl` block, as the entry below; see
-[the REST API reference](../../docs/reference/rest-api.md#model_options).
-
-```json
-"model_options": {"lm_head": {"token_chunk_size": 8192, "cross_entropy": false}}
-```
-
-The Qwen3.6-35B-A3B long-context training files in the model catalog,
-`examples/api/training.json` and `examples/api/rl.json` still use the
-`prime_rl` block, which older servers need.
-
-On server versions that have `numerics.fp32_parity`, Qwen3.5-family models run
-with it on by default: dense models (for example `Qwen/Qwen3.8-27B`) and
-Qwen3.5-MoE models with `EP_SIZE` > 1 (the Qwen3.6-35B-A3B configs). It raises
-GPU memory. Memory was not measured for rows near `max_seq_len` with the
-Qwen3.8-27B catalog files. If a job runs out of memory, raise `sp_size`
-(at most 8 for Qwen3.8-27B) or turn the option off by adding
-`"numerics": {"fp32_parity": false}` to the `model_options` entry of
-`training_config`, inside the same object if the config already has one (two
-`model_options` keys in one JSON object keep only the last). Turning it off
-can bring back part of the difference between the trainer's and the sampler's
-log-probabilities, which matters for RL. A server that has the option but not
-`model_options` support ignores that entry; see
-[the REST API reference](../../docs/reference/rest-api.md#model_options).
-
-The target list above is for dense Qwen models. For
-`Qwen/Qwen3.6-35B-A3B`, the catalog's LoRA files use
-`model_provider: "prime_rl"` and attention-only targets (`q_proj`, `k_proj`,
-`v_proj`, and `o_proj`). PrimeRL does not yet support LoRA on routed experts;
-`gate_proj`, `up_proj`, and `down_proj` do not select those parameters.
+`"router_replay": {"enabled": false}` on either sub-job turns router replay off.
+In `best_effort` mode, the trainer routes rows the sampler no longer holds with
+its own gate, where `strict` mode fails the step. Dense models get no router
+replay.
 
 ## Router-replay capacity planning
 
-The router-replay capacity planner in `examples/utils.py` derives the
-per-worker `router_replay.max_cache_bytes` caps before you create a job.
-`make_config` no longer uses it for the defaults above, which are now the fixed
-5 GiB / 20 GiB caps; call it directly (through `plan_router_replay_caps`, or the
-`plan_training_cache_bytes` and `plan_sampling_cache_bytes` functions) to size
-caps for a particular job, then set them with an override. It only calculates.
-It does not call the service, edit a job config, or reserve GPU memory. Put
-`CachePlan.max_cache_bytes` on the sampling and training `router_replay` objects
-yourself. When bootstrapping with an explicit cap, pass the training result to
-`bootstrap_router_replay(..., max_cache_bytes=...)`.
-
-One full-sequence capture occupies:
+To size caps for a specific job instead of using the fixed defaults, use the
+planner in `examples/utils.py` (`plan_router_replay_caps`, or
+`plan_training_cache_bytes` and `plan_sampling_cache_bytes`). Then set the
+result in `rl/overrides.json`. The planner only calculates: it doesn't call the
+service or change a job.
 
 ```text
-entry_bytes = seq_len * num_moe_layers * topk * dtype_bytes
+entry_bytes   = seq_len * num_moe_layers * topk * dtype_bytes   # 1 byte for <=256 experts, else 2
+training_cap  = ceil(ceil(batch_size / dp_size) * entry_bytes * safety_factor)
+sampling_cap  = ceil(ceil(backlog / replicas * routing_skew) * entry_bytes * safety_factor)
+backlog       = max_inflight_rollouts + ceil(batch_size * over_generation_multiplier)
+                + batch_size * max(async_depth, 1)
 ```
 
-`moe_geometry_from_config` reads `num_hidden_layers` and `num_experts_per_tok`
-from the config root or `text_config`, and rejects conflicting values. Every
-recognized expert-count field (`num_local_experts`, `n_routed_experts`,
-`num_experts`, `moe_num_experts`) must agree, be positive, and be at least
-`topk`. A count of 256 or fewer selects `dtype_bytes=1` because those expert
-ids fit in `uint8`. A count from 257 through 65536 selects `dtype_bytes=2`
-(`uint16`). A larger count is rejected. `plan_sampling_cache_bytes` and
-`plan_training_cache_bytes` use that width unless you pass `dtype_bytes`.
-
-The sampling cap is per sampling replica, and the training cap is per
-data-parallel shard:
-
-```text
-backlog = max_inflight_rollouts
-        + ceil(batch_size * over_generation_multiplier)
-        + batch_size * max(async_depth, 1)
-per_replica_rollouts = ceil(backlog / replicas * routing_skew)
-sampling_cap = ceil(per_replica_rollouts * entry_bytes * safety_factor)
-
-resident_rows = ceil(batch_size / dp_size)
-training_cap = ceil(resident_rows * entry_bytes * safety_factor)
-```
-
-`max_inflight_rollouts` defaults to `batch_size`. `routing_skew` defaults to
-`2.0` and `safety_factor` defaults to `1.2`. Replica and data-parallel counts
-come from `derive_num_sampling_workers` and `derive_dp_size`; known GPU counts
-must divide exactly by the parallel widths. The skew estimate is not an
-overflow-proof bound. Raise it, or set a manual cap, when a worker retains
-more replay entries than the average backlog times the skew.
-
-`plan_vllm_gpu_memory_utilization` lowers vLLM's `gpu_memory_utilization` by
-the sampling cap divided by the GPU's byte capacity. It raises when that
-reservation exceeds half the GPU or would push utilization below `0.05`.
+The defaults are `routing_skew=2.0` and `safety_factor=1.2`. The skew is an
+estimate, not an upper bound. See
+[REST API section 8.2](../../docs/reference/rest-api.md#82-trainingconfig) for
+`max_cache_bytes`.
 
 ```python
-from examples import utils as rrp
+from examples import utils
 
-geometry = rrp.resolve_model_moe_geometry(
-    "org/moe-model",
-    num_moe_layers_override=40,
-    topk_override=8,
-    num_experts_override=512,
-)
-assert geometry.dtype_bytes == 2
-
-backlog = rrp.derive_backlog_rollouts(batch_size=16, async_depth=2)
-sampling_workers = rrp.derive_num_sampling_workers(
-    sampling_gpus=8,
-    sampling_tensor_parallel_size=2,
-)
-sampling_plan = rrp.plan_sampling_cache_bytes(
+# Reads the model's Hugging Face config. To skip the download, pass
+# num_moe_layers_override=, topk_override= and num_experts_override=.
+geometry = utils.resolve_model_moe_geometry("Qwen/Qwen3.6-35B-A3B")
+training_cap = utils.plan_training_cache_bytes(
     seq_len=8192,
     geometry=geometry,
-    backlog_rollouts=backlog,
-    num_sampling_workers=sampling_workers,
-)
-training_plan = rrp.plan_training_cache_bytes(
-    seq_len=8192,
-    geometry=geometry,
-    resident_rows=rrp.derive_resident_rows(
-        batch_size=16,
-        dp_size=rrp.derive_dp_size(training_gpus=8, sp_size=2),
+    resident_rows=utils.derive_resident_rows(
+        batch_size=1024, dp_size=utils.derive_dp_size(training_gpus=8, sp_size=1)
     ),
-)
-sampling_cap = sampling_plan.max_cache_bytes
-training_cap = training_plan.max_cache_bytes
+).max_cache_bytes
 ```
 
-The same sequence length, layer count, and top-k with 512 experts stores each
-expert id in two bytes, so each capture is twice as large as one from a model
-with 256 or fewer experts. See
-[REST API section 8.2](../../docs/reference/rest-api.md#82-trainingconfig) for the
-`max_cache_bytes` field.
+## Job settings for specific models
 
-## Evaluation and Logs
+Model-specific job fields are documented in the reference docs:
 
-Training logs reward, correctness, format, rollout counts, and loss. Held-out
-MATH-500 generate eval runs every `eval_every` batches (`test/env/all/correct`;
-`eval_every=0` skips it). To mirror local metrics to Weights & Biases:
+- MoE LoRA targets attention only: see [LoRA and QLoRA](../../docs/guides/training/lora-and-qlora.md).
+- `prime_rl` versus `model_options`, and `numerics.fp32_parity` (on by default
+  for Qwen3.5-family models; turn it off if a job runs out of memory): see
+  [REST API `model_options`](../../docs/reference/rest-api.md#model_options).
 
-```bash
-uv pip install wandb
-export WANDB_API_KEY=...
-export WANDB_BASE_URL=...
-```
+## Evaluation and logs
 
-Then pass `wandb_project=WANDB_PROJECT` on the train command.
-
-To log the same metrics to Snowflake experiment tracking:
+Training logs reward, correctness, format, rollout counts and loss. MATH-500
+accuracy is logged as `test/env/all/correct`. After the final save, the example
+prints a matching `examples.inference.evaluate` command that uses the same
+prompt, grader and decoding:
 
 ```bash
-uv pip install "snowflake-ml-python>=1.19.0"
-```
-
-Then pass `sf_tracking=True` on the train command. The server ties each run to
-a Snowflake experiment; results are viewable in Snowsight under
-**AI & ML > Experiments**. See the
-[Snowflake ML Experiments docs](https://docs.snowflake.com/en/developer-guide/snowflake-ml/experiments).
-
-After save, the example prints one eval command whose `model=`, `context=`,
-`hardware=` and `lora=` pick the catalog inference file that serves the
-checkpoint: the run's model, hardware and mode, with the same adapter for LoRA,
-at the run's context or, when the model has no such file there, at the other
-one. When no catalog file fits, the command has `job_config=INFERENCE_JOB_CONFIG`
-instead, and a warning says what that inference job needs.
-`examples.inference.evaluate` uses the same few-shot prompt, grader, and
-decoding settings.
-
-```bash
-python -m examples.inference.evaluate \
-  config=/path/to/config.json \
+python -m examples.inference.evaluate config=/path/to/config.json \
   model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA \
-  source_job_id=TRAINING_JOB_ID \
-  checkpoint_id=CHECKPOINT_ID \
-  temperature=1.0 \
-  max_tokens=MAX_TOKENS
+  source_job_id=TRAINING_JOB_ID checkpoint_id=CHECKPOINT_ID \
+  temperature=1.0 max_tokens=MAX_TOKENS
 ```

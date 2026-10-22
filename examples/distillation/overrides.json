@@ -1,5 +1,5 @@
 {
-  "_comment": "Applied to every distillation student on top of the model catalog. Sizes the student to the shipped single-GPU footprint (one training and one sampling GPU, batch 1) and restores mb_spec packing, ZeRO reduce_scatter and the huggingface model provider. The \"_comment\" key is ignored and never reaches the job body.",
+  "_comment": "Sizes distillation students built from the catalog to one training and one sampling GPU with batch 1, and sets mb_spec packing, ZeRO reduce_scatter and the huggingface model provider. Skipped with job_config= and when attaching with job_id=. See examples/README.md, \"How an example builds its job\", for how this file is merged.",
   "sub_job_configs": [
     {
       "job_type": "training",

@@ -1,22 +1,13 @@
 # Cortex Training REST API Reference
 
-> **Status.** This page is a repository snapshot for the client version in this
-> branch. The service's own OpenAPI specification remains the source of truth
-> for the wire schema.
+> **Status.** This page is the REST contract the client in this repository
+> codes against. The service's own OpenAPI specification remains the source of
+> truth for the wire schema.
 >
 > **Scope.** This document describes the customer-facing Cortex Training REST
 > surface used by this repository's `CortexTrainingClient`. It covers REST paths,
 > request framing, asynchronous polling, client-visible schemas, checkpoints,
 > generation, operations, and logs.
->
-> **Sources used for this snapshot.** The client and wire implementation in
-> `src/cortex_training/client/` and `src/cortex_training/wire.py`, the
-> command-line interface in `src/cortex_training/cli/`, and their unit tests
-> are the local evidence for this document. The service's
-> own OpenAPI specification remains the source of truth when it is available.
-> The server-side statements in sections 8.2 and 8.3 about `model_options`
-> and the `prime_rl` block describe server behavior and are not exercised by
-> this repository's tests.
 >
 > **Important distinction.** `CortexTrainingClient` is a low-level transport client.
 > ArcticTraining may put additional keys such as `context` and `processing`
@@ -1730,19 +1721,14 @@ long-context/memory knobs:
 expert id as `uint8` when the model has at most 256 experts and as `uint16`
 when it has 257 to 65536 experts. A `uint16` capture uses twice as many bytes
 as a `uint8` capture for the same sequence length, MoE layer count, and top-k.
-The service does not choose the cap. The caps default to fixed values set
-client-side when a job is built — `5368709120` (5 GiB) on the training sub-job
-and `21474836480` (20 GiB) on the sampling sub-job. To use a different cap, set
-`router_replay.max_cache_bytes` explicitly in the job body for that sub-job (on
-a sampling sub-job it can also be set through `extra_sampling["router_replay"]`);
-setting it in the request is the supported path for every user, including a
-`pip`-installed one. If you have a repository checkout, its RL example also
-ships an optional planner (in `examples/utils.py`, not part of the installed
-package) that sizes a cap from the model's expert count, sequence length, MoE
-layer count, and top-k — it selects the `uint8`/`uint16` width and returns it as
-`CachePlan.max_cache_bytes`. See
-[Router-replay capacity planning](../../examples/rl/README.md#router-replay-capacity-planning)
-in the RL example README.
+The service and the client do not choose the cap: set
+`router_replay.max_cache_bytes` in the job body for each sub-job (on a sampling
+sub-job built with the SDK, through `extra_sampling["router_replay"]`). The
+repository's RL example fills in `5368709120` (5 GiB) for training and
+`21474836480` (20 GiB) for sampling on MoE models, and describes an optional
+planner that sizes a cap from the expert count, sequence length, MoE layer
+count, and top-k; see
+[Router-replay capacity planning](../../examples/rl/README.md#router-replay-capacity-planning).
 
 For LoRA training, set `extra_training["peft_config"]` to a PEFT
 `LoraConfig`-compatible object. It is validated and rewritten client-side, so it

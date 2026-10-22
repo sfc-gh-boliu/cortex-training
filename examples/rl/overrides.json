@@ -1,5 +1,5 @@
 {
-  "_comment": "Applied to every Math GRPO run on top of the model catalog (command-line args like lr= still win). Restores the RL tuning shared by the pre-restructure configs -- optimizer betas (0.9, 0.95), mb_spec.max_tokens_per_mb packing, and ZeRO reduce_scatter -- which the catalog's SFT-tuned training files do not carry. The \"_comment\" key is ignored and never reaches the job body.",
+  "_comment": "RL tuning for Math GRPO jobs built from the catalog: optimizer betas (0.9, 0.95), mb_spec.max_tokens_per_mb packing, and ZeRO reduce_scatter. Skipped with job_config= and when attaching with job_id=. See examples/README.md, \"How an example builds its job\", for how this file is merged.",
   "sub_job_configs": [
     {
       "job_type": "training",

@@ -1,10 +1,16 @@
 # Run tinker-cookbook on Cortex
 
-This page is the Cortex path for tinker-cookbook and for scripts that use the Tinker client.
+Run tinker-cookbook, or your own script that uses the Tinker client, with
+Cortex Training doing the training and sampling. The Arctic Platform package
+provides the bridge:
 
-A cookbook recipe is `python -m arctic_platform.integrations.tinker.run`, then the module and arguments from the cookbook. `--training-gpus` and `--sampling-gpus` size the Cortex job. Cortex runs training and sampling.
+- A cookbook run is `python -m arctic_platform.integrations.tinker.run`,
+  followed by the cookbook module and its arguments. `--training-gpus` and
+  `--sampling-gpus` size the Cortex job.
+- A script imports `arctic_platform.integrations.tinker` and passes the same GPU
+  counts to `ServiceClient`.
 
-A script imports `arctic_platform.integrations.tinker` and passes those GPU counts to `ServiceClient`. Connection settings are `ARCTIC_CORTEX_*`.
+Both read the connection from `ARCTIC_CORTEX_*` environment variables.
 
 ## Install
 
@@ -23,12 +29,13 @@ Use the account host, database, schema, and programmatic access token from
 export ARCTIC_CORTEX_HOST=ACCOUNT.snowflakecomputing.com
 export ARCTIC_CORTEX_DATABASE=CORTEX_TRAINING_DB
 export ARCTIC_CORTEX_SCHEMA=PUBLIC
-export ARCTIC_CORTEX_PAT=<pat>
+export ARCTIC_CORTEX_PAT='YOUR_PROGRAMMATIC_ACCESS_TOKEN'
 ```
 
 ## Run a cookbook recipe
 
-GSM8K, with the cookbook recipe's published arguments. The model is `Qwen/Qwen3.5-4B`. `--max-response-length` covers `max_tokens`.
+GSM8K on `Qwen/Qwen3.5-4B`, with the cookbook recipe's published arguments.
+`--max-response-length` covers `max_tokens`.
 
 ```bash
 python -m arctic_platform.integrations.tinker.run \
@@ -47,9 +54,11 @@ python -m arctic_platform.integrations.tinker.run \
 
 Other cookbook recipes use the same launcher and their own arguments.
 
-## Correctness
+## Results
 
-Published GSM8K arguments, `Qwen/Qwen3.5-4B`, 4 training GPUs and 4 sampling GPUs. The run finished at step 210. Held-out test correct is logged every 20 steps: 0.544 at step 0 and 0.964 at step 200. KL stays near 0.0002.
+The command above with `--training-gpus 4 --sampling-gpus 4` ran to step 210.
+Held-out test accuracy, logged every 20 steps, rose from 0.544 at step 0 to
+0.964 at step 200, and KL stayed near 0.0002.
 
 | Step | Correct | Reward | Test correct |
 |---|---|---|---|
@@ -74,13 +83,13 @@ Published GSM8K arguments, `Qwen/Qwen3.5-4B`, 4 training GPUs and 4 sampling GPU
 | chat supervised learning, sl-basic, prompt distillation | Supported |
 | on-policy distillation | Supported |
 | code RL, Harbor, search, verifiers | Supported |
-| `rl_loop`, `sl_loop` | Coming soon |
-| DPO, SDFT | Coming soon |
-| off-policy distillation | Coming soon |
-| RLHF pipeline | Coming soon |
-| true thinking score | Coming soon |
-| checkpoint resume | Coming soon |
-| `max_steps_off_policy` | Coming soon |
+| `rl_loop`, `sl_loop` | Not yet supported |
+| DPO, SDFT | Not yet supported |
+| off-policy distillation | Not yet supported |
+| RLHF pipeline | Not yet supported |
+| true thinking score | Not yet supported |
+| checkpoint resume | Not yet supported |
+| `max_steps_off_policy` | Not yet supported |
 | VLM classifier | Not supported |
 | audio | Not supported |
 

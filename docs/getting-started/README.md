@@ -9,6 +9,10 @@ client, and run your first training job.
    and all supported configuration methods (connections.toml, JSON, environment
    variables).
 
+Shorter pages for readers who already have an account:
+[prerequisites](prerequisites.md), [client setup](setup.md), and
+[a quick SFT run](first-sft-run.md).
+
 After completing account setup, use the
 [example index](../../examples/README.md) to explore other training workflows
 or consult the [troubleshooting reference](../reference/troubleshooting.md) if

@@ -21,5 +21,3 @@ To train a model inside an agent you already have, see
 keeps its own loop and sends model calls to a per-rollout endpoint; SkyRL and
 Cortex do the training. [OpenHands](../../../examples/frameworks/openhands.md) is the
 worked example.
-
-Additional code, tool-use, and multi-agent RL examples are planned.

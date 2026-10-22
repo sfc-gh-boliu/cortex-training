@@ -1,3 +1,3 @@
 {
-  "_comment": "Optional. Settings here are merged into every conversational SFT run on top of the model catalog (command-line args like lr=, train_batch_size= and max_seq_len= still win). Empty by default -- add fields such as {\"sub_job_configs\": [{\"job_type\": \"training\", \"training_config\": {}}]} to change a default for all SFT runs. The \"_comment\" key is ignored and never reaches the job body."
+  "_comment": "Job settings for SFT runs (conversational and DARE) built from the catalog. Empty by default. Skipped with job_config= and when attaching with job_id=. See examples/README.md, \"How an example builds its job\", for how this file is merged."
 }

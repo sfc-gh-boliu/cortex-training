@@ -23,6 +23,8 @@ the Cortex Training client.
 
 ## Scope
 
-Every page here documents behavior that exists in this branch. Where a workflow
-is only partially implemented, the page says so inline and names what is
-missing -- there are no placeholder pages for unimplemented features.
+These pages document the client, CLI and examples in this repository, and the
+service behavior they rely on; the service itself is not part of this
+repository. Where a workflow is only partially implemented, the page says so
+inline and names what is missing -- there are no placeholder pages for
+unimplemented features.

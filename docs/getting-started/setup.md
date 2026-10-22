@@ -39,18 +39,17 @@ Set `SNOWFLAKE_DEFAULT_CONNECTION_NAME=training`, configure
 the profile `[default]` to run `cortex-training capacity` without
 `--connection`.
 
-### Legacy JSON configuration
+## JSON connection file
 
-Existing JSON connection files and `cortex-training login` remain supported.
-The same file is what the examples take as `config=`. From a clone, copy the
-template, [`connection.json.template`](connection.json.template), to a location
-outside the repository:
+The examples read the connection from a JSON file, passed as `config=`, rather
+than from `connections.toml`. From a clone, copy the
+[template](connection.json.template) to a location outside the repository:
 
 ```bash
 cp docs/getting-started/connection.json.template ~/cortex-training-config.json
 ```
 
-Otherwise create it by hand, outside the repository:
+Otherwise create it by hand:
 
 ```json
 {
@@ -62,11 +61,11 @@ Otherwise create it by hand, outside the repository:
 ```
 
 Fill in the account host, programmatic access token, database, and schema. The
-template also carries the optional `endpoint`, `poll_interval`, `poll_timeout`,
-and `verify_ssl` settings with their defaults. Keep the file outside the
-repository and do not commit it: it holds a programmatic access token.
+template also lists the optional `endpoint`, `poll_interval`, `poll_timeout`,
+and `verify_ssl` settings with their defaults. Do not commit the file: it holds
+your token.
 
-Validate and store the legacy config path:
+To use the same file for CLI commands, validate it and store its path:
 
 ```bash
 cortex-training login ~/cortex-training-config.json

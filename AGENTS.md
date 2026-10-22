@@ -14,9 +14,9 @@ All tests must pass.
 
 `src/cortex_training/client/` is an HTTP client for the Cortex Training REST
 API (`core.py`, with its authentication, telemetry and config normalizers
-beside it), and `src/cortex_training/cli/` is the `ct` command line. This
-repository is the client only; the service implementation lives elsewhere and
-is not public.
+beside it), and `src/cortex_training/cli/` is the `cortex-training` (`ct`)
+command line. This repository is the client only; the service implementation
+lives elsewhere and is not public.
 
 The reference documents in this repository are the contract to code against:
 

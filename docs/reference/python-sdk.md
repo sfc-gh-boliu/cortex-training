@@ -204,14 +204,11 @@ other than `"strict"` on a sampling sub-job. See
 [rest-api.md section 8.2](rest-api.md#82-trainingconfig) and
 [section 6.1](rest-api.md#61-forwardbackward---post-job_idforward-backward).
 
-The SDK does not size `router_replay.max_cache_bytes`. A job built by Cortex
-Training's examples gets fixed default caps set client-side — 5 GiB on the
-training sub-job and 20 GiB on the sampling sub-job — which you change by setting
-`router_replay.max_cache_bytes` in the sub-job's `extra_training` or
-`extra_sampling`; setting it explicitly is the supported path for any install,
-including `pip`. The repository's RL example also ships an optional capacity
-planner that derives a cap from the model's geometry (it lives in `examples/`,
-not the installed package); see
+The SDK does not size `router_replay.max_cache_bytes`: set it on each sub-job's
+`router_replay` object in `extra_training` or `extra_sampling`. The
+repository's RL example fills in 5 GiB (training) and 20 GiB (sampling) for MoE
+models, and describes an optional planner that sizes a cap from the model's
+geometry; see
 [Router-replay capacity planning](../../examples/rl/README.md#router-replay-capacity-planning).
 
 ## Checkpoints

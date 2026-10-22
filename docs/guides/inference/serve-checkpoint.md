@@ -7,23 +7,20 @@ weights-only checkpoint produced by a training run:
 ```bash
 python -m examples.inference.serve \
   config=/path/to/config.json \
-  job_config=JOB_CONFIG \
+  model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID
 ```
 
+The SFT and RL examples print a generate or evaluate command with these
+arguments filled in after they save. Distillation logs only the checkpoint ID;
+see its [serve command](../../../examples/distillation/README.md#checkpoint-and-evaluation).
+To pick the arguments by hand, see
+[Serve](../../../examples/inference/README.md#serve).
+
 Sampling requires a `weights-only` checkpoint; resumable checkpoints carry
 optimizer state and are not loadable by the sampling runtime. The sampling job is
 independent, so the training job can be cancelled once the checkpoint is saved.
-
-GPU count and vLLM settings come from the model's inference file in the
-[model catalog](../../../model-catalog/README.md). Pick it with `model=` and
-`hardware=` as for the training run, `lora=true` for a LoRA checkpoint so the
-sampler's adapter matches it, and a `context=` the model has an inference file
-in. That need not be the training run's context: some models have standard
-training files but only long inference files. The training examples print a
-generate or evaluate command with these arguments after they save. For the
-equivalent raw client calls, see
+`serve` waits until the endpoint is up and leaves it running; stop it with
+`cortex-training cancel JOB_ID`. For the equivalent raw client calls, see
 [Start sampling from saved weights](../../reference/rest-api.md#134-start-sampling-from-saved-weights).
-
-Readiness checks, scaling and teardown are not yet documented.

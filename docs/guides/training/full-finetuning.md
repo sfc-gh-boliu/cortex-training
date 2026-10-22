@@ -21,5 +21,7 @@ python -m examples.sft.conversational.train \
 ```
 
 Full fine-tuning generally requires more memory than LoRA at the same GPU count;
-see [LoRA and QLoRA](lora-and-qlora.md) for the lighter path. Validated hardware
-ranges and checkpoint evaluation are not yet documented.
+see [LoRA and QLoRA](lora-and-qlora.md) for the lighter path. To serve or
+evaluate the checkpoint, see [Serve a training checkpoint](../inference/serve-checkpoint.md)
+and the [inference example](../../../examples/inference/README.md#evaluate).
+Validated hardware ranges are not yet documented.

@@ -47,16 +47,7 @@ continue to the next step.
 
 Generate a Programmatic Access Token (PAT) and configure your client connection.
 Follow the [authentication guide](authentication.md) to complete this step.
-
-Once done, verify your connection and GPU capacity:
-
-```bash
-cortex-training capacity
-```
-
-You should see your reserved GPU capacity listed. If you see zero capacity or
-an error, confirm with the Snowflake team that enablement and GPU reservation
-are complete.
+You verify the connection after installing the client in the next step.
 
 ## Step 4: Install the Client and Example Dependencies
 
@@ -67,14 +58,28 @@ Clone the repository and install:
 ```bash
 git clone https://github.com/snowflakedb/cortex-training.git
 cd cortex-training
+uv venv
+source .venv/bin/activate
 uv pip install -e .
 ```
 
-Install the example dependency — this is required to run any example:
+Install the example dependency. The training examples and the inference
+`generate` and `evaluate` commands need it for tokenization; `serve` and the
+raw API examples do not:
 
 ```bash
-uv pip install 'tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
+uv pip install 'tinker-cookbook[math-rl] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
 ```
+
+Verify your connection and GPU capacity:
+
+```bash
+cortex-training capacity
+```
+
+You should see your reserved GPU capacity listed. If you see zero capacity or
+an error, confirm with the Snowflake team that enablement and GPU reservation
+are complete.
 
 ## Step 5: Run Your First Training Job
 
@@ -87,8 +92,9 @@ python -m examples.sft.conversational.train \
   max_steps=10
 ```
 
-If you used `connections.toml` with a default connection, the example picks it
-up automatically. If you used a JSON config, pass the path as `config=`.
+`config=` is a JSON connection file. The examples do not read
+`connections.toml`, so if you configured only that, create the file as in
+[JSON connection file](setup.md#json-connection-file).
 
 What happens during this run:
 
@@ -103,14 +109,15 @@ is learning.
 
 ## Step 6: Verify with Inference
 
-The example prints a generate command after saving the checkpoint. Run it to
-confirm the model learned the expected answer:
+The example prints a generate command, with the job and checkpoint IDs filled
+in, after it saves the checkpoint. Run it to confirm the model learned the
+expected answer:
 
 ```bash
 python -m examples.inference.generate \
   config=/path/to/your-config.json \
-  source_job_id=<training_job_id> \
-  checkpoint_id=<checkpoint_id> \
+  source_job_id=TRAINING_JOB_ID \
+  checkpoint_id=CHECKPOINT_ID \
   temperature=0 \
   prompt="Who trained you?"
 ```
@@ -123,8 +130,8 @@ Useful commands while jobs are running or after they complete:
 
 ```bash
 cortex-training list                  # list all your jobs
-cortex-training get <job_id>          # detailed job info
-cortex-training cancel <job_id>       # cancel a job and release GPUs
+cortex-training get JOB_ID            # detailed job info
+cortex-training cancel JOB_ID         # cancel a job and release GPUs
 cortex-training tui                   # terminal UI for browsing jobs and logs
 ```
 

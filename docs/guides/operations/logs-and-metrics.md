@@ -50,7 +50,8 @@ training sub-job's calls returned, per step (`grad_norm`, `last_lr`, …) or per
 `/fwd-bwd` call (`avg_loss`, …) with `v`. Run `cortex-training tui` without a job id
 to browse and search your jobs first. See [Job TUI](../../reference/cli.md#job-tui).
 
-Example-level metrics are also written under each example's `log_path`.
+Example-level metrics are also written under each example's `log_path`; see
+[Experiment tracking](wandb.md) to mirror them elsewhere.
 
 Snowflake profile and PAT clients also emit best-effort client-side operation
 metrics over Snowflake's OTLP endpoint. Failures of essential SDK methods, and

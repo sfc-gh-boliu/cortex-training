@@ -1,192 +1,113 @@
-# Cortex Training model catalog
+# Cortex Training Model Catalog
 
-This directory is the customer-facing source of truth for the models Cortex
-Training supports, the context lengths and hardware each one runs on, and the
-tuned job configuration for each of those combinations.
+The supported models, and a tuned job file for each model, context, GPU type and
+mode. The examples and `python -m examples.utils` build their jobs from these
+files unless you pass your own job file; see
+[How an example builds its job](../examples/README.md#how-an-example-builds-its-job).
 
 ## Layout
 
 ```text
 model-catalog/
-├── models/
-│   └── <slug>/                    # one folder per model
-│       ├── model.json             # model ID, license, architecture, validation dates
-│       ├── standard/              # standard context: max_seq_len up to 32,768
-│       │   └── <hw>-<kind>-<mode>.json
-│       └── long/                  # long context: the same file names
-├── schema.json                    # JSON schema for model.json
-├── validate_catalog.py            # checks every model folder
-└── smoke_test_catalog.py          # dry-runs or submits one catalog file
+├── models/<slug>/                 # one folder per model
+│   ├── model.json                 # model ID, license, architecture, validation dates
+│   ├── standard/<hw>-<kind>-<mode>.json   # max_seq_len up to 32,768
+│   └── long/<hw>-<kind>-<mode>.json       # larger max_seq_len
+├── schema.json                    # schema for model.json
+├── validate_catalog.py
+└── smoke_test_catalog.py
 ```
 
-`<slug>` is the lowercased last segment of the model ID, so
-`Qwen/Qwen3.6-35B-A3B` lives in `models/qwen3.6-35b-a3b/`.
-
-Each job file is a complete create-job body, named `<hw>-<kind>-<mode>.json`:
-
-- `<hw>` is `h200`, `b200` or `b300`. The file sets the job-level `hardware`
-  field to the same value (`"hardware": "H200"` in an `h200-*.json` file). This
-  is the existing REST field, which defaults to H200.
+- `<slug>` is the last part of the model ID, in lowercase:
+  `Qwen/Qwen3.6-35B-A3B` → `qwen3.6-35b-a3b`.
+- `<hw>` is `h200`, `b200` or `b300`, and matches the file's `hardware` field.
+  All files are H200 today.
 - `<kind>` is `training` (one training sub-job) or `inference` (one sampling
   sub-job).
-- `<mode>` is `lora` or `full`. `lora` files carry `peft_config`; `full` files
-  don't.
+- `<mode>` is `lora` (the file has a `peft_config`) or `full`.
 
-The rules:
-
-- If a file exists, that model supports that configuration on that hardware.
-  No other file refers to it by path.
-- There is no RL file. An RL job combines a model's training and inference
-  files of the same context, hardware and mode.
-- A model's long-context files have a larger `max_seq_len` than its standard
-  ones.
-- Today's files are all H200. B200 and B300 files are added as they are
-  benchmarked.
+Each file is a complete create-job body (see the
+[create-job schema](../docs/reference/rest-api.md#8-create-job-schemas)), and its
+existence is the claim of support. The catalog has no RL files: an RL job
+combines a model's training and inference files of the same context, hardware
+and mode.
 
 `model.json` holds:
 
-- `model_id`: the exact model ID that every sub-job's `model_name` uses.
-- `license`: the license name and an `https` URL.
+- `model_id`
+- `license` (a name and URL)
 - `architecture`: `dense` or `moe`. MoE models also record
-  `moe: {num_moe_layers, topk, num_experts}`, so router replay can be planned
-  without downloading the model config. The values are what the router-replay
-  planner reads from the model's public `config.json`: `num_hidden_layers`,
-  `num_experts_per_tok`, and the expert count.
-- `last_validated`: one entry per job file, keyed `<context>/<hw>-<kind>-<mode>`,
-  with the date of its last successful live run or `null`.
-
-`schema.json` describes `model.json`; the job files follow the create-job
-schema in [the REST API reference](../docs/reference/rest-api.md#8-create-job-schemas).
-
-## Using the catalog
-
-`make_config` in `examples/utils.py` reads these files. It picks a model's
-training or inference file, or combines both into an RL job, and then applies
-override files in order: dictionaries merge key by key, `null` removes a key,
-`sub_job_configs` entries are matched by `job_type`, and other lists are
-replaced whole. For an RL job on an MoE model it then fills in router replay
-with the fixed default caps (5 GiB training, 20 GiB sampling), using the `moe`
-geometry of the model the merged job names only to confirm it is an MoE model;
-the capacity planner in `examples/utils.py` stays available to size caps by
-hand. The examples layer
-the catalog file, the example's `overrides.json` and the command-line
-arguments, in that order. To write a job from the catalog to a file, see
-[Create a job config from the command line](../examples/README.md#create-a-job-config-from-the-command-line).
-
-Qwen3.6-35B-A3B LoRA training uses the `prime_rl` model provider so checkpoints
-can be saved and loaded. PrimeRL currently supports LoRA on the attention
-projections (`q_proj`, `k_proj`, `v_proj`, and `o_proj`) for this model. Routed
-expert LoRA is not yet supported, and Hugging Face MLP names such as
-`gate_proj`, `up_proj`, and `down_proj` are no-ops on the PrimeRL model.
-
-## Validation
-
-`validate_catalog.py` checks, for every model folder:
-
-- File names match `{h200,b200,b300}-{training,inference}-{lora,full}.json`,
-  and each file is a valid job definition: it passes the checks
-  `cortex-training submit --dry-run` runs, uses only `hardware` and
-  `sub_job_configs` at the top level, and gives each sub-job the fields the
-  create-job schema requires.
-- The folder slug derives from the model ID in `model.json`, and no two models
-  share a slug or ID.
-- Each sub-job's model name matches `model.json`, the job `hardware` matches
-  the file's prefix, and the mode matches: every `lora` file carries a valid
-  LoRA `peft_config` object (not `null`), and no `full` file has one.
-- MoE models have `moe` geometry in `model.json`.
-- Each sub-job uses 1, 2, 4, or a multiple of 8 GPUs, and tensor-parallel and
-  sequence-parallel sizes divide `n_gpus`.
-- A model's long-context files have a larger `max_seq_len` than its standard
-  ones.
-- `last_validated` has an entry for each of the model's files and no others.
-- `make_config(..., rl=True)` in `examples/utils.py` builds a valid job for
-  each context, hardware and mode that has both a training and an inference
-  file.
+  `moe: {num_moe_layers, topk, num_experts}`.
+- `last_validated`: the date of the last successful live run for each job
+  file, or `null`
 
 ## Updating the catalog
 
-1. Add, change or remove the job files in the model's folder, and add a new
-   model as a new folder with its `model.json`. No code in `examples/` changes.
-2. Set the file's `last_validated` entry to `null` until that exact file
-   completes a live smoke test, then set it to the test date. For a
-   maximum-context inference claim, use `--full-context-prefill`; a short
-   prompt validates startup and basic generation but not the context limit.
-3. Keep [`docs/_data/models.yaml`](../docs/_data/models.yaml) in sync; its
-   header says how each field derives from this tree.
-4. Run:
+1. Add or change job files in the model's folder. For a new model, add a
+   folder with a `model.json`. No example code changes.
+2. In `model.json`, set the file's entry in the `last_validated` map to `null`
+   until a live smoke test (below) passes, then to the test date.
+3. Keep [`docs/_data/models.yaml`](../docs/_data/models.yaml) (its header
+   explains each field) and the table in
+   [model compatibility](../docs/reference/model-compatibility.md) in sync.
+4. Validate:
 
    ```bash
    python model-catalog/validate_catalog.py
    python -m pytest tests/test_model_catalog.py -q
    ```
 
-Snowflake product documentation vendors a pinned snapshot of this directory;
-it does not download mutable data during a documentation build.
+The validator checks:
 
-## Live job validation
+- file names and `hardware`, `model_name` and LoRA mode are consistent with
+  `model.json`;
+- each file passes `cortex-training submit --dry-run`;
+- GPU counts are 1, 2, 4 or multiples of 8, and `sp_size` and
+  `vllm_config.tensor_parallel_size` divide them;
+- long-context files have a larger `max_seq_len` than standard ones;
+- every training and inference pair builds a valid RL job, and the default
+  distillation student and teacher jobs build.
 
-Dry-run the exact request body of a catalog file:
+## Smoke testing
+
+Print the smoke-test plan for a catalog file without submitting it: a JSON
+list with one `{"job", "request"}` entry per `--job`, where `request` is the
+create-job body:
 
 ```bash
-python model-catalog/smoke_test_catalog.py \
-  --model-id Qwen/Qwen3.8-27B \
-  --context long \
-  --job inference-full
+python model-catalog/smoke_test_catalog.py --model-id Qwen/Qwen3.8-27B --context long --job inference-full
 ```
 
-`--context` defaults to `standard` and `--hardware` to `h200`. `--job` names the
-file's `<kind>-<mode>`, or `rl-lora` and `rl-full` for the RL job that
-`make_config(rl=True)` builds from the model's training and inference files.
+`--job` is `<kind>-<mode>` (`training-lora`, `inference-full`, ...), or
+`rl-lora` / `rl-full` for the composed RL job. You can repeat it. `--context`
+defaults to `standard`, and `--hardware` to `h200`.
 
-To execute a live smoke test, set the connection values through environment
-variables and add `--submit`. After the job reaches `running`, inference jobs
-execute and poll a one-token `generate` request and training jobs execute and
-poll a minimal `forward-backward` request, and RL jobs execute both. The job
-is then cancelled. The PAT
-is intentionally not accepted as a command-line argument, which keeps it out of
-shell history and process listings. Use `--debug-image-tag` when a validation
-run must select a specific backend build.
-
-The default inference probe uses a short text prompt and validates engine
-startup plus basic generation. Add `--full-context-prefill` to send exactly
-`max_seq_len - 1` pre-tokenized tokens and generate one token. Only the latter
-validates execution at the configured context limit.
-
-For a training file, use `--full-context-training` to execute
-forward-backward with exactly `max_seq_len` tokens in every sequence in the
-configured global batch. Add `--training-step` to exercise the optimizer, and
-`--checkpoint-round-trip` to step, save a resumable checkpoint, load it back
-into the training sub-job, and delete it. Job startup or the default
-eight-token forward-backward probe does not validate a training context-limit
-claim. Add `--memory-telemetry` to include the server's per-step peak GPU and
-CPU memory measurements in the result.
-
-Use `--training-sp-size` to evaluate a Ulysses sequence-parallel candidate
-before changing a catalog file. The generated request sets `sp_size` and
-adjusts `train_batch_size` to the logical data-parallel size
-`n_gpus / sp_size`; it does not silently change `max_seq_len`.
-For Qwen3.8, the degree must divide its 24 full-attention heads, 16 GDN key
-heads, and 48 GDN value heads. SP8 is the largest valid common degree; SP24 is
-invalid even though it divides the full-attention head count.
+To run a job live, add `--submit`. The job runs a minimal probe once it's
+running, and is cancelled afterwards, even if a probe fails. The probe is one
+generate for inference, one forward-backward for training, and both for RL. The
+PAT is read only from the environment, so it stays out of shell history:
 
 ```bash
 export SNOWFLAKE_HOST='ACCOUNT.snowflakecomputing.com'
 export SNOWFLAKE_DATABASE='CORTEX_TRAINING_DB'
 export SNOWFLAKE_SCHEMA='PUBLIC'
-read -rs SNOWFLAKE_PAT
-export SNOWFLAKE_PAT
+read -rs SNOWFLAKE_PAT; export SNOWFLAKE_PAT
 
-python model-catalog/smoke_test_catalog.py \
-  --model-id Qwen/Qwen3.8-27B \
-  --context long \
-  --job inference-full \
-  --full-context-prefill \
-  --submit
+python model-catalog/smoke_test_catalog.py --model-id Qwen/Qwen3.8-27B \
+  --context long --job inference-full --full-context-prefill --submit
 
 unset SNOWFLAKE_PAT
 ```
 
-Repeat `--job` to validate several files of one model and context serially.
-Supported values are `training-lora`, `training-full`, `inference-lora`,
-`inference-full`, `rl-lora` and `rl-full`. Each submitted job is cancelled after its data-plane probes
-complete, including when a probe or a later job fails.
+The default probes check only startup and basic execution. Validating a
+context-length claim takes the full-context flags:
+
+| Flag | Effect |
+|---|---|
+| `--full-context-prefill` | Inference: prefill `max_seq_len - 1` tokens, then generate one |
+| `--full-context-training` | Training: forward-backward at `max_seq_len` for the full batch |
+| `--training-step` | Also run an optimizer step |
+| `--checkpoint-round-trip` | Step, save a resumable checkpoint, load it back, then delete it |
+| `--memory-telemetry` | Report peak GPU and CPU memory per step |
+| `--training-sp-size N` | Try a sequence-parallel size before changing a file. Adjusts `train_batch_size` to `n_gpus / N` |
+| `--debug-image-tag TAG` | Use a specific backend build |

@@ -78,7 +78,7 @@ require the global `--job JOB_ID` option. Their `--help` usage lines show its
 placement. Management commands such as `get` and `checkpoints` instead take a
 positional `JOB_ID` after the subcommand.
 
-### [Connection](#connection-config)
+### [Connection](#legacy-connection-config)
 
 ```bash
 cortex-training --connection training list    # Use a Snowflake profile
@@ -173,7 +173,7 @@ cortex-training fwd-bwd --help
 
 ## Detailed Reference
 
-- [Connection config](#connection-config), [login](#login), and [environment variables](#environment-variables)
+- [Connection config](#legacy-connection-config), [login](#legacy-login), and [environment variables](#environment-variables)
 - [Submit](#submit-a-job), [manage jobs](#manage-existing-jobs), and [GPU capacity](#show-current-gpu-capacity)
 - [Forward-backward and optimizer steps](#run-a-forward-backward-smoke-test)
 - [Load checkpoints](#load-a-checkpoint-into-a-running-job) and [initialize sampling](#start-sampling-from-a-training-checkpoint)

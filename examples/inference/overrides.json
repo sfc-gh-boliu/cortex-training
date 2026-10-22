@@ -1,3 +1,3 @@
 {
-  "_comment": "Optional. Settings here are merged into every inference run on top of the model catalog (the command-line max_seq_len= still wins). Empty by default -- add fields such as {\"sub_job_configs\": [{\"job_type\": \"sampling\", \"inference_config\": {}}]} to change a default for all inference runs. The \"_comment\" key is ignored and never reaches the job body."
+  "_comment": "Job settings for inference endpoints the examples build from the catalog. Empty by default. Skipped with job_config= and when attaching with job_id=. See examples/README.md, \"How an example builds its job\", for how this file is merged."
 }

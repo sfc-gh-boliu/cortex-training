@@ -1,262 +1,90 @@
 # Inference Endpoint
 
-Create a standalone Cortex Training inference endpoint from open weights or a
-weights-only training checkpoint. Generate or evaluate against that running job.
+Serve open weights or a training checkpoint, then generate from it or evaluate
+it.
 
-## Hardware
+## Serve
 
-Sampling GPUs are `n_gpus` in the model's inference file in the
-[model catalog](../../model-catalog/README.md). Check account capacity before
-creating an endpoint:
-
-```bash
-cortex-training capacity
-```
-
-## Create an Endpoint
-
-`config=` is the Snowflake connection file only. The default job is
-`Qwen/Qwen3-8B` at standard context on H200 with full weights.
-
-From original Hugging Face weights:
+The default is Qwen3-8B full weights at standard context on two H200 GPUs.
+Check capacity first with `cortex-training capacity`.
 
 ```bash
-python -m examples.inference.serve \
-  config=/path/to/config.json
-```
+# Original Hugging Face weights
+python -m examples.inference.serve config=/path/to/config.json
 
-From a weights-only checkpoint produced by a training example. Pass
-`source_job_id` and `checkpoint_id` together, with `model=`, `context=`,
-`hardware=` and `lora=` picking an inference file for the training run's model,
-hardware and mode, so a LoRA checkpoint gets a sampler with the same adapter.
-The context need not be the training run's: some models have standard training
-files but only long inference files. The training examples print a generate or
-evaluate command with these arguments after they save.
+# Any catalog model with an inference file, e.g. GLM-5.3
+python -m examples.inference.serve config=/path/to/config.json model=zai-org/GLM-5.3 context=long
 
-```bash
-python -m examples.inference.serve \
-  config=/path/to/config.json \
+# A checkpoint from a training example
+python -m examples.inference.serve config=/path/to/config.json \
   model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA \
-  source_job_id=TRAINING_JOB_ID \
-  checkpoint_id=CHECKPOINT_ID
+  source_job_id=TRAINING_JOB_ID checkpoint_id=CHECKPOINT_ID
 ```
 
-The command waits until workers are up, prints `job_id` and the generate and
-evaluate commands for that endpoint, and leaves the endpoint running. Those
-commands repeat the serve command's `model=`, `context=`, `hardware=` and
-`lora=` (or its `job_config=`), and its `max_seq_len=` when set, so they pick
-a renderer for the endpoint's model rather than for their default model. Tear
-it down with:
+For a checkpoint, set `model=`, `hardware=` and `lora=` to match the training
+run; `context=` can be any context the model has an inference file in. A LoRA
+checkpoint also needs a sampler with the identical `peft_config`, which the
+catalog LoRA file has only if you kept the catalog adapter. The SFT and RL
+examples check this and print a matching generate or evaluate command after
+they save; the same arguments work with `serve`. When no catalog file matches,
+the printed command has `job_config=INFERENCE_JOB_CONFIG`: replace it with an
+inference job file whose sampling sub-job carries that adapter.
+
+`serve` waits until workers are up. It then prints the `job_id` and ready-made
+generate and evaluate commands, and leaves the endpoint running. Stop it with
+`cortex-training cancel JOB_ID`.
+
+The job is built as described in
+[How an example builds its job](../README.md#how-an-example-builds-its-job).
+The command-line layer is `max_seq_len=` only, and `inference/overrides.json`
+ships empty. `job_config=FILE` uses your own job file.
+
+## Generate
+
+Pass `job_id=` to use a running endpoint, with the same `model=` arguments
+`serve` printed so the prompts are rendered for that model. Without `job_id=`,
+the example creates a one-shot endpoint and releases it when done.
 
 ```bash
-cortex-training cancel JOB_ID
+python -m examples.inference.generate config=/path/to/config.json \
+  job_id=JOB_ID prompt="Who trained you?"
 ```
 
-`inference_walkthrough.ipynb` shows the same create → generate → cancel loop
-with the Python client. It builds its job with
-`make_config(model="Qwen/Qwen3-8B", context="standard", inference=True)` and a
-demo-only override to one GPU and a 2,048-token context. Start Jupyter inside
-the repository: the first cell puts the repository first on `sys.path` so
-`examples` imports from it. It reads the PAT from the connection file you
-created during [setup](../../docs/getting-started/setup.md)
-(`~/cortex-training-config.json`, or the path in `CORTEX_TRAINING_CONFIG`), so
-the notebook runs top to bottom wherever the kernel's working directory is.
+Other options: `prompts_file=`, `out=` (a JSONL file), `max_tokens=` (512),
+`temperature=` (0.6), and `enable_thinking=`.
 
-## Choose the job
+## Evaluate
 
-The example builds its job from the
-[model catalog](../../model-catalog/README.md) in three layers, each
-overriding the one before:
+`task=` picks the benchmark:
 
-1. The model's inference file for `model=` (the exact model ID), `context=`
-   (`standard` or `long`), `hardware=` (`h200`, `b200` or `b300`; default
-   `h200`) and `lora=` (`true` or `false`):
-   `model-catalog/models/<slug>/<context>/<hw>-inference-<lora|full>.json`.
-2. `inference/overrides.json`, applied to every inference run on top of the
-   catalog, in any model. It ships empty (only a `_comment` describing the file);
-   add fields to change a default for all inference runs. A reserved `_comment`
-   key (a free-text note) is stripped before merging and never reaches the job.
-3. The command line: `max_seq_len=`, which defaults to `None` and keeps the
-   value from the layers below.
-
-The source checkpoint, when given, goes on the sampling sub-job, and the job is
-logged before it is submitted. A combination the catalog does not have fails
-with the list of files that exist for that model. `job_config=JOB_CONFIG`
-replaces the first two layers with your own create-job JSON file, used as is.
-Overrides merge by the rules in
-[How an example builds its job](../README.md#how-an-example-builds-its-job),
-and
-[Create a job config from the command line](../README.md#create-a-job-config-from-the-command-line)
-shows how to write the same job to a file.
+| `task=` | Score |
+|---|---|
+| `math500` (default) | MATH-500 accuracy |
+| `gsm8k` | Exact match on the final `####` answer. Use `temperature=0` |
+| `identity` | Percentage of completions that contain `Snowflake AI Research` (prompts from `examples/sft/conversational/data/identity_eval.jsonl`) |
 
 ```bash
-# Qwen3-8B LoRA
-python -m examples.inference.serve \
-  config=/path/to/config.json \
-  lora=true
+# Against a running endpoint
+python -m examples.inference.evaluate config=/path/to/config.json job_id=JOB_ID
 
-# Qwen3.5-9B LoRA / full
-python -m examples.inference.serve \
-  config=/path/to/config.json \
-  model=Qwen/Qwen3.5-9B context=long lora=true
-
-python -m examples.inference.serve \
-  config=/path/to/config.json \
-  model=Qwen/Qwen3.5-9B context=long
-
-# Qwen3.8-27B LoRA / full
-python -m examples.inference.serve \
-  config=/path/to/config.json \
-  model=Qwen/Qwen3.8-27B context=long lora=true
-
-python -m examples.inference.serve \
-  config=/path/to/config.json \
-  model=Qwen/Qwen3.8-27B context=long
-
-# Qwen3.6-35B-A3B LoRA / full
-python -m examples.inference.serve \
-  config=/path/to/config.json \
-  model=Qwen/Qwen3.6-35B-A3B context=long lora=true
-
-python -m examples.inference.serve \
-  config=/path/to/config.json \
-  model=Qwen/Qwen3.6-35B-A3B context=long
-
-# Any catalog model with an inference file, for example GLM-5.3
-python -m examples.inference.serve \
-  config=/path/to/config.json \
-  model=zai-org/GLM-5.3 context=long
-```
-
-## Job config JSON
-
-The example submits one create-job body with a single sampling sub-job. Every
-inference file in the model catalog has this shape, with the job-level
-`hardware` field set to the file's prefix, and so must a file you pass with
-`job_config=JOB_CONFIG`.
-
-```json
-{
-  "hardware": HARDWARE,
-  "sub_job_configs": [
-    {
-      "job_type": "sampling",
-      "model_name": MODEL_NAME,
-      "dtype": DTYPE,
-      "seed": SEED,
-      "inference_config": {
-        "max_seq_len": MAX_SEQ_LEN,
-        "n_gpus": NUM_SAMPLING_GPUS,
-        "vllm_config": {
-          "tensor_parallel_size": TENSOR_PARALLEL_SIZE,
-          "gpu_memory_utilization": GPU_MEMORY_UTILIZATION
-        },
-
-        // Optional LoRA. Omit for full-parameter.
-        "peft_config": {
-          "peft_type": "Lora",
-          "r": LORA_RANK,
-          "lora_alpha": LORA_RANK,
-          "lora_dropout": 0.0,
-          "bias": "none",
-          "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-        }
-      }
-    }
-  ]
-}
-```
-
-The target list above is for dense Qwen models. A Qwen3.6 LoRA checkpoint uses
-the attention-only target list of the catalog's Qwen3.6 LoRA files; the
-sampling and training PEFT configurations must match.
-
-## Examples
-
-Point these at a running `job_id` from `serve`, or omit `job_id` to create a
-one-shot endpoint that exits (and releases GPUs) when the example finishes.
-
-### Generate
-
-```bash
-python -m examples.inference.generate \
-  config=/path/to/config.json \
-  job_id=JOB_ID \
-  prompt="Who trained you?"
-```
-
-From original weights or a checkpoint, without a pre-created endpoint:
-
-```bash
-python -m examples.inference.generate \
-  config=/path/to/config.json \
-  prompt="Who trained you?"
-
-python -m examples.inference.generate \
-  config=/path/to/config.json \
+# Against a checkpoint, one-shot
+python -m examples.inference.evaluate config=/path/to/config.json \
   model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA \
-  source_job_id=TRAINING_JOB_ID \
-  checkpoint_id=CHECKPOINT_ID \
-  prompt="Who trained you?"
+  source_job_id=TRAINING_JOB_ID checkpoint_id=CHECKPOINT_ID \
+  task=gsm8k temperature=0 max_tokens=1024
 ```
 
-### Evaluate (MATH-500)
+To score an existing `generate` output for identity (it needs a `completion`
+field):
 
 ```bash
-python -m examples.inference.evaluate \
-  config=/path/to/config.json \
-  job_id=JOB_ID
-
-python -m examples.inference.evaluate \
-  config=/path/to/config.json
-
-python -m examples.inference.evaluate \
-  config=/path/to/config.json \
-  model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA \
-  source_job_id=TRAINING_JOB_ID \
-  checkpoint_id=CHECKPOINT_ID
+python -m examples.sft.conversational.identity completions_file=/tmp/identity_eval.jsonl
 ```
 
-### Evaluate (GSM8K test)
+## Notebook
 
-Exact-match on the `####` final answer. Use `temperature=0` for a deterministic compare.
-
-```bash
-python -m examples.inference.evaluate \
-  config=/path/to/config.json \
-  task=gsm8k \
-  temperature=0 \
-  max_tokens=1024
-
-python -m examples.inference.evaluate \
-  config=/path/to/config.json \
-  lora=true \
-  source_job_id=TRAINING_JOB_ID \
-  checkpoint_id=CHECKPOINT_ID \
-  task=gsm8k \
-  temperature=0 \
-  max_tokens=1024
-```
-
-### Evaluate (identity)
-
-Score is the percent of completions that contain `Snowflake AI Research`.
-Default prompts are `examples/sft/conversational/data/identity_eval.jsonl`.
-
-```bash
-python -m examples.inference.evaluate \
-  config=/path/to/config.json \
-  lora=true \
-  source_job_id=TRAINING_JOB_ID \
-  checkpoint_id=CHECKPOINT_ID \
-  task=identity \
-  temperature=0 \
-  max_tokens=128
-```
-
-Score an existing `generate` JSONL (needs a `completion` field):
-
-```bash
-python -m examples.sft.conversational.identity \
-  completions_file=/tmp/identity_eval.jsonl
-```
+`inference_walkthrough.ipynb` runs the same create → generate → cancel loop with
+the Python client. It builds its job with
+`make_config(model="Qwen/Qwen3-8B", context="standard", inference=True)`, plus a
+demo override for one GPU and a 2,048-token context. Start Jupyter inside the
+repository.

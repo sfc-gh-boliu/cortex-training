@@ -8,9 +8,9 @@ the model behind it.
 The task is code localization: given a bug report, name the file, class, and
 function to change. The agent searches the repository with the `terminal` tool
 and submits with `localization_finish`. The reward is file F1 + module F1 +
-function F1, so the maximum is 3. Qwen3.5-4B is trained with GRPO. SkyRL
-drives the loop from a CPU machine, and Cortex runs 4 training and 4 sampling
-GPUs.
+function F1, so the maximum is 3. Qwen3.5-4B is trained with RL (a GSPO loss;
+see the settings under [Run](#run)). SkyRL drives the loop from a CPU machine,
+and Cortex runs 4 training and 4 sampling GPUs.
 
 ## How OpenHands plugs in
 
@@ -50,6 +50,19 @@ cd Arctic-Platform
 ```
 
 The run script installs OpenHands itself.
+
+## Configure
+
+The Arctic Platform launcher reads its connection from `ARCTIC_CORTEX_*`
+environment variables. Export them from your connection file:
+
+```bash
+cfg=~/cortex-training-config.json
+export ARCTIC_CORTEX_HOST=$(jq -r .host "$cfg")
+export ARCTIC_CORTEX_DATABASE=$(jq -r .database "$cfg")
+export ARCTIC_CORTEX_SCHEMA=$(jq -r .schema "$cfg")
+export ARCTIC_CORTEX_PAT=$(jq -r .pat "$cfg")
+```
 
 ## Data
 

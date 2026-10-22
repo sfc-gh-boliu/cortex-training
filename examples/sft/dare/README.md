@@ -5,7 +5,8 @@ benchmark's eval split with a local agent loop.
 
 ## DARE-Bench
 
-[DARE-Bench](https://github.com/Snowflake-Labs/dare-bench) (Shu et al., ICLR 2026) tests LLMs as data-science agents. Each task is built from a Kaggle
+[DARE-Bench](https://github.com/Snowflake-Labs/dare-bench) (Shu et al., ICLR
+2026) tests LLMs as data-science agents. Each task is built from a Kaggle
 dataset: the agent reads the task, writes Python that runs in a sandbox through
 a `python_executor` tool, and must leave its predictions in `prediction.csv`.
 The public release, a subset of the paper's 6,300 tasks, has 162 eval tasks,
@@ -31,12 +32,11 @@ Two epochs of full-parameter SFT on the FV traces nearly triple the total score:
 | Model | Total | class-IF | class-MM | reg-IF | reg-MM | time-XF | time-CF | Wrote a prediction |
 |---|---|---|---|---|---|---|---|---|
 | Qwen3-8B, no fine-tuning | 10.13 | 5.88 | 16.77 | 7.14 | 19.13 | 12.24 | 0.00 | 29.3% |
-| Full SFT, shipped config (1,912 FV traces, 120 steps) | **29.34** | 20.59 | 31.10 | 50.00 | 46.54 | 37.26 | 0.00 | 39.8% |
+| Full SFT, default settings (1,912 FV traces, 120 steps) | **29.34** | 20.59 | 31.10 | 50.00 | 46.54 | 37.26 | 0.00 | 39.8% |
 
-The same training run logged the train loss and held-out loss lowering (`valid_nll`):
+Held-out loss (`valid_nll`) over the same run:
 
 ![valid_nll falls from 0.53 to 0.34 over the 120 training steps](dare_valid_nll.png)
-
 
 ## Setup
 
@@ -69,6 +69,12 @@ The evaluator refuses to start if a reference file is missing.
 
 ## Run
 
+Training defaults to full-parameter Qwen3-8B at standard context on four H200
+GPUs, with `lr=1e-5`, `train_batch_size=32`, a cosine schedule, thinking on,
+and 120 steps, logging `valid_nll` every 10 steps (`eval_every=`). It takes the
+same job arguments as the [conversational SFT example](../README.md#options);
+run it with `--help` for the full list. Evaluation serves the model on two GPUs.
+
 ```bash
 # 1. Baseline
 python -m examples.sft.dare.evaluate \
@@ -77,7 +83,7 @@ python -m examples.sft.dare.evaluate \
   sandbox_python=$PWD/dare_sandbox_env/bin/python \
   log_path=/tmp/dare/base
 
-# 2. Train (logs the training job and checkpoint IDs when it finishes)
+# 2. Train (prints the step-3 command, with the job and checkpoint IDs, when it finishes)
 python -m examples.sft.dare.train \
   config=/path/to/config.json
 
@@ -95,18 +101,17 @@ The evaluator writes `predictions.jsonl` (per-episode score, stop reason, tool
 call count, and the full conversation) and `metrics.jsonl` under `log_path`.
 Work directories with each episode's outputs are kept under `log_path/work`.
 
-By default, **evaluation is run locally**: model-written code runs as a local subprocess with a
-stripped environment, not inside a container. Run the evaluator on a
-machine where that is acceptable.
-
-The evaluator runs up to 32 local CPU sandboxes at a time (`sandbox_workers`),
-each limited to 4 BLAS/OpenMP threads. You may lower the number of these by setting `sandbox_workers` explicitly.
+**Model-written code runs on the evaluator's machine** by default, as a local
+subprocess with a stripped environment, not inside a container. Run the
+evaluator where that is acceptable, or use `sandbox_url=` (see
+[Evaluation details](#evaluation-details)). Up to 32 sandboxes run at a time
+(`sandbox_workers=`), each limited to 4 BLAS/OpenMP threads.
 
 ## Data
 
 - **Training traces**: `sft_data/sft_data_fv.json` from
-  [`Snowflake/dare-bench`](https://huggingface.co/datasets/Snowflake/dare-bench)
-  , downloaded on first use: the 2,017 successful traces that pass the FV filter.
+  [`Snowflake/dare-bench`](https://huggingface.co/datasets/Snowflake/dare-bench),
+  downloaded on first use: the 2,017 successful traces that pass the FV filter.
   `variant=av|bv|dv` selects the other filters.
 - **Held-out traces**: the dataset ships no validation split, so training holds
   out every trace of 5% of the task ids (`heldout_fraction`).
@@ -126,15 +131,15 @@ copied into `dare_bench/`, inside a local agent loop:
 
 - The model gets the task prompt and the tool, and may call it up to 5 times.
   Each call goes through DARE-Bench's `python_executor`. It sends the code and
-  the requested input files with a 200-second limit, and copies the requested output files back to the task's
-  work directory.
+  the requested input files with a 200-second limit, and copies the requested
+  output files back to the task's work directory.
 - By default that endpoint is a local server (`sandbox.py`) that runs each call
   as one fresh Python process under `sandbox_python`. Pass `sandbox_url` to use
   a [Sandbox Fusion](https://bytedance.github.io/SandboxFusion/) deployment, as
   the public harness does.
 - Decoding is greedy with thinking on, up to 16,384 new tokens per turn. An
   episode ends when the model answers without a tool call, runs out of turns, or
-  its prompt reaches the endpoint's 32,768-token limit. 
+  its prompt reaches the endpoint's 32,768-token limit.
 - The final `prediction.csv` is scored against the task's reference with
   DARE-Bench's `evaluation.py`.
 

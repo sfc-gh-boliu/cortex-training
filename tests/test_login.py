@@ -7,6 +7,7 @@ import textwrap
 import pytest
 
 from cortex_training import _cli
+from cortex_training import _database_setup
 from cortex_training import _login
 from cortex_training import _picker
 from cortex_training import _profiles
@@ -22,6 +23,10 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     for name in ("SNOWFLAKE_DEFAULT_CONNECTION_NAME", "CORTEX_TRAINING_HOST", "CORTEX_TRAINING_PAT"):
         monkeypatch.delenv(name, raising=False)
+    # The fake client answers the database checks itself, instead of running SQL.
+    monkeypatch.setattr(_database_setup, "missing", lambda client: client.missing())
+    monkeypatch.setattr(_database_setup, "is_listed", lambda client, kind, name: client.is_listed(kind, name))
+    monkeypatch.setattr(_database_setup, "create", lambda client, objects: client.create(objects))
     return snowflake
 
 
@@ -40,22 +45,23 @@ class FakeClient:
     def __init__(self, world, profile, database, schema):
         self.world, self.profile, self.database, self.schema = world, profile, database, schema
         self.closed = False
-        self.auto_create_database = False
 
     def _current_role(self):
         return self.world.role
 
-    def _check_database(self):
+    def missing(self):
         if self.world.check_fails:
             return None
         return [] if self.database in self.world.databases else [("database", self.database)]
 
-    def _is_listed(self, kind, name):
+    def is_listed(self, kind, name):
         return name in self.world.databases
 
-    def _create_database(self, missing):
-        self.world.created.extend(missing)
-        self.world.databases.update(name for _, name in missing)
+    def create(self, objects):
+        if self.world.create_error:
+            raise _database_setup.DatabaseSetupError(self.world.create_error)
+        self.world.created.extend(objects)
+        self.world.databases.update(name for _, name in objects)
 
     def get_capacity(self):
         # Answers like the Cortex Training API: 403/517600 when it isn't enabled on
@@ -89,6 +95,7 @@ class World:
         self.capacity_calls = []
         self.sign_in_error = {}
         self.created = []
+        self.create_error = None
         self.opened = []
 
     def open(self, profile, database, schema):
@@ -181,6 +188,20 @@ def test_a_new_user_can_choose_the_profile_and_database_names(isolated):
     assert "CREATE DATABASE IF NOT EXISTS MY_DB;" in err
     assert world.created == [("database", "MY_DB")]
     assert summary["created_database"] is True
+
+
+def test_a_create_that_fails_explains_why_without_a_traceback(isolated):
+    world = World()
+    world.create_error = "Role TRAINER can't find database MY_DB and can't create it."
+    code, _, err = login(
+        world,
+        ["https://app.snowflake.com/acme/main", "ME", "TRAINER", "tok", "mine", "MY_DB", "y"],
+    )
+    assert code == 1
+    assert "Role TRAINER can't find database MY_DB and can't create it." in err
+    assert "Traceback" not in err
+    assert world.created == []
+    assert config() is None
 
 
 def test_without_a_terminal_login_explains_the_ci_route(isolated):

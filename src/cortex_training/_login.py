@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any
 from typing import TextIO
 
+from cortex_training import _database_setup
 from cortex_training import _environment
 from cortex_training import _picker
 from cortex_training import _profiles
@@ -250,9 +251,7 @@ def open_profile_client(profile: str, database: str, schema: str) -> Any:
     """Sign in with ``profile``; the client never creates a database on its own."""
     from cortex_training.client import CortexTrainingClient
 
-    client = CortexTrainingClient._from_profile(profile, database=database, schema=schema)
-    client.auto_create_database = False
-    return client
+    return CortexTrainingClient._from_profile(profile, database=database, schema=schema)
 
 
 class _Style:
@@ -534,7 +533,7 @@ class _Login:
             self.p.say(f"  {self.s.bad(result.error)}")
             return result
         self.p.say(f"  {self.s.ok('Cortex Training is enabled on this account')}")
-        result.missing = result.client._check_database()
+        result.missing = _database_setup.missing(result.client)
         if result.missing is None:
             self.p.say(f"  {self.s.unknown(f'Could not check database {database}; continuing')}")
         elif result.missing:
@@ -581,7 +580,7 @@ class _Login:
     @staticmethod
     def _visible(check: Check, database: str) -> bool:
         try:
-            return bool(check.client._is_listed("database", database))
+            return _database_setup.is_listed(check.client, "database", database)
         except Exception:
             return False
 
@@ -819,10 +818,7 @@ class _Login:
                 )
             self.p.say()
             return self.settle(self.copy_profile(check.profile))
-        statements = [
-            f"CREATE {kind.upper()} IF NOT EXISTS {name if kind == 'database' else f'{check.database}.{name}'};"
-            for kind, name in check.missing or ()
-        ]
+        statements = [f"{statement};" for statement in _database_setup.create_statements(check.client, check.missing or [])]
         self.p.say("Cortex Training can create it now by running:")
         for statement in statements:
             self.p.say(f"    {self.s.cyan(statement)}")
@@ -830,9 +826,12 @@ class _Login:
             raise LoginCancelled(
                 f"Database {check.database} doesn't exist yet. To create it yourself, run in Snowsight: {statements[0]}"
             )
-        check.client._create_database(check.missing)
+        try:
+            _database_setup.create(check.client, check.missing or [])
+        except _database_setup.DatabaseSetupError as exc:
+            raise LoginCancelled(str(exc)) from exc
         self.created_database = True
-        check.missing = check.client._check_database()
+        check.missing = _database_setup.missing(check.client)
         if check.missing:
             raise LoginCancelled(f"Database {check.database} still isn't visible to {who} after creating it")
         self.p.say(f"  {self.s.ok(f'Created database {check.database}')}")

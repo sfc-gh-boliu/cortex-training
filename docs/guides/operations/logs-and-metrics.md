@@ -55,7 +55,9 @@ Example-level metrics are also written under each example's `log_path`; see
 [Experiment tracking](wandb.md) to mirror them elsewhere.
 
 Snowflake profile and PAT clients also emit best-effort client-side operation
-metrics over Snowflake's OTLP endpoint. Failures of essential SDK methods, and
-the outcome and timing of every download, are emitted automatically; other
-successful outcomes require `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY=1`. See
+metrics over Snowflake's OTLP endpoint. Failures of essential SDK methods, the
+outcome and timing of every download, and the outcome and timing of every call
+the TUI makes are emitted automatically; other successful outcomes require
+`CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY=1`. Each metric says whether the SDK,
+the CLI or the TUI made the call (`client.surface`). See
 [Client metrics](../../reference/python-sdk.md#client-metrics).

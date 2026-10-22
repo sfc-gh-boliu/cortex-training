@@ -36,19 +36,56 @@ _TRAINABLE_LONG = [
     "long/h200-training-full",
     "long/h200-training-lora",
 ]
+# Full-weight training and inference files for both contexts, no LoRA.
+_FULL_STANDARD_LONG = [
+    "standard/h200-inference-full",
+    "standard/h200-training-full",
+    "long/h200-inference-full",
+    "long/h200-training-full",
+]
 EXPECTED_FILES = {
     "Qwen/Qwen3-0.6B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-1.7B": _TRAINABLE_STANDARD,
+    "Qwen/Qwen3-4B-Instruct-2507": _FULL_STANDARD_LONG,
     "Qwen/Qwen3-8B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3.5-4B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
     "Qwen/Qwen3.5-9B": _TRAINABLE_LONG,
     "Qwen/Qwen3.6-35B-A3B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
     "Qwen/Qwen3.8-27B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
+    "Qwen/Qwen3-30B-A3B": [
+        "standard/h200-inference-full",
+        "standard/h200-training-full",
+    ],
+    "Qwen/Qwen3.8-Flash-Next": [
+        "standard/h200-inference-full",
+        "standard/h200-inference-lora",
+        "standard/h200-training-full",
+        "standard/h200-training-lora",
+        "long/h200-inference-full",
+        "long/h200-training-full",
+        "long/h200-training-lora",
+    ],
     "deepseek-ai/DeepSeek-V4-Flash-0731": ["long/h200-inference-full"],
     "openai/gpt-oss-120b": ["long/h200-inference-full"],
+    "google/gemma-3-4b-it": _FULL_STANDARD_LONG,
+    "google/gemma-4-31B-it": _FULL_STANDARD_LONG,
+    "google/medgemma-4b-it": _FULL_STANDARD_LONG,
+    "google/medgemma-1.5-4b-it": _FULL_STANDARD_LONG,
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": _FULL_STANDARD_LONG,
+    "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": _FULL_STANDARD_LONG,
+    "zai-org/GLM-4.5-Air": _FULL_STANDARD_LONG,
     "zai-org/GLM-5.2": ["standard/h200-inference-full"],
     "zai-org/GLM-5.2-FP8": ["long/h200-inference-full"],
     "zai-org/GLM-5.3": ["long/h200-inference-full"],
+    "zai-org/GLM-5.3-Flash": [
+        "standard/h200-inference-full",
+        "standard/h200-inference-lora",
+        "standard/h200-training-lora",
+        "long/h200-inference-full",
+        "long/h200-inference-lora",
+        "long/h200-training-lora",
+    ],
+    "zai-org/GLM-5.3-Flash-BF16": _FULL_STANDARD_LONG,
 }
 
 
@@ -79,11 +116,11 @@ def _config(body: dict) -> dict:
 
 def test_checked_in_catalog_is_valid():
     assert validate_catalog() == {
-        "models": 12,
-        "files": 45,
-        "training": 20,
-        "inference": 25,
-        "rl": 20,
+        "models": 24,
+        "files": 96,
+        "training": 45,
+        "inference": 51,
+        "rl": 44,
         "distillation": 1,
     }
 
@@ -105,13 +142,26 @@ def test_catalog_models_include_license_links():
         "Qwen/Qwen3.5-9B": "Apache 2.0",
         "Qwen/Qwen3.6-35B-A3B": "Apache 2.0",
         "Qwen/Qwen3.8-27B": "Apache 2.0",
+        "Qwen/Qwen3-30B-A3B": "Apache 2.0",
+        "Qwen/Qwen3-4B-Instruct-2507": "Apache 2.0",
+        "Qwen/Qwen3.8-Flash-Next": "Apache 2.0",
         "deepseek-ai/DeepSeek-V4-Flash-0731": "MIT",
         "openai/gpt-oss-120b": "Apache 2.0",
+        "google/gemma-3-4b-it": "Gemma",
+        "google/gemma-4-31B-it": "Gemma",
+        "google/medgemma-4b-it": "Health AI Developer Foundations",
+        "google/medgemma-1.5-4b-it": "Health AI Developer Foundations",
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": "NVIDIA Nemotron Open Model License",
+        "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": "OpenMDW-1.1",
+        "zai-org/GLM-4.5-Air": "MIT",
         "zai-org/GLM-5.2": "MIT",
         "zai-org/GLM-5.2-FP8": "MIT",
         "zai-org/GLM-5.3": "GLM-5.3 License",
+        "zai-org/GLM-5.3-Flash": "MIT",
+        "zai-org/GLM-5.3-Flash-BF16": "MIT",
     }
-    assert all(license["url"].startswith("https://huggingface.co/") for license in licenses.values())
+    # schema.json requires each license.url to match ^https:// (host is not constrained).
+    assert all(license["url"].startswith("https://") for license in licenses.values())
 
 
 def test_moe_models_record_router_replay_geometry():
@@ -121,12 +171,19 @@ def test_moe_models_record_router_replay_geometry():
     }
 
     assert {model_id: moe for model_id, (architecture, moe) in geometry.items() if architecture == "moe"} == {
+        "Qwen/Qwen3-30B-A3B": {"num_moe_layers": 48, "topk": 8, "num_experts": 128},
         "Qwen/Qwen3.6-35B-A3B": {"num_moe_layers": 40, "topk": 8, "num_experts": 256},
+        "Qwen/Qwen3.8-Flash-Next": {"num_moe_layers": 48, "topk": 10, "num_experts": 512},
         "deepseek-ai/DeepSeek-V4-Flash-0731": {"num_moe_layers": 43, "topk": 6, "num_experts": 256},
         "openai/gpt-oss-120b": {"num_moe_layers": 36, "topk": 4, "num_experts": 128},
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": {"num_moe_layers": 23, "topk": 6, "num_experts": 128},
+        "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": {"num_moe_layers": 23, "topk": 6, "num_experts": 128},
+        "zai-org/GLM-4.5-Air": {"num_moe_layers": 45, "topk": 8, "num_experts": 128},
         "zai-org/GLM-5.2": {"num_moe_layers": 78, "topk": 8, "num_experts": 256},
         "zai-org/GLM-5.2-FP8": {"num_moe_layers": 78, "topk": 8, "num_experts": 256},
         "zai-org/GLM-5.3": {"num_moe_layers": 78, "topk": 8, "num_experts": 256},
+        "zai-org/GLM-5.3-Flash": {"num_moe_layers": 42, "topk": 8, "num_experts": 288},
+        "zai-org/GLM-5.3-Flash-BF16": {"num_moe_layers": 42, "topk": 8, "num_experts": 288},
     }
     assert all(moe is None for architecture, moe in geometry.values() if architecture == "dense")
 
@@ -184,8 +241,60 @@ def test_files_keep_their_source_sequence_lengths():
         ("zai-org/GLM-5.2", "standard", "inference"): 32768,
         ("zai-org/GLM-5.2-FP8", "long", "inference"): 1048576,
         ("zai-org/GLM-5.3", "long", "inference"): 720896,
+        ("Qwen/Qwen3-30B-A3B", "standard", "inference"): 40960,
+        ("Qwen/Qwen3-30B-A3B", "standard", "training"): 40960,
+        ("Qwen/Qwen3-4B-Instruct-2507", "standard", "inference"): 65536,
+        ("Qwen/Qwen3-4B-Instruct-2507", "standard", "training"): 65536,
+        ("Qwen/Qwen3-4B-Instruct-2507", "long", "inference"): 262144,
+        ("Qwen/Qwen3-4B-Instruct-2507", "long", "training"): 262144,
+        ("Qwen/Qwen3.8-Flash-Next", "standard", "inference"): 65536,
+        ("Qwen/Qwen3.8-Flash-Next", "standard", "training"): 65536,
+        ("Qwen/Qwen3.8-Flash-Next", "long", "inference"): 262144,
+        ("Qwen/Qwen3.8-Flash-Next", "long", "training"): 262144,
+        ("google/gemma-3-4b-it", "standard", "inference"): 65536,
+        ("google/gemma-3-4b-it", "standard", "training"): 65536,
+        ("google/gemma-3-4b-it", "long", "inference"): 131072,
+        ("google/gemma-3-4b-it", "long", "training"): 131072,
+        ("google/gemma-4-31B-it", "standard", "inference"): 65536,
+        ("google/gemma-4-31B-it", "standard", "training"): 65536,
+        ("google/gemma-4-31B-it", "long", "inference"): 262144,
+        ("google/gemma-4-31B-it", "long", "training"): 262144,
+        ("google/medgemma-4b-it", "standard", "inference"): 65536,
+        ("google/medgemma-4b-it", "standard", "training"): 65536,
+        ("google/medgemma-4b-it", "long", "inference"): 131072,
+        ("google/medgemma-4b-it", "long", "training"): 131072,
+        ("google/medgemma-1.5-4b-it", "standard", "inference"): 65536,
+        ("google/medgemma-1.5-4b-it", "standard", "training"): 65536,
+        ("google/medgemma-1.5-4b-it", "long", "inference"): 131072,
+        ("google/medgemma-1.5-4b-it", "long", "training"): 131072,
+        ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "standard", "inference"): 65536,
+        ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "standard", "training"): 65536,
+        ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "long", "inference"): 262144,
+        ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "long", "training"): 262144,
+        ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "standard", "inference"): 65536,
+        ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "standard", "training"): 65536,
+        ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "long", "inference"): 262144,
+        ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "long", "training"): 262144,
+        ("zai-org/GLM-4.5-Air", "standard", "inference"): 65536,
+        ("zai-org/GLM-4.5-Air", "standard", "training"): 65536,
+        ("zai-org/GLM-4.5-Air", "long", "inference"): 131072,
+        ("zai-org/GLM-4.5-Air", "long", "training"): 131072,
+        ("zai-org/GLM-5.3-Flash", "standard", "inference"): 65536,
+        ("zai-org/GLM-5.3-Flash", "standard", "training"): 65536,
+        ("zai-org/GLM-5.3-Flash", "long", "inference"): 262144,
+        ("zai-org/GLM-5.3-Flash", "long", "training"): 262144,
+        ("zai-org/GLM-5.3-Flash-BF16", "standard", "inference"): 65536,
+        ("zai-org/GLM-5.3-Flash-BF16", "standard", "training"): 65536,
+        ("zai-org/GLM-5.3-Flash-BF16", "long", "inference"): 262144,
+        ("zai-org/GLM-5.3-Flash-BF16", "long", "training"): 262144,
     }
-    assert all(length <= 32768 for (_, context, _), length in lengths.items() if context == "standard")
+    # Standard is the model's smaller tier: where a model has both, standard < long.
+    # (The original models cap standard at 32,768; the #107 families use larger
+    # standard windows, so the tier ordering, not a fixed cap, is the invariant.)
+    for (model_id, context, kind), length in lengths.items():
+        if context == "standard":
+            long_length = lengths.get((model_id, "long", kind))
+            assert long_length is None or length < long_length, model_id
     assert all(length > 32768 for (_, context, _), length in lengths.items() if context == "long")
 
 
@@ -428,7 +537,7 @@ def _invalid(catalog_dir: Path, match: str) -> str:
 
 
 def test_copied_catalog_is_valid(catalog):
-    assert validate_catalog(catalog)["models"] == 12
+    assert validate_catalog(catalog)["models"] == 24
 
 
 def test_distillation_jobs_build_with_make_distillation_config(catalog):

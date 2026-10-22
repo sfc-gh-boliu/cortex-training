@@ -25,6 +25,10 @@ from cortex_training.client.core import DEBUG_OPTIONS_ENV
 from cortex_training.client.core import DISABLE_TELEMETRY_ENV
 from cortex_training.client.core import DISABLE_TENSOR_PROMPTS_ENV
 from cortex_training.client.core import ENABLE_SUCCESS_TELEMETRY_ENV
+from cortex_training.client.core import CLI_SURFACE
+from cortex_training.client.core import SDK_SURFACE
+from cortex_training.client.core import SURFACE_ATTRIBUTE
+from cortex_training.client.core import TUI_SURFACE
 from cortex_training.client.core import AccountJobListUnavailable
 from cortex_training.client.core import ChunkGroupConflictError
 from cortex_training.client.core import ChunkGroupError
@@ -47,6 +51,10 @@ __all__ = [
     "DISABLE_TELEMETRY_ENV",
     "DISABLE_TENSOR_PROMPTS_ENV",
     "ENABLE_SUCCESS_TELEMETRY_ENV",
+    "CLI_SURFACE",
+    "SDK_SURFACE",
+    "SURFACE_ATTRIBUTE",
+    "TUI_SURFACE",
     "AccountJobListUnavailable",
     "ChunkGroupConflictError",
     "ChunkGroupError",

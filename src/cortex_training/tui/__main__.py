@@ -21,6 +21,7 @@ import argparse
 import math
 import os
 import re
+import threading
 from pathlib import Path
 
 _CONNECT_HINT = ("to connect, run 'cortex-training login config.json', set CORTEX_TRAINING_CONFIG, pass "
@@ -29,6 +30,9 @@ _CONNECT_HINT = ("to connect, run 'cortex-training login config.json', set CORTE
 # Bounds for every TUI read.
 READ_MAX_RETRIES = 2
 READ_TIMEOUT = (10.0, 45.0)
+# How long quitting waits to close the Snowflake sessions the TUI kept for its downloads;
+# one it couldn't close by then expires by itself.
+SESSION_CLOSE_SECONDS = 1.0
 # The oldest Textual the TUI is tested on (pyproject.toml requires it, below 9).
 TEXTUAL_FLOOR = (8, 2, 8)
 _TEXTUAL_REQUIREMENT = "textual>=8.2.8,<9"
@@ -204,13 +208,36 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     from cortex_training.client import TUI_SURFACE
 
     client._telemetry_surface = TUI_SURFACE
+    # A tab's download, and each refresh of it, starts without a login (see _close_sessions).
+    if hasattr(type(client), "keep_artifact_sessions"):
+        client.keep_artifact_sessions = True
 
     # job_id is optional: given, open that job's details; omitted, open the job
     # list so the user can choose one.
     app = CortexTrainingLogTUI(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=log_poll_interval)
     app.sign_in = _sign_in(cli, args, from_config)  # for the commands the TUI shows to copy
-    app.run()
+    try:
+        app.run()
+    finally:
+        _close_sessions(client)
     return app.return_code or 0  # non-zero when the app stopped on an unhandled error
+
+
+def _close_sessions(client) -> None:
+    """Close the download sessions the client kept, waiting at most SESSION_CLOSE_SECONDS:
+    each close is a request, and quitting must not wait on an unreachable service."""
+    if not hasattr(type(client), "keep_artifact_sessions") or not client.keep_artifact_sessions:
+        return
+
+    def close() -> None:
+        try:
+            client.keep_artifact_sessions = False
+        except Exception:  # noqa: BLE001 - a session it can't close expires by itself
+            pass
+
+    closer = threading.Thread(target=close, name="cortex-tui-session-close", daemon=True)
+    closer.start()
+    closer.join(SESSION_CLOSE_SECONDS)
 
 
 def _sign_in(cli, args, from_config: dict) -> dict:

@@ -352,6 +352,34 @@ def test_a_new_profile_that_cannot_sign_in_is_kept_if_the_user_says_no(isolated)
     assert config() is None
 
 
+def test_a_sign_in_error_is_shown_in_full(isolated):
+    # Snowflake's reason, and the next steps after it, come after the first 160 characters.
+    reason = (
+        "could not open Snowflake connection 'fresh': 394400 (08001): Failed to connect to DB: "
+        "acme-new.snowflakecomputing.com:443. Programmatic access token is invalid.\n"
+        "\n"
+        "Snowflake rejected your programmatic access token (PAT). The most common causes:"
+    )
+    world = World(databases={"CORTEX_TRAINING_DB"})
+    world.sign_in_error["fresh"] = reason
+    code, _, err = login(world, [*NEW_PROFILE, "", ""], name="fresh")
+    assert code == 1
+    assert "Profile fresh couldn't sign in:" in err
+    assert "Programmatic access token is invalid." in err
+    assert "Snowflake rejected your programmatic access token (PAT). The most common causes:" in err
+
+
+def test_a_profile_that_just_failed_is_not_used_to_check_its_account(isolated):
+    world = World(databases={"CORTEX_TRAINING_DB"})
+    world.sign_in_error["cortex-training"] = "Programmatic access token is invalid."
+    # No profiles -> create one -> check [Y] -> it fails -> keep it (n) -> back to the list.
+    code, _, err = login(world, ["acme-new.snowflakecomputing.com", "ME", "", "tok", "", "", "", "n"])
+    assert code != 0
+    assert "Profile cortex-training can't be used." in err
+    assert "Which of your accounts have Cortex Training?" not in err
+    assert [client.profile for client in world.opened] == []
+
+
 def test_a_new_profile_on_an_account_without_cortex_training_can_be_deleted(isolated):
     world = World(databases={"CORTEX_TRAINING_DB"})
     world.not_enabled.add("fresh")

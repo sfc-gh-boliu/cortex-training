@@ -532,8 +532,13 @@ class _Login:
         try:
             result.client = self.open_client(profile, database, schema)
         except Exception as exc:
+            # The profile list shows this short form; the screen shows the whole
+            # error, whose reason and next steps come after the first 160 characters.
             result.error = f"Profile {profile} couldn't sign in: {_first_line(exc)}"
-            self.p.say(f"  {self.s.bad(result.error)}")
+            heading = f"Profile {profile} couldn't sign in:"
+            self.p.say(f"  {self.s.bad(heading)}")
+            for line in str(exc).strip().splitlines():
+                self.p.say(f"    {line}" if line.strip() else "")
             return result
         self.clients.append(result.client)
         result.role = result.client._current_role()
@@ -719,7 +724,8 @@ class _Login:
             return self.create_from_scratch()
         names = sorted(profiles)
         hints = {name: describe_profile(profiles[name]) for name in names}
-        self.check_accounts(names, hints)
+        # A profile that just failed would only fail again, so it isn't used to check its account.
+        self.check_accounts([name for name in names if name not in failed], hints)
 
         def enabled(name: str) -> bool:
             return (self.account_status or {}).get(self._account(name), ("",))[0] == CT_ENABLED

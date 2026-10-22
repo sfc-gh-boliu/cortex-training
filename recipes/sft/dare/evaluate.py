@@ -72,7 +72,7 @@ class Config:
     config: str
     bench_dir: str
     job_id: str | None = None
-    job_config: str = "configs/qwen3_8b_full.json"
+    job_config: str = "model-catalog/models/qwen3-8b/standard/h200-inference-full.json"
     source_job_id: str | None = None
     checkpoint_id: str | None = None
     keep_job: bool | None = None

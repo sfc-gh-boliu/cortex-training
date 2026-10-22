@@ -3490,9 +3490,9 @@ def test_the_screenshot_script_tags_its_real_client_as_the_tui(monkeypatch):
     # With --connection it drives the TUI against an account: its calls are the TUI's.
     import importlib.util
 
-    import cortex_training._cli as cli
+    import cortex_training.cli.commands as cli
 
-    path = Path(__file__).resolve().parents[1] / "scripts" / "tui_screenshot.py"
+    path = Path(__file__).resolve().parents[1] / "tools" / "tui_screenshot.py"
     spec = importlib.util.spec_from_file_location("tui_screenshot", path)
     tui_screenshot = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(tui_screenshot)

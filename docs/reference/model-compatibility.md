@@ -34,7 +34,10 @@ for a specific workload.
 | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
 | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16` | MoE | standard, long | standard, long | 262,144 |
 
-Standard context is a `max_seq_len` of up to 32,768 tokens. Most models with
+A model's `standard` and `long` files are its smaller and larger `max_seq_len`
+tiers; the boundary is per model, not a fixed cutoff, so one model's standard
+window can exceed another's (the `Long-context max_seq_len` column shows each
+model's larger tier). Most models with
 training files have both LoRA and full files for training and inference, and the
 inference-only models have full-weight files; some newer families ship only a
 subset (full-weight only, or LoRA only), so the model's folder in the catalog is

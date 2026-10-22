@@ -1683,7 +1683,7 @@ def main(
             cortex_training_client_cls = _load_cortex_training_client_class()
 
             def default_client_factory(parsed_args: argparse.Namespace) -> Any:
-                from .client import CLI_SURFACE
+                from cortex_training.client import CLI_SURFACE
 
                 client = build_client(parsed_args, cortex_training_client_cls)
                 # Its metrics say a command made the call (client.surface).

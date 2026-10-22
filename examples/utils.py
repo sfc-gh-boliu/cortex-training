@@ -1359,8 +1359,8 @@ CATALOG_FILE_PATTERN = re.compile(r"^(h200|b200|b300)-(training|inference)-(lora
 # The sub-job each catalog file kind holds, and its config block.
 CATALOG_JOB_TYPES = {"training": "training", "inference": "sampling"}
 CATALOG_CONFIG_KEYS = {"training": "training_config", "inference": "inference_config"}
-# Files with a max_seq_len up to this go under standard/, longer ones under long/.
-STANDARD_CONTEXT_MAX_SEQ_LEN = 32768
+# standard/ and long/ are a model's smaller and larger tiers, not a fixed cutoff:
+# each model sets its own windows, so the boundary is per model (standard < long).
 
 
 def model_slug(model_id: str) -> str:
@@ -2209,6 +2209,33 @@ def same_adapter(first: Any, second: Any) -> bool:
     return first == second
 
 
+def _inference_context_order(folder: Path, hardware: str, lora: bool, wanted: int) -> tuple[str, ...]:
+    """The model's inference contexts, best-fit for a ``wanted``-token checkpoint first.
+
+    The standard/long split is per model, not a fixed sequence length: a model's
+    ``standard`` window is simply its smaller tier. Order the model's inference
+    files for this hardware and mode by their own ``max_seq_len``, preferring the
+    smallest whose window still covers ``wanted``, then the rest largest-first as a
+    best-effort fallback when none covers it. Contexts with no such inference file
+    are dropped, so a model with one inference tier yields just that one; a model
+    with none falls back to the plain context order for the caller's warning path.
+    """
+    sized: list[tuple[int, str]] = []
+    for ctx in CATALOG_CONTEXTS:
+        path = folder / ctx / catalog_file_name(hardware, "inference", lora)
+        if not path.is_file():
+            continue
+        try:
+            config = _sub_job_config(load_job_body(str(path)), "sampling", "inference_config")
+            max_seq_len = config.get("max_seq_len") or 0
+        except (ValueError, FileNotFoundError):
+            max_seq_len = 0
+        sized.append((max_seq_len, ctx))
+    covering = sorted((item for item in sized if item[0] >= wanted), key=lambda item: item[0])
+    shorter = sorted((item for item in sized if item[0] < wanted), key=lambda item: item[0], reverse=True)
+    return tuple(ctx for _, ctx in (*covering, *shorter)) or CATALOG_CONTEXTS
+
+
 def inference_job_args(
     body: Mapping[str, Any],
     *,
@@ -2221,9 +2248,12 @@ def inference_job_args(
     inference job for that sub-job's model and mode on the job's hardware, and
     for LoRA the same adapter (``peft_config``). Returns ``model=``,
     ``context=``, ``hardware=`` and ``lora=`` for the catalog inference file
-    that fits: in ``context`` when there is one there (by default the context
-    the training ``max_seq_len`` falls in), otherwise in the other context.
-    Some models have standard training files but only long inference files.
+    that fits. The standard/long tiers are per model: by default it picks the
+    smallest of the model's own inference tiers whose ``max_seq_len`` still covers
+    the training ``max_seq_len``, so a model whose standard window is larger than
+    another's is still served by its standard file, not pushed to long. An
+    explicit ``context`` is tried first, the other after. Some models have
+    standard training files but only long inference files.
 
     When no catalog file fits, it logs what the job needs and returns
     ``job_config=INFERENCE_JOB_CONFIG``, to be replaced with such a job's file.
@@ -2234,14 +2264,18 @@ def inference_job_args(
     hardware = str(body.get("hardware") or "H200").lower()
     adapter = config.get("peft_config")
     lora = adapter is not None
-    if context is None:
-        context = "standard" if (config.get("max_seq_len") or 0) <= STANDARD_CONTEXT_MAX_SEQ_LEN else "long"
     try:
         folder = load_catalog_model(model, catalog_dir)[0] if isinstance(model, str) else None
     except FileNotFoundError:
         folder = None
+    if context is not None:
+        candidates: tuple[str, ...] = (context, *(name for name in CATALOG_CONTEXTS if name != context))
+    elif folder is not None:
+        candidates = _inference_context_order(folder, hardware, lora, config.get("max_seq_len") or 0)
+    else:
+        candidates = CATALOG_CONTEXTS
     if folder is not None:
-        for candidate in (context, *(name for name in CATALOG_CONTEXTS if name != context)):
+        for candidate in candidates:
             path = folder / candidate / catalog_file_name(hardware, "inference", lora)
             if not path.is_file():
                 continue

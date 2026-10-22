@@ -8690,7 +8690,7 @@ class TestTailOnEndedJobs:
 
     def test_a_tail_whose_retry_cannot_get_a_token_has_the_job_status_too(self):
         # Not every later attempt fails off the wire: one that gets no token fails the call too.
-        from cortex_training.snowflake_auth import SnowflakeProfileError
+        from cortex_training.client.auth import SnowflakeProfileError
 
         c = _make_client()
         c.max_retries = 2  # as the TUI reads

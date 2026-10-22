@@ -57,7 +57,7 @@ inference examples pick their job with these arguments (distillation uses
 | Argument | Values | Default |
 |---|---|---|
 | `model=` | Exact model ID, e.g. `Qwen/Qwen3.6-35B-A3B` | `Qwen/Qwen3-8B` |
-| `context=` | `standard` (up to 32K) or `long` | `standard` |
+| `context=` | `standard` (the model's smaller window) or `long` | `standard` |
 | `hardware=` | `h200`, `b200`, `b300` | `h200` |
 | `lora=` | `true` or `false` | per example |
 | `job_config=` | Your own job file, used instead of the catalog | none |

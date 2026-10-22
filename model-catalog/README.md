@@ -11,8 +11,8 @@ files unless you pass your own job file; see
 model-catalog/
 ├── models/<slug>/                 # one folder per model
 │   ├── model.json                 # model ID, license, architecture, validation dates
-│   ├── standard/<hw>-<kind>-<mode>.json   # max_seq_len up to 32,768
-│   └── long/<hw>-<kind>-<mode>.json       # larger max_seq_len
+│   ├── standard/<hw>-<kind>-<mode>.json   # the model's smaller max_seq_len tier
+│   └── long/<hw>-<kind>-<mode>.json       # the model's larger max_seq_len tier
 ├── schema.json                    # schema for model.json
 ├── validate_catalog.py
 └── smoke_test_catalog.py

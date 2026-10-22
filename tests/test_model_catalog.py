@@ -295,7 +295,34 @@ def test_files_keep_their_source_sequence_lengths():
         if context == "standard":
             long_length = lengths.get((model_id, "long", kind))
             assert long_length is None or length < long_length, model_id
-    assert all(length > 32768 for (_, context, _), length in lengths.items() if context == "long")
+
+
+def test_inference_job_args_picks_the_models_own_standard_tier():
+    # Tiers are per model, not a fixed 32,768 cutoff. Qwen3-4B-Instruct's standard
+    # inference window is 65,536, so a 65,536 checkpoint must resolve to that model's
+    # standard inference file, not its 262,144-token long one.
+    from examples.utils import inference_job_args
+
+    body = {
+        "hardware": "H200",
+        "sub_job_configs": [
+            {
+                "job_type": "training",
+                "model_name": "Qwen/Qwen3-4B-Instruct-2507",
+                "training_config": {"max_seq_len": 65536},
+            }
+        ],
+    }
+    args = inference_job_args(body, catalog_dir=CATALOG_DIR)
+    assert args == {
+        "model": "Qwen/Qwen3-4B-Instruct-2507",
+        "context": "standard",
+        "hardware": "h200",
+        "lora": False,
+    }
+    # A larger checkpoint than the standard tier covers still resolves to long.
+    body["sub_job_configs"][0]["training_config"]["max_seq_len"] = 262144
+    assert inference_job_args(body, catalog_dir=CATALOG_DIR)["context"] == "long"
 
 
 def test_every_file_names_its_hardware():

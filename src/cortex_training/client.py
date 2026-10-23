@@ -1826,8 +1826,8 @@ def _validate_artifact_relative_path(path: str) -> str:
 
 def _deprecated_constructor(name: str) -> str:
     return (
-        f"CortexTrainingClient.{name}() is deprecated and will be removed in a future "
-        "release. Use CortexTrainingClient.from_configs(), which reads your Snowflake "
+        f"CortexTrainingClient.{name}() is deprecated and will be removed in cortex-training "
+        "0.2.0. Use CortexTrainingClient.from_configs(), which reads your Snowflake "
         "connection profile; see docs/reference/python-sdk.md."
     )
 

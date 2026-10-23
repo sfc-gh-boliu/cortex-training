@@ -100,10 +100,10 @@ not earn credit:
   token cap.
 
 The fraction of disqualified rollouts is logged as
-`grading_policy/disqualified`. The policy requires a verifiers build that
-implements it (it is off by default upstream); the Arctic Platform prime-rl
-integration pins the build it is validated against. Remove the `grading_policy`
-and `max_turns` lines to run plain SWE.
+`grading_policy/disqualified`. The policy is applied over the unmodified public
+`verifiers` by a startup patch shipped in the Arctic Platform prime-rl
+integration (no fork, and nothing to pass at launch); it is off unless a recipe
+opts in. Remove the `grading_policy` and `max_turns` lines to run plain SWE.
 
 ## Results
 

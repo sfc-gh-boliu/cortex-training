@@ -2724,7 +2724,8 @@ Return:
 memory. An execution log can be hundreds of megabytes, so prefer
 `download_execution_logs()` for anything but small jobs. It:
 
-1. Calls `GET /{job_id}/experiment-run`.
+1. Calls `GET /{job_id}/experiment-run`, once per job for the client (see
+   [section 12.7](#127-download-sessions)).
 2. For profile clients, opens an independent connection from the same
    Snowflake profile.
 3. For direct PAT clients, resolves the current user and role through the SQL
@@ -2769,7 +2770,8 @@ without `sub_job_ids` there is no preview.
 Each chunk is one experiment artifact `GET` into a private temporary directory.
 Up to `max_workers` (default 16) run at once on one Connector session, each on
 its own cursor; fetches may finish in any order, but chunks are appended
-strictly in sorted name order. At most four fetched chunks per worker wait to
+strictly in sorted name order. The session, and the two listings that come
+first, are described in [section 12.7](#127-download-sessions). At most four fetched chunks per worker wait to
 be appended, which bounds temporary disk use. `LIST` and `GET` are retried with
 bounded exponential backoff on transient Connector, network, and service
 errors; a session or token expiry reopens the session. Each `LIST` or `GET`
@@ -2903,8 +2905,9 @@ and is removed once `on_preview` returns. The chunks are not fetched again, so
 the download makes no more requests than without a preview; there is none when
 they are most of what the sub-job has new, or when none of them can be read.
 Metrics chunks are uploaded about once a minute per sub-job, so a cold download
-of a long job is mostly per-chunk round trips: this is how the TUI draws a job's
-newest half hour before the rest of its history arrives.
+of a long job is mostly per-chunk round trips: this is how the TUI draws the
+window on screen (the newest 10 minutes, where every job opens, and at most the
+newest half hour) before the rest of its history arrives.
 
 The reconstructed file contains the JSONL records emitted by the deployed
 training runtime. Version 2 GPU rows have no `kind` field and include:
@@ -3017,6 +3020,58 @@ metrics tab reads `training.jsonl` and shows it per step and per call.
 The client contains `tail_events()` and `stream_events()`, but the server does
 not accept their operation type. See
 [section 7.9](#79-unsupported-zone-events-client-helper).
+
+### 12.7 Download sessions
+
+Each artifact read in sections 12.2 to 12.5 resolves the job's experiment run
+(`GET /{job_id}/experiment-run`) and then lists and fetches on a Connector
+session. A client, and every client `for_job()` makes from it, resolves each
+job's experiment run once and reuses it, since a job's run never changes: they
+share what they read, and remember the newest 256 jobs' runs. A failed read is
+not kept, so the next call tries again. A chunked download (stdout, GPU
+metrics, training metrics) lists its two roots, `_{name}/` and
+`checkpoints/_{name}/`, at the same time, each on its own cursor. If the first
+listing fails, the download waits up to 10 seconds for the second, which runs
+on the same session, before it closes that session; one still running then
+finishes on a session that is closed, never kept.
+
+A PAT client opens its sessions with `platform_detection_timeout_seconds=0`
+(Connector 3.17.2 and later), which skips the Connector's cloud-metadata
+probes at login. The probes only report the platform the client runs on, and
+off a cloud VM the Connector waits for each to give up: from a fraction of a
+second to over two seconds per login. The login itself is unchanged. A profile
+client's sessions are opened as its profile says.
+
+By default `download_execution_logs`, `download_stdout_logs`,
+`download_metrics` and `download_training_metrics` close their session when
+they return, and `fetch_execution_logs` always does. Setting
+`keep_artifact_sessions = True` on the client keeps the session of a download
+that succeeded, up to two per database and schema (two downloads can run at
+once), for the next download, which then starts with its first `LIST` instead
+of a login. A session idle for 30 minutes is closed instead of reused, and one
+the Connector reports closed is never handed out. A kept session whose first
+call fails before any call on it has worked, because it expired on the service
+or its connection dropped while kept, is replaced at once by a fresh login,
+without the retry backoff and without using one of the retries; if that fresh
+login fails, the usual retries take over. A download that fails or is
+cancelled, that abandoned an attempt past `transfer_timeout_seconds`, or that
+left a listing running on its session, closes its session. `close()` closes the kept sessions, and so does setting
+`keep_artifact_sessions` back to `False` on the client that owns them; a
+client from `for_job()` shares them and closes none.
+
+`warm_artifact_session(job_id)` prepares a download before it is asked for: it
+resolves the job's experiment run and, while sessions are kept and none is kept
+for the client's database and schema, logs one in and keeps it. It raises what
+resolving the run or logging in raises, and then keeps nothing.
+
+The TUI keeps sessions while it runs. It calls `warm_artifact_session` once a
+job's screen has drawn its first log lines (or 1.5 seconds after the screen
+opens, when no lines come), so that the job's first Resources or Training
+metrics download starts with its listing. A warm-up that fails shows nothing on
+screen, as the download then logs in itself and says what failed; its
+traceback goes to the TUI's error log (`~/.cortex-training-errors.log`), once
+per job screen. When the TUI quits, it closes the sessions it kept, waiting at
+most a second.
 
 ---
 

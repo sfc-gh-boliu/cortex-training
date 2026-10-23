@@ -323,11 +323,9 @@ def build_parser(
         prog=prog,
         description="Manage Cortex Training jobs through the Cortex Training REST endpoint.",
     )
-    parser.add_argument(
-        "--config",
-        default=_env("CORTEX_TRAINING_CONFIG"),
-        help="Path to a reusable Cortex Training CLI config JSON file.",
-    )
+    # The old JSON config and direct credentials: parsed only to explain what
+    # replaced them (see _reject_old_connection).
+    parser.add_argument("--config", help=argparse.SUPPRESS)
     parser.add_argument(
         "--ct-config",
         metavar="PATH",
@@ -339,24 +337,15 @@ def build_parser(
     parser.add_argument(
         "--connection",
         "-c",
-        default=_env("CORTEX_TRAINING_CONNECTION"),
         help=(
-            "Snowflake connection profile name. When no legacy config or direct "
-            "credentials are configured, the Snowflake default profile is used."
+            "Snowflake connection profile to use. Without it, the profile saved by "
+            "`cortex-training login` (in config.json) is used, then your Snowflake default profile."
         ),
     )
-    parser.add_argument(
-        "--base-url",
-        help="Base URL for a local or otherwise compatible server. Skips PAT auth.",
-    )
-    parser.add_argument(
-        "--host",
-        help="Snowflake account host for PAT auth.",
-    )
-    parser.add_argument(
-        "--pat",
-        help="Programmatic access token.",
-    )
+    # For a local or mock server, during development.
+    parser.add_argument("--base-url", help=argparse.SUPPRESS)
+    parser.add_argument("--host", help=argparse.SUPPRESS)
+    parser.add_argument("--pat", help=argparse.SUPPRESS)
     parser.add_argument(
         "--database",
         help="Database containing the cortex-training endpoint.",
@@ -956,6 +945,132 @@ def target_line(resolution: Any, stream: TextIO) -> str:
     return f"→ {who} · database {style.bold(resolution.database)} {source('database')} · {schema}\n"
 
 
+class OldConnectionError(ValueError):
+    """The command uses a connection form that profiles replaced; the message says what to do."""
+
+
+class OldConfigFile(Exception):
+    """The command would sign in with an old JSON config, which can be converted."""
+
+    def __init__(self, path: str, source: str) -> None:
+        super().__init__(path)
+        self.path = path
+        self.source = source
+
+
+_LOGIN_HINT = "Run `cortex-training login` to set up a Snowflake connection profile."
+
+# Variables the old CLI read that other Snowflake tools also set: ignored now,
+# and what to use instead.
+_IGNORED_VARIABLES = {
+    "SNOWFLAKE_HOST": "a profile (or CORTEX_TRAINING_HOST, in CI only)",
+    "SNOWFLAKE_PAT": "a profile (or CORTEX_TRAINING_PAT, in CI only)",
+    "SNOWFLAKE_DATABASE": "CORTEX_TRAINING_DATABASE, or the profile's database",
+    "SNOWFLAKE_SCHEMA": "CORTEX_TRAINING_SCHEMA, or the profile's schema",
+}
+
+
+def _reject_old_connection(args: argparse.Namespace) -> None:
+    """Raise for --host / --pat, and for an old JSON config the command would sign in with."""
+    used = [flag for flag, value in (("--host", args.host), ("--pat", args.pat)) if value]
+    if used:
+        raise OldConnectionError(
+            f"{' and '.join(used)} {'is' if len(used) == 1 else 'are'} no longer supported: Cortex Training signs "
+            "in with a Snowflake connection profile. Run `cortex-training login` to set one up (it can create one "
+            "from an account and a PAT). In CI, set CORTEX_TRAINING_HOST and CORTEX_TRAINING_PAT instead."
+        )
+    if args.config:
+        source, path = "--config", args.config
+    elif _env("CORTEX_TRAINING_CONFIG"):
+        source, path = "CORTEX_TRAINING_CONFIG", _env("CORTEX_TRAINING_CONFIG")
+    else:
+        path = _remembered_config_path()
+        source = "login.json"
+    if path is None:
+        return
+    if not Path(path).expanduser().is_file():
+        if source == "login.json":
+            return  # A stale pointer: warn_ignored_environment says so, and the profile is used.
+        raise OldConnectionError(
+            f"{source} points to an old JSON config, {path}, which doesn't exist; old JSON configs are no longer "
+            f"supported. {_unset_hint(source)}{_LOGIN_HINT}"
+        )
+    raise OldConfigFile(str(Path(path).expanduser()), source)
+
+
+def _remembered_config_path() -> str | None:
+    """The old JSON config ``login.json`` points to, if it can be read."""
+    try:
+        return _read_login_config_path()
+    except ValueError:
+        return None
+
+
+def _unset_hint(source: str) -> str:
+    if source == "CORTEX_TRAINING_CONFIG":
+        return "Unset CORTEX_TRAINING_CONFIG (see `cortex-training login`'s shell check). "
+    if source == "login.json":
+        return f"Delete {_login_state_path()}. "
+    return ""
+
+
+def warn_ignored_environment(stderr: TextIO) -> None:
+    """Warn about variables the old CLI read that no longer change the connection."""
+    from cortex_training._login import _Style
+
+    style = _Style(stderr)
+    if _env("CORTEX_TRAINING_CONNECTION"):
+        stderr.write(
+            f"{style.yellow('warning:')} CORTEX_TRAINING_CONNECTION is set but ignored. Use --connection NAME, "
+            "or run `cortex-training login` to change the saved profile.\n"
+        )
+    for name, instead in _IGNORED_VARIABLES.items():
+        if _env(name):
+            stderr.write(f"{style.yellow('warning:')} {name} is set but ignored; Cortex Training uses {instead}.\n")
+    remembered = _remembered_config_path()
+    if remembered is not None and not Path(remembered).expanduser().is_file():
+        stderr.write(
+            f"{style.yellow('warning:')} {_login_state_path()} points to {remembered}, which doesn't exist; it's "
+            "ignored. Delete it.\n"
+        )
+
+
+def offer_convert(found: OldConfigFile, stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    """Explain that old JSON configs are no longer supported, and offer to convert this one."""
+    import shlex
+
+    from cortex_training._login import _Prompter
+
+    command = f"cortex-training login --convert-old-config {shlex.quote(found.path)}"
+    stderr.write(
+        f"error: signing in with an old JSON config ({found.path}, from {found.source}) is no longer supported. "
+        "Cortex Training now signs in with a Snowflake connection profile, and can convert this file into one.\n"
+    )
+    if not (stdin.isatty() and stderr.isatty()):
+        stderr.write(f"To convert it, run in a terminal:  {command}\n")
+        return 2
+    if not _Prompter(stdin, stderr).confirm("Convert it now?", default=True):
+        stderr.write(f"Nothing was changed. To convert it later, run:  {command}\n")
+        return 2
+    from cortex_training._convert import run_convert
+
+    return run_convert(found.path, stdin=stdin, stdout=stdout, stderr=stderr)
+
+
+def offer_login(error: Exception, stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    """No profile is set up: in a terminal, offer to run `cortex-training login`."""
+    from cortex_training._login import _Prompter
+
+    stderr.write(f"error: {error}\n")
+    if not (stdin.isatty() and stderr.isatty()):
+        return 1
+    if not _Prompter(stdin, stderr).confirm("Run `cortex-training login` now?", default=True):
+        return 1
+    from cortex_training._login import run_login
+
+    return run_login(None, stdin=stdin, stdout=stdout, stderr=stderr)
+
+
 def parse_args(
     argv: list[str] | None = None,
     *,
@@ -975,19 +1090,28 @@ def parse_args(
     if args.command == "login":
         return args
 
+    _reject_old_connection(args)
     dry_run = args.command == "submit" and args.dry_run
     typed = _typed_settings(args)
-    args = _resolve_args(args, load_login=not dry_run)
-    if dry_run:
+    if typed["endpoint"] is None:
+        typed["endpoint"] = _env("CORTEX_TRAINING_ENDPOINT")
+    if dry_run or args.base_url or _env("CORTEX_TRAINING_BASE_URL"):
+        # A dry run doesn't connect; --base-url is a local or mock server.
+        args = _resolve_args(args, load_login=False)
+        if dry_run:
+            return args
+        args = _normalize_connection_args(args)
+        if not args.database:
+            parser.error("--base-url needs --database (or CORTEX_TRAINING_DATABASE)")
         return args
-    args = _normalize_connection_args(args)
-    if args.use_connection_profile:
-        return _pick(args, typed)
-    if not args.database:
-        parser.error("provide --database or set CORTEX_TRAINING_DATABASE/SNOWFLAKE_DATABASE")
-    if args.base_url is None and (args.host is None or args.pat is None):
-        parser.error("provide --base-url for local/mock use, or both --host and --pat")
-    return args
+    args.use_connection_profile = True
+    return _pick(args, typed)
+
+
+def _picker_no_profile_error() -> type[Exception]:
+    from cortex_training._picker import NoProfileError
+
+    return NoProfileError
 
 
 def build_client(args: argparse.Namespace, cortex_training_client_cls):
@@ -1787,8 +1911,17 @@ def main(
 
     args = None
     try:
-        args = parse_args(argv, prog=prog, include_tui=include_tui)
+        try:
+            args = parse_args(argv, prog=prog, include_tui=include_tui)
+        except OldConnectionError as exc:
+            print(f"error: {exc}", file=stderr)
+            return 2
+        except OldConfigFile as found:
+            return offer_convert(found, stdin, stdout, stderr)
+        except _picker_no_profile_error() as exc:
+            return offer_login(exc, stdin, stdout, stderr)
         if getattr(args, "resolution", None) is not None:
+            warn_ignored_environment(stderr)
             stderr.write(target_line(args.resolution, stderr))
         dry_run = args.command == "submit" and args.dry_run
         no_client = dry_run or args.command == "login"

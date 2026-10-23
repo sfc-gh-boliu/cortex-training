@@ -35,9 +35,10 @@ jobs:
       - name: Install package and test dependencies
         # The recipe tests import tinker-cookbook and wandb; install them the
         # way recipes/README.md does. CPU-only torch keeps the job small.
+        # `python -m uv pip` installs into the setup-python interpreter, which
+        # is the one the next step runs.
         run: |
           python -m pip install uv
-          python -m uv venv --python "$(command -v python)"
           python -m uv pip install --index-strategy unsafe-best-match \
             --extra-index-url https://download.pytorch.org/whl/cpu \
             -e ".[dev]" \
@@ -45,4 +46,4 @@ jobs:
             wandb
 
       - name: Run tests
-        run: .venv/bin/python -m pytest tests/ -q
+        run: python -m pytest tests/ -q

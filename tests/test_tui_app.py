@@ -4539,7 +4539,9 @@ async def _run_a_that_stops_the_pages_says_at_once_what_the_list_on_screen_is():
         assert "so far" not in _info_text(screen)
         assert not any(str(table.get_row_at(i)[0]).endswith("…") for i in range(table.row_count))
         client.schema_gate.set()
-        assert await _pause_until(pilot, lambda: screen._scope.kind == SCHEMA, seconds=10.0)
+        # The schema's list arrives a page at a time, its first pages already SCHEMA-scoped.
+        assert await _pause_until(pilot, lambda: screen._scope.kind == SCHEMA and not screen._scope.loading,
+                                  seconds=10.0)
         assert app.sub_title.endswith("Current schema: " + screen._schema_label()), app.sub_title
         client.release(10)
         await _settle(app, pilot)

@@ -52,6 +52,7 @@ import shutil
 import tempfile
 import threading
 import time
+import warnings
 import uuid
 from collections import deque
 from collections.abc import Callable
@@ -230,6 +231,9 @@ _ENDED_JOB_STATES = frozenset(
 # out the service's read-after-create window.
 _RECENTLY_CREATED_SECONDS = 120.0
 _SESSION_EXPIRED_CODES = frozenset({"390111", "390112", "390114"})
+# The Cortex Training API's code, on an HTTP 400, for a database or schema in the
+# URL path that it cannot resolve. The client explains it; it never creates one.
+_DATABASE_NOT_RESOLVED_CODE = "517602"
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {
     _CHUNK_GROUP_RESTART_REQUIRED,
@@ -322,6 +326,33 @@ class ChunkGroupRestartError(ChunkGroupError):
 
 class ChunkGroupConflictError(ChunkGroupError):
     """The same chunk-group identity was reused inconsistently."""
+
+
+class DatabaseAccessError(requests.exceptions.HTTPError, RuntimeError):
+    """The configured database or schema can't be found by the current role.
+
+    Raised for the API's HTTP 400 with code 517602. The client never creates a
+    database; the message says how to create it, get access, or use another.
+    ``kind`` is ``"database"`` or ``"schema"``, ``name`` the object, ``role``
+    the session's role (None when it can't be determined, as for PAT clients),
+    and ``statement`` the CREATE statement that would set it up.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        response: requests.Response,
+        kind: str,
+        name: str,
+        role: str | None,
+        statement: str,
+    ):
+        super().__init__(message, response=response, request=getattr(response, "request", None))
+        self.kind = kind
+        self.name = name
+        self.role = role
+        self.statement = statement
 
 
 # Default per-request HTTP timeout, as a (connect, read) pair in seconds. The
@@ -1916,14 +1947,12 @@ class CortexTrainingClient:
         self._artifact_connection_config: dict[str, str] | None = None
         self._artifact_connection_factory: Callable[[], Any] | None = None
         self._auth_provider: SnowflakeProfileAuth | None = None
-        self._db_ensured = False
         # job_id -> monotonic time this client created it (see _definitive_not_found).
         self._recently_created_jobs: dict[str, float] = {}
         self._recently_created_lock = threading.Lock()
-        self._db_creating = False
         # Both are cleared on a for_job() child; see for_job().
         self._owns_session = True
-        self._auto_create_database = True
+        self._explain_database_errors = True
         self._metric_emitter: OtlpMetricEmitter | None = None
         # Sent with every metric as SURFACE_ATTRIBUTE; entry points set their own.
         self._telemetry_surface = SDK_SURFACE
@@ -1935,16 +1964,24 @@ class CortexTrainingClient:
 
     @property
     def auto_create_database(self) -> bool:
-        """Whether a request answered "database or schema not found" creates them and retries.
+        """Deprecated, and always False: the client never creates a database.
 
-        True by default. Set it to False for a client that only reads: the error
-        is then raised as it is. A client from :meth:`for_job` starts with it off.
+        A request answered "database or schema not found" raises
+        :class:`DatabaseAccessError`, which says how to create it.
         """
-        return self._auto_create_database
+        return False
 
     @auto_create_database.setter
     def auto_create_database(self, value: bool) -> None:
-        self._auto_create_database = bool(value)
+        # False is already the only behavior, so only asking for creation warns.
+        if value:
+            warnings.warn(
+                "CortexTrainingClient.auto_create_database is deprecated and does nothing: the "
+                "client never creates a database. Create it once, for example with "
+                "CREATE DATABASE IF NOT EXISTS in Snowsight.",
+                FutureWarning,
+                stacklevel=2,
+            )
 
     @classmethod
     def from_pat(
@@ -2220,75 +2257,53 @@ class CortexTrainingClient:
                 parts.append(f"{key}={value}")
         return " ".join(parts)
 
-    def _create_database(self) -> None:
-        """Attempt to create the configured database (and schema if non-PUBLIC).
+    def _current_role(self) -> str | None:
+        """The role this client signs in with, without running SQL.
 
-        Called only when an API request fails with a database-not-found error.
-        Routes through ``_send`` so auth works for both PAT and connection
-        profile users. Raises on failure with an actionable error message.
+        Profile clients read it from their Connector session, which Snowflake
+        fills at sign-in, even when the profile sets no role. PAT clients have
+        no session, so their role can't be determined.
         """
-        db_stmt = f"CREATE DATABASE IF NOT EXISTS {self.database}"
-        manual_hint = (
-            f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {self.database}; "
-            "— or if the database already exists, check that your role has USAGE on it."
-        )
-        self._db_creating = True  # prevent recursion from inner _send call
+        if self._auth_provider is None:
+            return None
         try:
-            logger.info("Database '%s' not found. Attempting to create it...", self.database)
-            resp = self._send(
-                "POST",
-                f"{self.base_url}/api/v2/statements",
-                json={"statement": db_stmt, "timeout": 60},
-                max_retries=1,
-            )
-            if resp.status_code == 202:
-                raise RuntimeError(
-                    f"Database creation for '{self.database}' was accepted but has not "
-                    f"completed yet. {manual_hint}"
-                )
-            logger.info("Database '%s' created successfully.", self.database)
-
-            if self.schema.upper() != "PUBLIC":
-                schema_stmt = f"CREATE SCHEMA IF NOT EXISTS {self.database}.{self.schema}"
-                logger.info("Schema '%s' does not exist. Attempting to create it...", self.schema)
-                schema_resp = self._send(
-                    "POST",
-                    f"{self.base_url}/api/v2/statements",
-                    json={"statement": schema_stmt, "timeout": 60},
-                    max_retries=1,
-                )
-                if schema_resp.status_code == 202:
-                    raise RuntimeError(
-                        f"Schema creation for '{self.database}.{self.schema}' was accepted but has not "
-                        f"completed yet. Create it manually: CREATE SCHEMA IF NOT EXISTS {self.database}.{self.schema};"
-                    )
-                logger.info("Schema '%s' created successfully.", self.schema)
-
-            self._db_ensured = True
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(
-                f"Could not create database '{self.database}': {exc}. {manual_hint}"
-            ) from exc
-        finally:
-            self._db_creating = False
-
-    @staticmethod
-    def _is_database_not_found(resp: requests.Response) -> bool:
-        """Return True if the response indicates the configured database does not exist.
-
-        The Cortex Training API returns 400 with error code 517602 and a message
-        like ``Schema MY_DB.PUBLIC is not found or not authorized`` when the
-        database in the URL path does not exist.
-        """
-        if resp.status_code not in (400, 404, 422):
-            return False
-        try:
-            text = resp.text.lower()
+            return self._auth_provider.role
         except Exception:
-            return False
-        return "not found or not authorized" in text or "does not exist or not authorized" in text
+            logger.debug("Could not read the session's role.", exc_info=True)
+            return None
+
+    def _database_error(self, response: requests.Response) -> DatabaseAccessError:
+        """Explain an HTTP 400 with code 517602: the configured database or schema can't be found."""
+        role = self._current_role()
+        who = f"Role {role}" if role else "Role <ROLE> (couldn't determine your role)"
+        grantee = role or "<ROLE>"
+        source = ""
+        if self._auth_provider is not None:
+            profile = getattr(self._auth_provider, "connection_name", None)
+            source = f" (from profile {profile})" if profile else " (from your default Snowflake profile)"
+        database, schema = self.database, self.schema
+        if schema.upper() == "PUBLIC":
+            kind, name, statement = "database", database, f"CREATE DATABASE IF NOT EXISTS {database}"
+            lines = [
+                f"{who} can't find database {database}{source}.",
+                f"- If it doesn't exist: run `{statement}` (or ask an admin to).",
+                f"- If it exists: ask an admin to run `GRANT USAGE ON DATABASE {database} TO ROLE {grantee}`.",
+            ]
+        else:
+            kind, name = "schema", f"{database}.{schema}"
+            create_database = f"CREATE DATABASE IF NOT EXISTS {database}"
+            create_schema = f"CREATE SCHEMA IF NOT EXISTS {database}.{schema}"
+            statement = f"{create_database}; {create_schema}"
+            lines = [
+                f"{who} can't find database {database} or its schema {schema}{source}.",
+                f"- If they don't exist: run `{create_database}` and `{create_schema}` (or ask an admin to).",
+                f"- If they exist: ask an admin to run `GRANT USAGE ON DATABASE {database} TO ROLE {grantee}` "
+                f"and `GRANT USAGE ON SCHEMA {database}.{schema} TO ROLE {grantee}`.",
+            ]
+        lines.append("- Or use another database: --database NAME / CORTEX_TRAINING_DATABASE.")
+        return DatabaseAccessError(
+            "\n".join(lines), response=response, kind=kind, name=name, role=role, statement=statement
+        )
 
     def _send(
         self,
@@ -2297,16 +2312,17 @@ class CortexTrainingClient:
         *,
         retry_on=_is_transient,
         max_retries: int | None = None,
-        ensure_database: bool = True,
+        explain_database: bool = True,
         **kwargs,
     ) -> requests.Response:
         """Send one request with retries.
 
-        ``ensure_database=False`` skips creating the configured database on a
-        not-found error, for routes whose path names no database. A client from
-        :meth:`for_job` never creates one, whatever the caller passes.
+        An HTTP 400 with code 517602 (the configured database or schema can't be
+        found) raises :class:`DatabaseAccessError`. ``explain_database=False``
+        leaves that answer as it is, for routes whose path names no database; a
+        client from :meth:`for_job` always leaves it.
         """
-        auto_create = ensure_database and self._auto_create_database
+        explain_database = explain_database and self._explain_database_errors
         fn = getattr(self._session, method.lower())
         debug_context = kwargs.pop("debug_context", None)
         debug_label = self._debug_context_label(debug_context) if debug_context is not None else None
@@ -2432,25 +2448,11 @@ class CortexTrainingClient:
                         self._debug_response_summary(resp),
                     )
                 if (
-                    auto_create
-                    and not self._db_ensured
-                    and not self._db_creating
-                    and self._is_database_not_found(resp)
+                    explain_database
+                    and status_code == 400
+                    and _response_error_code(resp) == _DATABASE_NOT_RESOLVED_CODE
                 ):
-                    resp.close()
-                    self._create_database()
-                    # Retry the original request once after creating the DB.
-                    continue
-                if (
-                    auto_create
-                    and self._db_ensured
-                    and self._is_database_not_found(resp)
-                ):
-                    raise RuntimeError(
-                        f"Database '{self.database}' still not found after creation attempt. "
-                        f"The database may already exist but your role lacks USAGE on it. "
-                        f"Create it manually in Snowsight: CREATE DATABASE IF NOT EXISTS {self.database};"
-                    )
+                    raise self._database_error(resp)
                 try:
                     # requests.Response.raise_for_status() intentionally ignores 3xx.
                     if 300 <= resp.status_code < 400:
@@ -2828,7 +2830,7 @@ class CortexTrainingClient:
                 retry_on=_is_account_list_transient,
                 # The path names no database, so a not-found error here is not
                 # about the configured one.
-                ensure_database=False,
+                explain_database=False,
                 **bounds,
             )
         except requests.exceptions.HTTPError as exc:
@@ -2860,7 +2862,7 @@ class CortexTrainingClient:
                 retry_on=_is_account_list_transient,
                 # The path names no database, so a not-found error here is not
                 # about the configured one.
-                ensure_database=False,
+                explain_database=False,
             )
         except requests.exceptions.HTTPError as exc:
             if exc.response is None or exc.response.status_code != 404:
@@ -2898,7 +2900,7 @@ class CortexTrainingClient:
         client._session.close()
         client._session = self._session
         client._owns_session = False
-        client._auto_create_database = False
+        client._explain_database_errors = False
         client._auth_provider = self._auth_provider
         client._metric_emitter = self._metric_emitter
         client._telemetry_surface = self._telemetry_surface

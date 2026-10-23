@@ -218,7 +218,7 @@ def test_moe_sft_recipes_have_runnable_parallelism():
             1,
         ),
         "deepseek-v4-flash/standard/h200-training-full.json": (
-            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            "PrimeIntellect/DeepSeek-V4-Flash-0731-bf16",
             16,
             16,
             65536,
@@ -235,14 +235,14 @@ def test_moe_sft_recipes_have_runnable_parallelism():
         ),
         "deepseek-v4-flash/long/h200-training-lora.json": (
             "deepseek-ai/DeepSeek-V4-Flash-0731",
-            16,
-            16,
+            8,
+            8,
             262144,
-            16,
+            8,
             1,
         ),
         "deepseek-v4-flash/long/h200-training-full.json": (
-            "deepseek-ai/DeepSeek-V4-Flash-0731",
+            "PrimeIntellect/DeepSeek-V4-Flash-0731-bf16",
             16,
             16,
             262144,
@@ -323,6 +323,10 @@ def test_moe_sft_recipes_have_runnable_parallelism():
                 }
                 assert training["optimizer"]["lr"] == 2e-5
                 assert "peft_config" not in training
+            if filename == "deepseek-v4-flash/standard/h200-training-lora.json":
+                assert "offload_optimizer" not in ds_config["zero_optimization"]
+            else:
+                assert ds_config["zero_optimization"]["offload_optimizer"]["device"] == "cpu"
         if filename in {
             "glm-5.3-flash/long/h200-training-lora.json",
             "glm-5.3-flash-bf16/long/h200-training-full.json",
@@ -463,7 +467,12 @@ def test_moe_rl_recipes_have_runnable_parallelism():
         assert sampling_config["vllm_config"]["tensor_parallel_size"] == expected_tp
         assert "trust_remote_code" not in sampling_config["vllm_config"]
         assert training["job_type"] == "training"
-        assert training["model_name"] == model_id
+        expected_training_model = (
+            "PrimeIntellect/DeepSeek-V4-Flash-0731-bf16"
+            if filename == "deepseek-v4-flash/long/h200-training-full.json"
+            else model_id
+        )
+        assert training["model_name"] == expected_training_model
         assert training["dtype"] == "bfloat16"
         assert training_config["model_provider"] == "prime_rl"
         if filename == "glm-5.3-flash/long/h200-training-lora.json":

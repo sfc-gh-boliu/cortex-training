@@ -41,14 +41,25 @@ model's catalog folder lists exactly which files it has. The examples pick a fil
 `model=`, `context=`, `hardware=` and `lora=` (see
 [Run an example](../../examples/README.md#run-an-example)).
 
-The examples that tokenize prompts pick a chat renderer from tinker-cookbook,
-with thinking off by default (`examples.inference.serve` needs none).
+The examples that tokenize prompts pick a chat renderer from tinker-cookbook
+(`examples.inference.serve` needs none):
+
+- Conversational SFT and the inference `generate`/`evaluate` commands default
+  to thinking off, and accept `enable_thinking=` and `renderer_name=`. DARE
+  defaults to thinking on.
+- Distillation defaults to `renderer_name=qwen3_disable_thinking`.
+- Math GRPO takes no renderer arguments and uses tinker-cookbook's top
+  recommendation for the model, which is thinking on for hybrid Qwen3 models.
+
 tinker-cookbook lists no renderer for Qwen3-0.6B, Qwen3-1.7B, Qwen3.8-Flash-Next,
 the Gemma and MedGemma models, DeepSeek V4, GLM 4.5 Air, GLM 5.2 or GLM 5.3 Flash
-BF16, so pass `renderer_name=` for those (SFT, distillation and the inference
-`generate`/`evaluate` commands accept it; Math GRPO does not, so it can't run
-these models). Qwen3-4B-Instruct, GLM 5.3, GLM 5.3
-Flash and gpt-oss have only thinking renderers, so pass `enable_thinking=true` or
+BF16, so pass `renderer_name=` for those; Math GRPO can't run them. Pick a
+renderer from tinker-cookbook's
+[renderer list](https://tinker-docs.thinkingmachines.ai/tutorials/core-concepts/rendering/#available-renderers)
+whose chat template matches the model's own (its `tokenizer_config.json` on
+Hugging Face); a mismatched template trains and samples on the wrong format.
+Qwen3-4B-Instruct, GLM 5.3, GLM 5.3 Flash and gpt-oss have only thinking
+renderers, so with a thinking-off default pass `enable_thinking=true` or
 `renderer_name=`.
 
 ## Model notes

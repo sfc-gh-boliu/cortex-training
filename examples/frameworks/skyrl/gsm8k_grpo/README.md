@@ -79,10 +79,12 @@ roughly:
 | 120 | 0.75 |
 | 230 | 0.77 |
 
-## Resume a stopped run
+## Resume a stopped run (experimental)
 
-Checkpoints land every ten steps under `~/checkpoints`, but the launcher starts
-fresh by default. To continue from the last one:
+Resuming on Cortex is untested: no run has been restarted from a checkpoint, so
+it is not yet known whether model and optimizer state are restored. Checkpoints
+land every ten steps under `~/checkpoints`, but the launcher starts fresh by
+default. To try continuing from the last one:
 
 ```bash
 bash run_qwen3_0.6b_gsm8k_grpo_cortex.sh trainer.resume_mode=latest
@@ -90,9 +92,7 @@ bash run_qwen3_0.6b_gsm8k_grpo_cortex.sh trainer.resume_mode=latest
 
 Arguments are forwarded to the trainer, so this overrides the default. From a
 new terminal, re-export `SKYRL_HOME` and the four `ARCTIC_CORTEX_*` values
-first; the dataset and checkpoints are still on disk. The reload itself is
-unverified here: the checkpoints are written, but no Cortex run has been
-restarted from one.
+first; the dataset and checkpoints are still on disk.
 
 ## More detail
 

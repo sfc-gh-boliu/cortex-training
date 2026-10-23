@@ -8,8 +8,9 @@ experiment tracking.
 
 ```bash
 uv pip install wandb
-export WANDB_API_KEY=...
-export WANDB_BASE_URL=...
+export WANDB_API_KEY=YOUR_WANDB_API_KEY
+# Only for a self-hosted W&B server:
+# export WANDB_BASE_URL=https://wandb.example.com
 ```
 
 Then set a project on the train command, and optionally `wandb_name` to name

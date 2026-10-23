@@ -69,7 +69,8 @@ arguments and defaults.
 
 ## How an example builds its job
 
-Three layers, each overriding the one before:
+The SFT, RL and inference examples build their job in three layers, each
+overriding the one before:
 
 1. **Catalog file:** the model's job file for the selected context, hardware,
    kind and mode (see the [catalog layout](../model-catalog/README.md#layout)).
@@ -83,6 +84,11 @@ Three layers, each overriding the one before:
 applies on top of it. Without `job_config=`, an RL job on an MoE model also gets
 [router replay](rl/README.md#router-replay) filled in after the merge. The
 final job is logged before it is submitted.
+
+Distillation builds a student and a teacher job instead; see
+[How the jobs are built](distillation/README.md#how-the-jobs-are-built). Its
+`job_config=` and `teacher_job_config=` files are used as is, without its
+sizing arguments.
 
 Merge rules:
 

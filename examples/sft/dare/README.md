@@ -27,7 +27,8 @@ diverse subset of tasks.
 
 ## Results
 
-Two epochs of full-parameter SFT on the FV traces nearly triple the total score:
+About two epochs of full-parameter SFT on the FV traces (120 steps of 32, 3,840
+examples) nearly triple the total score:
 
 | Model | Total | class-IF | class-MM | reg-IF | reg-MM | time-XF | time-CF | Wrote a prediction |
 |---|---|---|---|---|---|---|---|---|
@@ -129,8 +130,8 @@ a tool loop and what the agent loop below feeds back to the model.
 `evaluate.py` runs the public harness's own tool, dispatch, and scoring code,
 copied into `dare_bench/`, inside a local agent loop:
 
-- The model gets the task prompt and the tool, and may call it up to 5 times.
-  Each call goes through DARE-Bench's `python_executor`. It sends the code and
+- The model gets the task prompt and the tool, and has up to 5 assistant
+  turns; every tool call in a turn is run, so a turn can run several. Each call goes through DARE-Bench's `python_executor`. It sends the code and
   the requested input files with a 200-second limit, and copies the requested
   output files back to the task's work directory.
 - By default that endpoint is a local server (`sandbox.py`) that runs each call

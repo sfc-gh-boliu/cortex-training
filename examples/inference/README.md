@@ -41,13 +41,16 @@ ships empty. `job_config=FILE` uses your own job file.
 
 ## Generate
 
-Pass `job_id=` to use a running endpoint, with the same `model=` arguments
-`serve` printed so the prompts are rendered for that model. Without `job_id=`,
+Pass `job_id=` to use a running endpoint, with the same `model=`, `context=`,
+`hardware=` and `lora=` (or `job_config=`) arguments `serve` printed, so the
+prompts are rendered for that model (and `evaluate` checks prompt length
+against its context). Without `job_id=`,
 the example creates a one-shot endpoint and releases it when done.
 
 ```bash
 python -m examples.inference.generate config=/path/to/config.json \
-  job_id=JOB_ID prompt="Who trained you?"
+  job_id=JOB_ID model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA \
+  prompt="Who trained you?"
 ```
 
 Other options: `prompts_file=`, `out=` (a JSONL file), `max_tokens=` (512),
@@ -60,12 +63,13 @@ Other options: `prompts_file=`, `out=` (a JSONL file), `max_tokens=` (512),
 | `task=` | Score |
 |---|---|
 | `math500` (default) | MATH-500 accuracy |
-| `gsm8k` | Exact match on the final `####` answer. Use `temperature=0` |
+| `gsm8k` | Exact numeric match on the answer after `####`, or on the last number when there is no `####`; `gsm8k/format` reports how often `####` was used. Use `temperature=0` |
 | `identity` | Percentage of completions that contain `Snowflake AI Research` (prompts from `examples/sft/conversational/data/identity_eval.jsonl`) |
 
 ```bash
-# Against a running endpoint
-python -m examples.inference.evaluate config=/path/to/config.json job_id=JOB_ID
+# Against a running endpoint (the arguments serve printed)
+python -m examples.inference.evaluate config=/path/to/config.json \
+  job_id=JOB_ID model=MODEL context=CONTEXT hardware=HARDWARE lora=LORA
 
 # Against a checkpoint, one-shot
 python -m examples.inference.evaluate config=/path/to/config.json \

@@ -1,8 +1,8 @@
 # Cortex Training REST API Reference
 
-> **Status.** This page is the REST contract the client in this repository
-> codes against. The service's own OpenAPI specification remains the source of
-> truth for the wire schema.
+> **Status.** This page is the customer-facing REST contract: the client in this
+> repository codes against it, and it is the reference for anything a caller
+> can observe.
 >
 > **Scope.** This document describes the customer-facing Cortex Training REST
 > surface used by this repository's `CortexTrainingClient`. It covers REST paths,

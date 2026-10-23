@@ -1077,10 +1077,17 @@ was cancelled, terminated or completed. It shows the service's `reason` and
 `reason_details` (a failure always has a reason, `not reported` when none is
 sent), or what the state means, and where to look next. A running job has no
 box unless the service sends a reason. The Sub-jobs card shows type, status
-(a badge such as `● RUNNING`), model, GPUs and key config; multiplexed rows
-name the source sub-job. Long cells use `…`, narrow screens omit Type, and
-wider tables scroll with `←` / `→` or `Home` / `End`; the card's bottom border
-says so (`e whole table`, `← → scroll`).
+(a badge such as `● RUNNING`), model and GPUs. Long cells use `…`, narrow
+screens omit Type, and wider tables scroll with `←` / `→` or `Home` / `End`;
+the card's bottom border says so (`e whole table`, `← → scroll`).
+
+The Config card under it follows the highlighted row: that sub-job's submitted
+config, exactly as `cortex-training get JOB_ID` prints that sub-job's entry
+(indented JSON by key, values as the service returns them, aliases as
+submitted), without the fields the service adds (`sub_job_id`, `status`). On
+the entire-job row, each sub-job's goes under its name, side by side when each
+has at least 40 cells. A line wider than its column is cut with `…` until `e`,
+which also puts the sub-jobs one under the other.
 
 Live previews refresh every 60 seconds, on return from details, or on `r`; a
 dim line at the end of the job card reports reads, slow reads and refresh

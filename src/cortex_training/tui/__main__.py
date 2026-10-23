@@ -22,7 +22,6 @@ import math
 import os
 import re
 import sys
-from pathlib import Path
 
 _CONNECT_HINT = ("to connect, run 'cortex-training login', or pass --connection NAME; "
                  "or try the TUI without a connection: --debug")
@@ -158,7 +157,6 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     typed = {**cli._typed_settings(args), "poll_interval": None, "poll_timeout": None}
     # The same connection rules as the CLI: old forms are explained (an old JSON
     # config can be converted), and the picker chooses the profile.
-    from_config: dict = {}
     try:
         cli._reject_old_connection(args)
     except cli.OldConnectionError as exc:
@@ -167,7 +165,7 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
         return cli.offer_convert(found, sys.stdin, sys.stdout, sys.stderr)
     if args.base_url or os.environ.get("CORTEX_TRAINING_BASE_URL"):
         try:
-            args = cli._normalize_connection_args(cli._resolve_args(args, load_login=False))
+            args = cli._resolve_local(args)
         except ValueError as exc:
             parser.error(str(exc))
         if not args.database:
@@ -207,35 +205,17 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     # job_id is optional: given, open that job's details; omitted, open the job
     # list so the user can choose one.
     app = CortexTrainingLogTUI(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=log_poll_interval)
-    app.sign_in = _sign_in(cli, args, from_config)  # for the commands the TUI shows to copy
+    app.sign_in = _sign_in(args)  # for the commands the TUI shows to copy
     app.run()
     return app.return_code or 0  # non-zero when the app stopped on an unhandled error
 
 
-def _sign_in(cli, args, from_config: dict) -> dict:
+def _sign_in(args) -> dict:
     """How the TUI's client connects, for the commands it shows to copy (read by
-    ``views.sign_in_options``). It never holds the PAT; ``config`` is the config
-    file as an absolute path, so a copied command finds it from any directory."""
+    ``views.sign_in_options``). It never holds a token."""
     if args.use_connection_profile:
         return {"kind": "profile"}
-    config = None
-    if getattr(args, "_legacy_config_selected", False) and args.config:
-        config = str(Path(args.config).expanduser().resolve())
-    if args.base_url:
-        return {"kind": "url", "config": config, "base_url": args.base_url,
-                "base_url_in_config": from_config.get("base_url") == args.base_url}
-    host = cli._normalize_host(args.host or "")
-    return {"kind": "pat", "config": config, "host": host,
-            "host_in_config": bool(host) and from_config.get("host") == host}
-
-
-def _config_connection(cli, values: dict) -> dict:
-    """What the config file (``values``, as the CLI reads it; empty for none) gives by
-    itself: its ``base_url`` and PAT ``host`` (normalized), None where it gives neither."""
-    base_url, host = cli._config_str(values, "base_url"), cli._config_str(values, "host")
-    if base_url and not cli._has_url_scheme(base_url) and host is None:
-        base_url, host = None, base_url  # the CLI reads a base URL without a scheme as the PAT host
-    return {"base_url": base_url, "host": cli._normalize_host(host) if host else None}
+    return {"kind": "url", "config": None, "base_url": args.base_url, "base_url_in_config": False}
 
 
 def _run_demo(args, app_class, *, account_list: str | None = None) -> int:

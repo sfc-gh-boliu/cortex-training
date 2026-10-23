@@ -49,6 +49,7 @@ from cortex_training.tui import __main__ as tui_main  # noqa: E402
 from cortex_training.tui.account import ACCOUNT  # noqa: E402
 from cortex_training.tui.account import SCHEMA  # noqa: E402
 from cortex_training.tui.account import JobLister  # noqa: E402
+from cortex_training.tui.account import Listing  # noqa: E402
 from cortex_training.tui.account import scope_text  # noqa: E402
 from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
 from cortex_training.tui.job_list import JobListScreen  # noqa: E402
@@ -5607,3 +5608,310 @@ async def _run_a_tail_nobody_watches_stops_polling(monkeypatch):
 
 def test_a_tail_nobody_watches_stops_polling(monkeypatch):
     asyncio.run(_run_a_tail_nobody_watches_stops_polling(monkeypatch))
+
+
+async def _run_a_schema_list_past_the_cap(c):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item,
+                           tries=400)
+        screen = app.screen
+        drawn = lambda: len(screen._job_by_item)  # noqa: E731
+        assert drawn() == 2_001, "not the newest 2,000 and every active job"
+        assert "newest 2,000 + every active job (more exist)" in screen._scope_text()
+        await pilot.press("f")
+        assert await _wait(pilot, app, lambda: drawn() == 2_500, tries=400), "f drew no more"
+        assert "newest 2,000" not in screen._scope_text()
+        calls = c.list_jobs.call_count
+        await pilot.press("r")  # a refresh keeps what f asked for
+        assert await _wait(pilot, app, lambda: c.list_jobs.call_count > calls and drawn() == 2_500, tries=400)
+        await pilot.press("f")
+        assert await _wait(pilot, app, lambda: drawn() == 2_001, tries=400), "f did not go back"
+        await _settle(app, pilot)
+
+
+def test_a_schema_list_past_the_cap_draws_its_newest_and_f_draws_every_job():
+    # Where the account-level list isn't there, list_jobs answers the schema whole: drawing
+    # tens of thousands of rows froze the list for seconds, and every search keystroke after.
+    now = datetime.now(timezone.utc)
+    c = _client()
+    c.list_jobs.return_value = [{"job_id": f"j{i}", "status": "SUCCEEDED",
+                                 "created_at": (now - timedelta(minutes=i)).isoformat()} for i in range(2_500)]
+    c.list_jobs.return_value[-1]["status"] = "RUNNING"  # the oldest, still running: always listed
+    asyncio.run(_run_a_schema_list_past_the_cap(c))
+
+
+async def _run_a_on_a_schema_list_past_the_cap(c):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item,
+                           tries=400)
+        screen = app.screen
+        drawn = lambda: len(screen._job_by_item)  # noqa: E731
+        cut = "newest 2,000 + every active job (more exist)"
+
+        async def press_a():
+            calls = c.list_jobs.call_count
+            await pilot.press("a")
+            assert await _wait(pilot, app, lambda: screen._declined and c.list_jobs.call_count > calls
+                               and not screen._refreshing, tries=400), "a never came back to the schema"
+
+        assert drawn() == 2_001 and cut in screen._scope_text()
+        await press_a()  # all schemas aren't there: the list stays the schema's, cut as it was
+        assert drawn() == 2_001, "a drew a different list"
+        assert cut in screen._scope_text(), f"the header lost the cut: {screen._scope_text()!r}"
+        assert screen.check_action("full_list", ("all",)), "a hid f"
+        await pilot.press("f")
+        assert await _wait(pilot, app, lambda: drawn() == 2_500, tries=400), "f drew no more after a"
+        await press_a()  # with every job drawn, they stay drawn: it is the same list
+        assert drawn() == 2_500 and screen.check_action("full_list", ("newest",))
+        await pilot.press("f")
+        assert await _wait(pilot, app, lambda: drawn() == 2_001, tries=400), "f did not go back"
+        assert cut in screen._scope_text()
+        await _settle(app, pilot)
+
+
+def test_a_on_a_schema_list_past_the_cap_keeps_it_cut_and_f_at_hand():
+    # Where the account-level list isn't there, a reads the configured schema's whole list
+    # again; it is shown as the schema list it is, so cut, saying so, with every job for f.
+    now = datetime.now(timezone.utc)
+    c = _client()
+    c.list_jobs.return_value = [{"job_id": f"j{i}", "status": "SUCCEEDED",
+                                 "created_at": (now - timedelta(minutes=i)).isoformat()} for i in range(2_500)]
+    c.list_jobs.return_value[-1]["status"] = "RUNNING"  # the oldest, still running: always listed
+    asyncio.run(_run_a_on_a_schema_list_past_the_cap(c))
+
+
+async def _run_f_just_as_a_refresh_lands(c):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item,
+                           tries=400)
+        screen = app.screen
+        drawn = lambda: len(screen._job_by_item)  # noqa: E731
+        older = screen._cut_listing
+        assert older is not None and drawn() == 2_001
+        created = datetime.now(timezone.utc).isoformat()
+        job = {"job_id": "j-new", "status": "SUCCEEDED", "created_at": created}
+        newer = Listing([job, *older.jobs], older.scope, everything=[job, *older.everything])
+        screen.action_full_list("all")  # its draw waits for the note to be painted
+        screen._show_listing(newer)  # a refresh lands first, drawn whole as f asks
+        assert await _wait(pilot, app, lambda: drawn() == 2_501, tries=400), "the refresh wasn't drawn whole"
+        await pilot.pause(0.5)  # f's own draw has had its turn
+        assert screen._cut_listing is newer and drawn() == 2_501, "f drew the older list back over the refresh"
+        assert "j-new" in {row.get("job_id") for row in screen._all_jobs}
+        # f twice before its draw: the newest stay drawn.
+        screen.action_full_list("newest")
+        assert await _wait(pilot, app, lambda: drawn() == 2_002, tries=400)
+        screen.action_full_list("all")
+        screen.action_full_list("newest")
+        await pilot.pause(0.5)
+        assert drawn() == 2_002 and not screen._full_list, "a draw f no longer asked for was made"
+        await _settle(app, pilot)
+
+
+def test_f_just_as_a_refresh_lands_keeps_the_refresh_s_list():
+    # f draws on the next idle; a refresh that shows in between has drawn its list whole, as f asks,
+    # and the older list f held must not go back over it until the next refresh.
+    now = datetime.now(timezone.utc)
+    c = _client()
+    c.list_jobs.return_value = [{"job_id": f"j{i}", "status": "SUCCEEDED",
+                                 "created_at": (now - timedelta(minutes=i + 1)).isoformat()} for i in range(2_500)]
+    c.list_jobs.return_value[-1]["status"] = "RUNNING"
+    asyncio.run(_run_f_just_as_a_refresh_lands(c))
+
+
+async def _run_f_does_nothing_on_a_list_not_cut_short(c):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test() as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item)
+        before = len(app.screen._job_by_item)
+        await pilot.press("f")
+        await pilot.pause(0.1)
+        assert len(app.screen._job_by_item) == before
+        assert not app.screen.check_action("full_list", ("all",)), "f offered on a list that is whole"
+        await _settle(app, pilot)
+
+
+def test_f_does_nothing_on_a_list_not_cut_short():
+    asyncio.run(_run_f_does_nothing_on_a_list_not_cut_short(_client()))
+
+
+def _extending_download(start):
+    """A download whose first call writes two hours of 4 GPUs and each later one appends 30 s,
+    as a resumed download extends the file: the loader reads only the rows after."""
+    calls = []
+
+    def download(job_id, output_dir, **_kwargs):
+        sub = Path(output_dir) / "7:training:0"
+        sub.mkdir(parents=True, exist_ok=True)
+        path = sub / "gpu.jsonl"
+        first, count = (0, 1440) if not calls else (1440 + 6 * (len(calls) - 1), 6)
+        calls.append(1)
+        rows = [{"record_version": 2, "sub_job_id": "7:training:0", "worker_num": gpu, "local_gpu_index": 0,
+                 "global_gpu_index": gpu, "sample_interval_s": 5.0, "gpu_util_pct": float((k * 7 + gpu) % 100),
+                 "fb_used_bytes": float(1024**3), "fb_free_bytes": float(8 * 1024**3),
+                 "sample_ts": (start + timedelta(seconds=5 * k)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+                for k in range(first, first + count) for gpu in range(4)]
+        with path.open("a", encoding="utf-8") as out:
+            out.write("".join(json.dumps(row) + "\n" for row in rows))
+        names = ["c0.gz"] + [f"c{n}.gz" for n in range(1, len(calls))]
+        path.with_name(".gpu.jsonl.manifest.json").write_text(
+            json.dumps({"version": 1, "names": names, "bytes": path.stat().st_size}), encoding="utf-8")
+        return [{"sub_job_id": "7:training:0", "path": str(path)}]
+
+    return download
+
+
+async def _run_a_window_picked_after_a_refresh(tmp_path, monkeypatch):
+    import cortex_training.tui.resource as resource_module
+    import cortex_training.tui.widgets as widgets_module
+    from cortex_training._download_lock import DownloadLock
+    from tests.test_tui_resource import _same
+
+    start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=2)
+    c = _client()
+    c.download_metrics.side_effect = _extending_download(start)
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        assert await _pause_until(pilot, lambda: isinstance(app.screen, LogScreen) and app.screen._current_source)
+        screen = app.screen
+        screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        loaded = lambda n: c.download_metrics.call_count >= n and not screen._resource_loading  # noqa: E731
+        assert await _pause_until(pilot, lambda: loaded(1) and screen._resource_kind_data(), seconds=15)
+        await pilot.press("r")  # a refresh that extends the file: only the window on screen is built
+        assert await _pause_until(pilot, lambda: loaded(2), seconds=15)
+        gpu = screen._resource_kind_data()
+        assert gpu.fresh("10m") and not gpu.fresh("30m"), "the refresh built windows that aren't shown"
+
+        held = DownloadLock(screen._metrics_root)  # holds the rebuild off, as a download in flight would
+        assert held.try_acquire()
+        await pilot.press("w")  # to 30m: shown as it last was, then rebuilt from the rows in hand
+        await pilot.pause(0.2)
+        assert screen._resource_range == "30m"
+        assert screen._resource_kind_data().view("30m") is not None, "the window picked showed nothing meanwhile"
+        assert screen._resource_state(screen._resource_kind_data()) == ("refreshing…",), \
+            "a window as it last was did not say so"
+        held.release()
+        assert await _pause_until(pilot, lambda: screen._resource_kind_data().fresh("30m"), seconds=15), \
+            "the window picked was never rebuilt"
+        assert c.download_metrics.call_count == 2, "picking a window downloaded"
+        assert screen._resource_state(screen._resource_kind_data()) == (), "still says it is refreshing"
+        whole = resource_module.ResourceLoader(screen._metrics_root).load().kinds["7:training:0"]["gpu"]
+        assert _same(screen._resource_kind_data().view("30m"), whole.view("30m"))
+        # A rebuild that answers after a newer load (a refresh's) must not put its older rows back.
+        current = screen._resource_data
+        screen._accept_rebuilt_window(resource_module.ResourceData({}), resource_module.resource_loader(screen._metrics_root))
+        assert screen._resource_data is current, "an older rebuild replaced newer rows"
+
+        failures = ["rebuild broke"]
+
+        def broken(self, **kwargs):
+            if kwargs.get("shown") == "1h":
+                raise RuntimeError(failures[0])
+            return real_load(self, **kwargs)
+
+        real_load = resource_module.ResourceLoader.load
+        monkeypatch.setattr(resource_module.ResourceLoader, "load", broken)
+        header = lambda: str(screen.query_one("#resource-status", Static).render())  # noqa: E731
+        await pilot.press("w")  # to 1h: its rebuild fails
+        assert await _pause_until(pilot, lambda: "rebuild broke" in _error_log_text(widgets_module), seconds=10)
+        assert await _pause_until(pilot, lambda: "refresh failed: RuntimeError: rebuild broke" in header(),
+                                  seconds=10), header()
+        assert app.is_running and screen._resource_range == "1h", "a failed rebuild took the app down"
+        assert "refreshing…" not in header(), "a failed rebuild still says it is refreshing"
+        # Picking the window again is another try: refreshing… until it answers, then what it found.
+        assert held.try_acquire()
+        for _ in range(len(RANGES)):  # once round, back to 1h
+            await pilot.press("w")
+        await pilot.pause(0.2)
+        assert screen._resource_range == "1h"
+        assert screen._resource_state(screen._resource_kind_data()) == ("refreshing…",), header()
+        held.release()
+        assert await _pause_until(pilot, lambda: "refresh failed: RuntimeError: rebuild broke" in header(),
+                                  seconds=10), header()
+        # A refresh whose loads fail too: once it is over, the header names that newer failure.
+        failures[0] = "the load broke too"
+        await pilot.press("r")
+        assert await _pause_until(pilot, lambda: not screen._resource_loading
+                                  and "the load broke too" in (screen._resource_error or ""), seconds=15)
+        assert "refresh failed: RuntimeError: the load broke too" in header(), header()
+        assert "refreshing…" not in header(), header()
+        # Once the window can be built, the next refresh builds it, and nothing failed.
+        monkeypatch.setattr(resource_module.ResourceLoader, "load", real_load)
+        await pilot.press("r")
+        assert await _pause_until(pilot, lambda: not screen._resource_loading and screen._resource_error is None
+                                  and screen._resource_kind_data().fresh("1h"), seconds=15)
+        assert "failed" not in header() and "refreshing…" not in header(), header()
+        await _settle(app, pilot)
+
+
+async def _run_a_window_picked_while_a_refresh_builds(monkeypatch):
+    import cortex_training.tui.resource as resource_module
+
+    start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=2)
+    c = _client()
+    c.download_metrics.side_effect = _extending_download(start)
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
+    async with app.run_test(size=(140, 40)) as pilot:
+        assert await _pause_until(pilot, lambda: isinstance(app.screen, LogScreen) and app.screen._current_source)
+        screen = app.screen
+        screen.query_one("#job-tabs", TabbedContent).active = "resource"
+        assert await _pause_until(pilot, lambda: c.download_metrics.call_count >= 1 and not screen._resource_loading
+                                  and screen._resource_kind_data(), seconds=15)
+        assert screen._resource_kind_data().fresh("30m"), "a first open builds every window"
+        entered, release = threading.Event(), threading.Event()
+        real_load = resource_module.ResourceLoader.load
+
+        def held(self, **kwargs):
+            # The refresh's load after its download, building the 10m window it was asked for.
+            if kwargs.get("shown") == "10m" and c.download_metrics.call_count >= 2 and not entered.is_set():
+                entered.set()
+                assert release.wait(10)
+            return real_load(self, **kwargs)
+
+        monkeypatch.setattr(resource_module.ResourceLoader, "load", held)
+        await pilot.press("r")
+        assert await _pause_until(pilot, entered.is_set, seconds=15), "the refresh never loaded"
+        await pilot.press("w")  # to 30m, fresh on screen still: nothing to rebuild yet
+        await pilot.pause(0.1)
+        assert screen._resource_range == "30m"
+        release.set()
+        assert await _pause_until(pilot, lambda: not screen._resource_loading
+                                  and screen._resource_kind_data().fresh("30m"), seconds=15), \
+            "the window picked during the refresh was left as of its last showing"
+        assert screen._resource_state(screen._resource_kind_data()) == (), "still says it is refreshing"
+        assert c.download_metrics.call_count == 2, "rebuilding the window downloaded"
+        await _settle(app, pilot)
+
+
+def test_a_window_picked_while_a_refresh_builds_is_rebuilt_once_it_lands(monkeypatch):
+    asyncio.run(_run_a_window_picked_while_a_refresh_builds(monkeypatch))
+
+
+def _error_log_text(widgets_module) -> str:
+    path = Path(widgets_module._ERROR_LOG)
+    return path.read_text() if path.exists() else ""
+
+
+def test_a_window_picked_after_a_refresh_is_rebuilt_without_a_download(tmp_path, monkeypatch):
+    asyncio.run(_run_a_window_picked_after_a_refresh(tmp_path, monkeypatch))
+
+
+async def _run_a_search_with_no_match_on_a_cut_list(c):
+    app = CortexTrainingLogTUI(c, poll_interval=0.01)
+    async with app.run_test(size=(160, 40)) as pilot:
+        assert await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen) and app.screen._job_by_item,
+                           tries=400)
+        await pilot.press("slash", *"zzz-no-such-job", "enter")
+        assert await _wait(pilot, app, lambda: app.screen._nomatch, tries=200)
+        assert "f searches all 2,500 jobs of the schema." in app.screen._nomatch, app.screen._nomatch
+        await _settle(app, pilot)
+
+
+def test_a_search_with_no_match_on_a_cut_list_says_f_searches_them_all():
+    now = datetime.now(timezone.utc)
+    c = _client()
+    c.list_jobs.return_value = [{"job_id": f"j{i}", "status": "SUCCEEDED",
+                                 "created_at": (now - timedelta(minutes=i)).isoformat()} for i in range(2_500)]
+    asyncio.run(_run_a_search_with_no_match_on_a_cut_list(c))

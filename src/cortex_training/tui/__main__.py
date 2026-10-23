@@ -24,8 +24,7 @@ import re
 from pathlib import Path
 
 _CONNECT_HINT = ("to connect, run 'cortex-training login config.json', set CORTEX_TRAINING_CONFIG, pass "
-                 "--config config.json, --connection NAME, --base-url (local/mock), or --host + --pat; "
-                 "or try the TUI without a connection: --debug")
+                 "--config config.json, --connection NAME, --base-url (local/mock), or --host + --pat")
 # Bounds for every TUI read.
 READ_MAX_RETRIES = 2
 READ_TIMEOUT = (10.0, 45.0)
@@ -123,11 +122,6 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
     )
     p.add_argument("--no-verify-ssl", action="store_true",
                    help="Disable SSL certificate verification for authenticated requests.")
-    p.add_argument(
-        "--debug",
-        action="store_true",
-        help="Run the TUI on synthetic jobs and telemetry, with no connection (to try it or debug it).",
-    )
     return p
 
 
@@ -150,9 +144,29 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
         parser.exit(2, f"{parser.prog}: error: the TUI couldn't load ({exc}); reinstall cortex-training, "
                        f"or pip install --upgrade '{_TEXTUAL_REQUIREMENT}'\n")
 
-    if args.debug:
-        return _run_demo(args, CortexTrainingLogTUI)
+    # --poll-interval paces the TUI's log polls only. The client's own poll interval
+    # is for waiting on an asynchronous result, which the TUI never does, and it
+    # refuses more than 6 s: it keeps the default, so a slow --poll-interval works.
+    log_poll_interval, args.poll_interval = args.poll_interval, parser.get_default("poll_interval")
+    client, sign_in = _build_read_only_client(parser, args)
 
+    # job_id is optional: given, open that job's details; omitted, open the job
+    # list so the user can choose one.
+    app = CortexTrainingLogTUI(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=log_poll_interval)
+    app.sign_in = sign_in  # for the commands the TUI shows to copy
+    app.run()
+    return app.return_code or 0  # non-zero when the app stopped on an unhandled error
+
+
+def _build_read_only_client(parser: argparse.ArgumentParser, args: argparse.Namespace):
+    """The TUI's client for ``args`` (from :func:`_build_arg_parser`, resolved in place
+    as the CLI resolves them), and how it signs in (``CortexTrainingLogTUI.sign_in``).
+
+    Its reads are bounded and its calls tagged as the TUI's. Whatever keeps it from
+    connecting (a config it can't use, no database, no connection) exits with one of
+    ``parser``'s error lines, not a traceback. ``scripts/tui_screenshot.py`` builds
+    its client here too, so the two stay the same.
+    """
     import cortex_training._cli as cli
 
     # Reuse the CLI's resolution: --config / login state / env / defaults.
@@ -189,10 +203,6 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     args.max_retries, args.request_timeout = READ_MAX_RETRIES, READ_TIMEOUT
     from cortex_training.snowflake_auth import SnowflakeProfileError
 
-    # --poll-interval paces the TUI's log polls only. The client's own poll interval
-    # is for waiting on an asynchronous result, which the TUI never does, and it
-    # refuses more than 6 s: it keeps the default, so a slow --poll-interval works.
-    log_poll_interval, args.poll_interval = args.poll_interval, parser.get_default("poll_interval")
     try:
         client = cli.build_client(args, cli._load_cortex_training_client_class())
     except (SnowflakeProfileError, ValueError) as exc:
@@ -204,13 +214,7 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
     from cortex_training.client import TUI_SURFACE
 
     client._telemetry_surface = TUI_SURFACE
-
-    # job_id is optional: given, open that job's details; omitted, open the job
-    # list so the user can choose one.
-    app = CortexTrainingLogTUI(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=log_poll_interval)
-    app.sign_in = _sign_in(cli, args, from_config)  # for the commands the TUI shows to copy
-    app.run()
-    return app.return_code or 0  # non-zero when the app stopped on an unhandled error
+    return client, _sign_in(cli, args, from_config)
 
 
 def _sign_in(cli, args, from_config: dict) -> dict:
@@ -237,30 +241,6 @@ def _config_connection(cli, values: dict) -> dict:
     if base_url and not cli._has_url_scheme(base_url) and host is None:
         base_url, host = None, base_url  # the CLI reads a base URL without a scheme as the PAT host
     return {"base_url": base_url, "host": cli._normalize_host(host) if host else None}
-
-
-def _run_demo(args, app_class, *, account_list: str | None = None) -> int:
-    """Run against :class:`~cortex_training.tui.demo.DemoClient` with throwaway local stores."""
-    import tempfile
-
-    from cortex_training.tui.demo import DemoClient
-
-    previous = os.environ.get("CORTEX_TRAINING_TUI_CACHE_DIR")
-    with tempfile.TemporaryDirectory(prefix="cortex-training-demo-") as cache:
-        # Demo caches must never land in the real cache dir.
-        os.environ["CORTEX_TRAINING_TUI_CACHE_DIR"] = cache
-        try:
-            client = DemoClient(account_list=account_list)
-            app = app_class(client, args.job_id, sub_job_id=args.sub_job_id, poll_interval=args.poll_interval)
-            app.title = "cortex training (debug)"  # synthetic jobs: say so on every screen
-            app.run()
-        finally:
-            # In-process callers (and tests) must not keep pointing at the deleted dir.
-            if previous is None:
-                os.environ.pop("CORTEX_TRAINING_TUI_CACHE_DIR", None)
-            else:
-                os.environ["CORTEX_TRAINING_TUI_CACHE_DIR"] = previous
-    return app.return_code or 0
 
 
 if __name__ == "__main__":

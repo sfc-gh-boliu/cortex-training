@@ -11,5 +11,6 @@ These JSON files demonstrate individual Cortex Training request bodies:
 | `fwd-bwd.json` | Submit a readable forward/backward batch |
 | `generate.json` | Submit prompts for generation |
 | `glm-sampling.json` | Create a 16-GPU GLM-5.2-FP8 sampling sub-job with a 1M-token context and an FP8 MLA KV cache |
+| `model-deployment-checkpoint.json` | Create an evaluation model deployment from a weights-only checkpoint (`cortex-training model-deployment create --spec`; not a CreateJob body) |
 
 They are wire-format examples, not end-to-end training recipes.

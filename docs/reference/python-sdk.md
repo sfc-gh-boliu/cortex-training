@@ -8,34 +8,68 @@ from cortex_training import CortexTrainingClient, SubJobConfig, JobType
 client: every data-plane call returns a `request_id` that you poll, and results
 are whatever the backend returns.
 
-Construct it with a named Snowflake connection profile:
+Construct it with `from_configs()`, which uses your Snowflake connection
+profile:
 
 ```python
-client = CortexTrainingClient.from_connection_name("training")
+client = CortexTrainingClient.from_configs()                # pick the profile as below
+client = CortexTrainingClient.from_configs(connection="training")
 ```
 
-Pass no name to use the Connector-configured default profile. The profile's
-database and schema are used unless explicitly overridden. The client shares
-the profile's live Snowflake session token with REST and telemetry calls,
-reconnecting once when the API reports token expiry.
+`from_configs(connection=None, *, database=None, schema=None, **kwargs)`
+picks, first match wins:
 
-Direct Programmatic Access Token construction remains supported:
+- **Profile:** `connection`; then `"profile"` in `config.json`; then the
+  Snowflake default profile. `CORTEX_TRAINING_HOST` and `CORTEX_TRAINING_PAT`
+  are used only when no Snowflake profile exists, for CI; when a profile is used
+  they are ignored and a warning says so.
+- **Database:** `database`; then `CORTEX_TRAINING_DATABASE` (logged when used);
+  then the profile's database; then `CORTEX_TRAINING_DB`.
+- **Schema:** `schema`; then `CORTEX_TRAINING_SCHEMA`; then the profile's
+  schema; then `PUBLIC`.
 
-```python
-client = CortexTrainingClient.from_pat(
-    host="ACCOUNT.snowflakecomputing.com",
-    pat=PAT,
-    database="CORTEX_TRAINING_DB",
-    schema="PUBLIC",
-)
+It logs one line naming the target and where each part came from, for example
+`profile training (saved in ~/.snowflake/cortex-training/config.json), db TRAIN_DB (from profile training), schema PUBLIC (default)`.
+The client shares the profile's live Snowflake session token with REST and
+telemetry calls, reconnecting once when the API reports token expiry.
+
+`config.json` holds one key, the name of the Snowflake connection profile to
+use:
+
+```json
+{"profile": "training"}
 ```
+
+It lives in the Snowflake folder the profiles come from,
+`<Snowflake folder>/cortex-training/config.json`: `$SNOWFLAKE_HOME` if that
+folder exists, else `~/.snowflake`, else the platform's config folder. So
+`SNOWFLAKE_HOME` moves the profiles and `config.json` together. A missing file
+is fine: the Snowflake default profile is used. Any other key is rejected:
+credentials and the database belong in the Snowflake profile, and settings such
+as `poll_interval` or `verify_ssl` are keyword arguments to `from_configs()`,
+which go to the constructor.
+
+These fail with an error that says what's wrong:
+
+- A profile name that doesn't exist (passed in, saved in `config.json`, or the
+  Snowflake default from `SNOWFLAKE_DEFAULT_CONNECTION_NAME` or
+  `default_connection_name`) names where the name came from and lists the
+  profiles that exist.
+- A profile that can't sign in names the profile and where it came from.
+- `CORTEX_TRAINING_HOST` may include `https://` and a trailing `/`. Anything
+  else that isn't an account host, such as `ACCOUNT.snowflakecomputing.com`
+  (with an optional `:port`), is rejected.
+
+`from_connection_name()` and `from_pat()` still work but are deprecated: each
+emits a `FutureWarning` and will be removed in a future release. Use
+`from_configs()` instead.
 
 Tuning knobs on the constructor: `endpoint`, `poll_interval` (0.5s),
 `poll_timeout` (1800s), `poll_backoff_multiplier` (1.25), `poll_max_interval`
 (6s), `pool_maxsize` (1024), `max_retries` (10), and `request_timeout`
 (`(30s connect, 600s read)`). Pass a positive scalar to use the same connect
-and read timeout, or a `(connect, read)` pair. `from_connection_name` and
-`from_pat` also accept `telemetry_timeout` (3s) for best-effort client metrics.
+and read timeout, or a `(connect, read)` pair. `from_configs` also accepts
+`telemetry_timeout` (3s) for best-effort client metrics.
 
 The client never creates a database. A request that fails because the
 database or schema in its URL can't be found (HTTP 400, code `517602`) raises

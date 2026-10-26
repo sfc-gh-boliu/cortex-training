@@ -99,6 +99,7 @@ from cortex_training.client import _account_jobs
 from cortex_training.client._account_jobs import AccountJobListUnavailable  # noqa: F401 - exported
 from cortex_training.client._account_jobs import InvalidPageToken  # noqa: F401 - exported
 from cortex_training.client.auth import SnowflakeProfileAuth
+from cortex_training.client.auth import SnowflakeProfileError
 from cortex_training.client.auth import SnowflakeTelemetryTokenProvider
 from cortex_training.client.auth import rest_host
 from cortex_training.client.optimizer import normalize_optimizer_config
@@ -2413,24 +2414,25 @@ def _validate_artifact_relative_path(path: str) -> str:
     return path
 
 
+def _deprecated_constructor(name: str) -> str:
+    return (
+        f"CortexTrainingClient.{name}() is deprecated and will be removed in a future "
+        "release. Use CortexTrainingClient.from_configs(), which reads your Snowflake "
+        "connection profile; see docs/reference/python-sdk.md."
+    )
+
+
 # ─── HTTP client ─────────────────────────────────────────────────────────
 
 
 class CortexTrainingClient:
     """HTTP client for the Cortex Training REST API (``cortex-training``).
 
-    Construct with a named Snowflake connection profile::
+    Construct with :meth:`from_configs`, which uses your Snowflake connection
+    profile::
 
-        client = CortexTrainingClient.from_connection_name("training")
-
-    Direct PAT authentication remains available through :meth:`from_pat`::
-
-        client = CortexTrainingClient.from_pat(
-            host="ACCOUNT.snowflakecomputing.com",
-            pat="...",
-            database="CORTEX_TRAINING_DB",
-            schema="PUBLIC",
-        )
+        client = CortexTrainingClient.from_configs()  # default profile
+        client = CortexTrainingClient.from_configs(connection="training")
 
     Against a local or otherwise compatible server, construct the client
     directly with an explicit ``base_url``; this skips PAT auth::
@@ -2582,7 +2584,65 @@ class CortexTrainingClient:
                 kept.close()
 
     @classmethod
-    def from_pat(
+    def from_configs(
+        cls,
+        connection: str | None = None,
+        *,
+        database: str | None = None,
+        schema: str | None = None,
+        **kwargs: Any,
+    ) -> "CortexTrainingClient":
+        """Create a client from your Snowflake connection profile.
+
+        The profile is ``connection``, else ``"profile"`` in
+        ``<Snowflake folder>/cortex-training/config.json`` (by default
+        ``~/.snowflake/cortex-training/config.json``), else the Snowflake
+        default profile. ``CORTEX_TRAINING_HOST`` and ``CORTEX_TRAINING_PAT``
+        are used only when no profile exists (CI). The database is
+        ``database``, else ``CORTEX_TRAINING_DATABASE``, else the profile's
+        database, else ``CORTEX_TRAINING_DB``; the schema follows the same order
+        and defaults to ``PUBLIC``. Other keyword arguments (``poll_interval``,
+        ``verify_ssl``, ...) go to the constructor.
+        """
+        from cortex_training import _picker
+
+        resolution = _picker.resolve(connection=connection, database=database, schema=schema)
+        logger.info("Cortex Training target: %s", resolution.describe())
+        if resolution.profile is None:
+            return cls._from_pat(
+                host=resolution.host,
+                pat=resolution.pat,
+                database=resolution.database,
+                schema=resolution.schema,
+                **kwargs,
+            )
+        try:
+            return cls._from_profile(
+                resolution.profile,
+                database=resolution.database,
+                schema=resolution.schema,
+                **kwargs,
+            )
+        except SnowflakeProfileError as exc:
+            raise SnowflakeProfileError(
+                f"{exc}\nProfile {resolution.profile!r} was used because it was {resolution.sources['profile']}. "
+                f"{_picker._PICK_ANOTHER}"
+            ) from exc
+
+    @classmethod
+    def from_pat(cls, *args: Any, **kwargs: Any) -> "CortexTrainingClient":
+        """Deprecated: use :meth:`from_configs`. Same arguments as before (``host``, ``pat``, ...)."""
+        warnings.warn(_deprecated_constructor("from_pat"), FutureWarning, stacklevel=2)
+        return cls._from_pat(*args, **kwargs)
+
+    @classmethod
+    def from_connection_name(cls, *args: Any, **kwargs: Any) -> "CortexTrainingClient":
+        """Deprecated: use :meth:`from_configs`. Same arguments as before (``connection_name``, ...)."""
+        warnings.warn(_deprecated_constructor("from_connection_name"), FutureWarning, stacklevel=2)
+        return cls._from_profile(*args, **kwargs)
+
+    @classmethod
+    def _from_pat(
         cls,
         host: str,
         pat: str,
@@ -2627,7 +2687,7 @@ class CortexTrainingClient:
         return client
 
     @classmethod
-    def from_connection_name(
+    def _from_profile(
         cls,
         connection_name: str | None = None,
         *,

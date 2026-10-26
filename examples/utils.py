@@ -138,7 +138,7 @@ def _legacy_json_connection(config_path: str, overrides: Mapping[str, Any]) -> R
     if pat is None:
         raise ValueError("no PAT found: put `pat` in the connection config")
     verify_ssl = bool(config.get("verify_ssl", True))
-    client = CortexTrainingClient.from_pat(host=host, pat=pat, verify_ssl=verify_ssl, **kwargs)
+    client = CortexTrainingClient._from_pat(host=host, pat=pat, verify_ssl=verify_ssl, **kwargs)
     return ResolvedConnection(
         client=client,
         source="config file",

@@ -113,16 +113,8 @@ Reward below is the mean task reward over all rollouts
 
 ### SWE — Qwen3.5-4B, r2e-gym, grading policy
 
-| Step | Reward | Disqualified |
-|---|---|---|
-| 1 | 0.41 | 0.37 |
-| 10 | 0.40 | 0.39 |
-| 20 | 0.55 | 0.16 |
-| 30 | 0.68 | 0.03 |
-| 40 | 0.77 | 0.07 |
-| 60 | 0.82 | 0.04 |
-| 80 | 0.85 | 0.01 |
-| 100 | 0.84 | 0.02 |
+![SWE reward curve: mean task reward climbs from ~0.41 to a ~0.85-0.9 plateau while the
+grading-policy disqualified fraction falls from ~37% to ~2%](img/prime-rl-swe-reward.png)
 
 After a short warm-up the model stops emitting malformed tool calls — the
 disqualified fraction falls from ~37% to ~2% — and reward climbs from ~0.40 to
@@ -130,16 +122,8 @@ a ~0.85 plateau and holds there with no collapse.
 
 ### Math — Qwen3.5-4B, i3_math
 
-| Step | Reward |
-|---|---|
-| 1 | 0.21 |
-| 10 | 0.59 |
-| 20 | 0.63 |
-| 40 | 0.78 |
-| 60 | 0.89 |
-| 80 | 0.84 |
-| 100 | 0.85 |
-| 120 | 0.84 |
+![Math reward curve: mean task reward climbs from ~0.21 to a high ~0.85-0.9 plateau over the
+first ~50-60 steps and holds there](img/prime-rl-math-reward.png)
 
 Reward climbs steadily from ~0.21 to a high ~0.85–0.9 plateau over the first
 ~50–60 steps and holds there, with no collapse. The difficulty filter keeps a

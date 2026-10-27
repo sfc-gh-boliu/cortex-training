@@ -2427,6 +2427,15 @@ def _deprecated_constructor(name: str) -> str:
 # ─── HTTP client ─────────────────────────────────────────────────────────
 
 
+def _sub_job_id_params(sub_job_id: str | None) -> dict[str, dict[str, str]]:
+    """``params=`` kwargs for a sub-job-addressed request, or nothing when unset.
+
+    The key is omitted rather than sent empty so a request without a sub_job_id is
+    byte-identical to one from a client that predates the parameter.
+    """
+    return {"params": {"sub_job_id": sub_job_id}} if sub_job_id else {}
+
+
 class CortexTrainingClient:
     """HTTP client for the Cortex Training REST API (``cortex-training``).
 
@@ -2510,7 +2519,8 @@ class CortexTrainingClient:
         # means the job was fetched but exposes no sampling max_seq_len (skip
         # validation); a missing key means it has not been resolved yet (e.g. a
         # transient get_job failure), so a later call will retry.
-        self._sampling_max_seq_len: dict[str, int | None] = {}
+        # Keyed on (job_id, sub_job_id); sub_job_id is None for the unaddressed case.
+        self._sampling_max_seq_len: dict[tuple[str, str | None], int | None] = {}
         self._artifact_connection_config: dict[str, str] | None = None
         self._artifact_connection_factory: Callable[[], Any] | None = None
         # Download sessions kept open for the next download (see keep_artifact_sessions), and
@@ -6087,6 +6097,7 @@ class CortexTrainingClient:
         sampling_params,
         routing_key,
         strict,
+        sub_job_id: str | None = None,
     ) -> bytes:
         """Encode a generate request body, for both the unary and stream calls.
 
@@ -6099,7 +6110,7 @@ class CortexTrainingClient:
 
         ``op`` only names the caller in the length-check error message.
         """
-        self._check_prompt_lengths(op, job_id, prompts)
+        self._check_prompt_lengths(op, job_id, prompts, sub_job_id)
         # Packed after validation so the check above still reads plain lists,
         # and so a rejected prompt is never converted for nothing.
         payload: dict = {"prompts": _pack_token_prompts(prompts)}
@@ -6125,39 +6136,69 @@ class CortexTrainingClient:
                 "bring the serialized request under the limit."
             )
 
-    def _resolve_sampling_max_seq_len(self, job_id: str) -> int | None:
-        """Return the sampling sub-job's ``max_seq_len``, or ``None`` if unknown.
+    def _resolve_sampling_max_seq_len(self, job_id: str, sub_job_id: str | None = None) -> int | None:
+        """Return a sampling sub-job's ``max_seq_len``, or ``None`` if unknown.
 
-        The value is read from the job's sampling ``inference_config`` (the same
-        number the backend launches vLLM with as ``max_model_len``) and cached
-        per ``job_id``. A successful lookup — including a definitive "no sampling
-        sub-job" miss — is cached; a transient ``get_job`` failure is not, so a
-        later call retries rather than disabling validation permanently.
+        The value is read from the sub-job's ``inference_config`` (the same number
+        the backend launches vLLM with as ``max_model_len``) and cached per
+        ``(job_id, sub_job_id)``. A successful lookup — including a definitive
+        "no sampling sub-job" miss — is cached; a transient ``get_job`` failure is
+        not, so a later call retries rather than disabling validation permanently.
+
+        ``sub_job_id`` selects one sub-job. Without it, the value is only resolved
+        when the job has exactly one sampling sub-job: guessing between several
+        risks rejecting a prompt the chosen zone would have accepted, so ``None``
+        (validation skipped) is returned instead and the server decides.
+
+        Only ``job_type == "sampling"`` sub-jobs are considered. ``log_prob``
+        sub-jobs also carry an ``inference_config``, and its window has no bearing
+        on where a generate request runs.
         """
-        if job_id in self._sampling_max_seq_len:
-            return self._sampling_max_seq_len[job_id]
+        cache_key = (job_id, sub_job_id)
+        if cache_key in self._sampling_max_seq_len:
+            return self._sampling_max_seq_len[cache_key]
         try:
             job = self.get_job(job_id)
         except Exception:
             # Don't let a transient lookup failure break generate, and don't
             # cache the miss — the real request will surface any hard error.
             return None
-        max_seq_len: int | None = None
-        for sub in job.get("sub_jobs", []) or []:
-            if not isinstance(sub, dict):
-                continue
+
+        def _window(sub: dict) -> int | None:
             cfg = sub.get("inference_config")
             if not isinstance(cfg, dict):
-                continue
+                return None
             raw = cfg.get("max_seq_len")
             # Proto numbers can arrive as floats (e.g. 2048.0); coerce to int.
             if isinstance(raw, (int, float)) and raw > 0:
-                max_seq_len = int(raw)
-                break
-        self._sampling_max_seq_len[job_id] = max_seq_len
+                return int(raw)
+            return None
+
+        # A sub-job record flattens its config into the record, so job_type sits at
+        # the top level. The REST schema accepts it case-insensitively, so normalise.
+        sampling = [
+            sub
+            for sub in (job.get("sub_jobs", []) or [])
+            if isinstance(sub, dict) and str(sub.get("job_type", "")).lower() == JobType.SAMPLING.value
+        ]
+        max_seq_len: int | None = None
+        if sub_job_id is not None:
+            for sub in sampling:
+                if sub.get("sub_job_id") == sub_job_id:
+                    max_seq_len = _window(sub)
+                    break
+        elif len(sampling) == 1:
+            max_seq_len = _window(sampling[0])
+        self._sampling_max_seq_len[cache_key] = max_seq_len
         return max_seq_len
 
-    def _check_prompt_lengths(self, op: str, job_id: str, prompts: list[str | list[int]]) -> None:
+    def _check_prompt_lengths(
+        self,
+        op: str,
+        job_id: str,
+        prompts: list[str | list[int]],
+        sub_job_id: str | None = None,
+    ) -> None:
         """Fail fast when a pre-tokenized prompt cannot fit the sampling window.
 
         Mirrors vLLM's decoder-prompt check (``vllm/v1/engine/input_processor``):
@@ -6193,7 +6234,7 @@ class CortexTrainingClient:
 
         if not any(_pretokenized(p) for p in prompts):
             return
-        max_seq_len = self._resolve_sampling_max_seq_len(job_id)
+        max_seq_len = self._resolve_sampling_max_seq_len(job_id, sub_job_id)
         if max_seq_len is None:
             return
         for i, prompt in enumerate(prompts):
@@ -6222,6 +6263,7 @@ class CortexTrainingClient:
         force_chunk: bool = False,
         allow_group_restart: bool = False,
         debug_context: dict[str, Any] | None = None,
+        sub_job_id: str | None = None,
     ) -> dict:
         chunks = wire.encode_byte_chunks(
             frame,
@@ -6247,6 +6289,7 @@ class CortexTrainingClient:
                     f"{self._prefix}/{job_id}/{path_suffix}",
                     data=chunk,
                     headers={"Content-Type": "application/octet-stream"},
+                    **_sub_job_id_params(sub_job_id),
                     retry_on=(_is_chunk_post_transient if allow_group_restart else _is_transient),
                     debug_context=debug_context,
                 )
@@ -6334,6 +6377,7 @@ class CortexTrainingClient:
         sampling_params: dict | list[dict | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool | None = None,
+        sub_job_id: str | None = None,
     ) -> str:
         """Submit a generate request to a sampling sub-job. Returns request_id.
 
@@ -6353,14 +6397,26 @@ class CortexTrainingClient:
           would require replicating the server tokenizer (including special
           tokens), so an over-long string instead fails server-side in vLLM
           with a ``maximum model length`` error rather than client-side.
+
+        Args:
+            sub_job_id: Optional. Which sampling sub-job runs the request, e.g.
+                ``"{job_id}:sampling:1"``; discover the ids from
+                :meth:`get_job`'s ``sub_jobs``. Sent as a query parameter, since
+                the body is an opaque frame. If omitted, no ``sub_job_id`` is
+                sent and the server chooses the sub-job; currently that is the
+                job's only sampling sub-job, and a job with several rejects the
+                request and lists the valid ids.
         """
-        body = self._build_generate_frame("generate", job_id, prompts, sampling_params, routing_key, strict)
+        body = self._build_generate_frame(
+            "generate", job_id, prompts, sampling_params, routing_key, strict, sub_job_id
+        )
         response = self._post_octet_request_chunks(
             job_id=job_id,
             path_suffix="generate",
             operation="generate",
             frame=body,
             max_bytes=self._MAX_GENERATE_BYTES,
+            sub_job_id=sub_job_id,
         )
         request_id = response["request_id"]
         self._generate_request_ids.add(request_id)
@@ -6374,6 +6430,7 @@ class CortexTrainingClient:
         sampling_params: dict | list[dict | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool | None = None,
+        sub_job_id: str | None = None,
     ) -> dict:
         """Start a streaming generate request. Returns the response body.
 
@@ -6389,14 +6446,21 @@ class CortexTrainingClient:
         prompts are checked client-side against the sampling sub-job's
         ``max_seq_len`` and fail fast, while over-long string prompts are left
         to fail server-side in vLLM (see :meth:`generate`).
+
+        Args:
+            sub_job_id: Optional. Which sampling sub-job runs the request; see
+                :meth:`generate` for the format and when it may be omitted.
         """
-        body = self._build_generate_frame("generate_stream", job_id, prompts, sampling_params, routing_key, strict)
+        body = self._build_generate_frame(
+            "generate_stream", job_id, prompts, sampling_params, routing_key, strict, sub_job_id
+        )
         self._check_generate_payload("generate_stream", body)
         resp = self._send(
             "POST",
             f"{self._prefix}/{job_id}/generate-stream",
             data=body,
             headers={"Content-Type": "application/octet-stream"},
+            **_sub_job_id_params(sub_job_id),
         )
         return resp.json()
 

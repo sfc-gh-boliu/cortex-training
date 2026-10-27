@@ -262,7 +262,7 @@ supported`. The short alias `log_prob` is rejected the same way.
 |---|---|---|
 | `forward_backward(job_id, data)` | `request_id` | `data` is a DSSST1 frame; always chunk-wrapped |
 | `step(job_id, learning_rate=None)` | `request_id` | Omitting the rate uses the job's optimizer setting |
-| `generate(job_id, prompts, sampling_params=None, routing_key=None, strict=None)` | `request_id` | Pre-tokenized prompts are length-checked client-side |
+| `generate(job_id, prompts, sampling_params=None, routing_key=None, strict=None, sub_job_id=None)` | `request_id` | Pre-tokenized prompts are length-checked client-side; `sub_job_id` picks the sampling sub-job when a job has several |
 | `generate_stream(...)` | response dict | Same DSSST1 body encoding as `generate`, sent in one POST; read progress with `get_request_status` |
 | `weight_sync(job_id, source_sub_job_id, target_sub_job_ids, weight_format=None)` | `request_id` | `weight_format="lora"` syncs adapters only |
 | `forward(job_id, payload, ...)` | response dict | Byte frames that exceed the `/operation` JSON ceiling are request-chunked; see [rest-api.md section 7.1](rest-api.md#71-forward) |

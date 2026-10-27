@@ -190,6 +190,10 @@ _GPU_METRICS_CHUNK_RE = re.compile(
 _TRAINING_METRICS_CHUNK_RE = re.compile(
     r"^training\.(?P<timestamp>\d{8}-\d{6})\.(?P<suffix>[^./\\]+)\.gz$"
 )
+# A sub-job id that can be listed under its own prefix (see _scoped_sub_jobs): a
+# LIST path is taken literally (``%3A`` does not mean ``:``), and an id with other
+# characters is listed with the rest of its root instead.
+_SCOPED_LIST_SUB_JOB_RE = re.compile(r"[A-Za-z0-9_.:-]+")
 _STREAM_COPY_BUFFER_BYTES = 1024 * 1024
 # How long a chunked download whose first listing failed waits for its other listing, which
 # runs on the same session, before that session is closed (never kept) under it.
@@ -2515,6 +2519,11 @@ class CortexTrainingClient:
         self._kept_sessions: _artifact_download.KeptSessions | None = None
         self._experiment_runs: OrderedDict[str, tuple[str, str]] = OrderedDict()
         self._experiment_runs_lock = threading.Lock()
+        # (run URI, job id, stream's chunk pattern, sub-job id) -> the one root a listing of both
+        # found the sub-job's chunks of that stream under, and when (monotonic); see
+        # _list_gzip_chunks. for_job() children share it too.
+        self._artifact_roots_seen: OrderedDict[tuple[str, str, str, str], tuple[str, float]] = OrderedDict()
+        self._artifact_roots_lock = threading.Lock()
         self._auth_provider: SnowflakeProfileAuth | None = None
         # job_id -> monotonic time this client created it (see _definitive_not_found).
         self._recently_created_jobs: dict[str, float] = {}
@@ -3761,6 +3770,8 @@ class CortexTrainingClient:
         client._kept_sessions = self._kept_sessions
         client._experiment_runs = self._experiment_runs
         client._experiment_runs_lock = self._experiment_runs_lock
+        client._artifact_roots_seen = self._artifact_roots_seen
+        client._artifact_roots_lock = self._artifact_roots_lock
         return client
 
     @_track_operation("cancel_job")
@@ -3985,11 +3996,13 @@ class CortexTrainingClient:
         run_uri: str,
         run_name: str,
         artifact_root: str,
+        *,
+        within: str | None = None,
     ) -> list[str]:
         """List safe run-relative file paths below ``artifact_root``."""
         return sorted(
             CortexTrainingClient._list_experiment_artifact_files(
-                connection, run_uri, run_name, artifact_root
+                connection, run_uri, run_name, artifact_root, within=within
             )
         )
 
@@ -3999,12 +4012,20 @@ class CortexTrainingClient:
         run_uri: str,
         run_name: str,
         artifact_root: str,
+        *,
+        within: str | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Map each safe run-relative path below ``artifact_root`` to what LIST
         reported about it: ``size``, ``md5`` and ``last_modified`` (``None``
-        when a column is missing)."""
+        when a column is missing).
+
+        A file outside ``artifact_root`` is an error, unless ``within`` (an
+        ancestor of ``artifact_root``) is given and holds it: such a file is left
+        out, as from a LIST that matched ``artifact_root`` without its final ``/``.
+        """
         root = artifact_root.strip("/") + "/"
         _validate_artifact_relative_path(root.removesuffix("/"))
+        allowed = root if within is None else within.strip("/") + "/"
         cursor = connection.cursor()
         try:
             rows = cursor.execute(
@@ -4024,11 +4045,13 @@ class CortexTrainingClient:
             relative_path = _validate_artifact_relative_path(
                 name.removeprefix(run_prefix)
             )
-            if not relative_path.startswith(root):
+            if not relative_path.startswith(allowed):
                 raise ValueError(
                     "experiment artifact LIST returned a file outside the "
-                    f"requested root {root!r}: {relative_path!r}"
+                    f"requested root {allowed!r}: {relative_path!r}"
                 )
+            if not relative_path.startswith(root):
+                continue
             # LIST columns: name, size, md5, last_modified.
             size = row[1] if len(row) > 1 and isinstance(row[1], int) and not isinstance(row[1], bool) else None
             files[relative_path] = {
@@ -5015,6 +5038,65 @@ class CortexTrainingClient:
                 raise
         return results
 
+    @staticmethod
+    def _scoped_sub_jobs(job_id: str, sub_job_ids: Iterable[str] | None) -> list[str] | None:
+        """The sub-job to list under its own prefix (a list of at most one), or None to list each root whole.
+
+        A named id that is not one of the job's sub-jobs has no chunks, so it is not
+        listed: an empty list means there is nothing to list. A LIST costs the service
+        a listing of the whole run whatever its prefix, so several named sub-jobs are
+        listed with the rest of their root, in one LIST, rather than one apiece;
+        so is one with characters _SCOPED_LIST_SUB_JOB_RE leaves out. The id is
+        returned as a plain ``str``: a subclass's (such as a ``str`` Enum member's)
+        own formatting would name another directory.
+        """
+        if sub_job_ids is None:
+            return None
+        scoped = sorted(
+            {
+                str.__str__(sub_job_id)
+                for sub_job_id in sub_job_ids
+                if isinstance(sub_job_id, str)
+                and sub_job_id not in {"", ".", ".."}
+                and (sub_job_id == job_id or sub_job_id.startswith(f"{job_id}:"))
+                and "/" not in sub_job_id
+                and "\\" not in sub_job_id
+            }
+        )
+        if len(scoped) > 1 or (scoped and _SCOPED_LIST_SUB_JOB_RE.fullmatch(scoped[0]) is None):
+            return None
+        return scoped
+
+    # A sub-job's root is looked up again, by listing both, once it is this old: this bounds
+    # how long chunks it starts saving under the other root go unseen.
+    _ARTIFACT_ROOT_RECHECK_SECONDS = 600.0
+    # Sub-jobs whose root is kept; the one noted longest ago is forgotten first.
+    _ARTIFACT_ROOTS_KEPT = 1024
+
+    def _known_artifact_root(self, key: tuple[str, str, str, str]) -> str | None:
+        """The one root a recent listing of both found the sub-job's chunks of the stream under."""
+        with self._artifact_roots_lock:
+            seen = self._artifact_roots_seen.get(key)
+        if seen is None or time.monotonic() - seen[1] >= self._ARTIFACT_ROOT_RECHECK_SECONDS:
+            return None
+        return seen[0]
+
+    def _note_artifact_roots(
+        self, run_uri: str, job_id: str, stream: str, by_root: Mapping[str, Mapping[str, Any]]
+    ) -> None:
+        """Remember each sub-job's root from a listing of both: the one holding its chunks of the
+        stream, if just one does. One with chunks under both is listed under both from then on."""
+        now = time.monotonic()
+        with self._artifact_roots_lock:
+            seen = self._artifact_roots_seen
+            for sub_job_id, roots in by_root.items():
+                key = (run_uri, job_id, stream, sub_job_id)
+                seen.pop(key, None)
+                if len(roots) == 1:
+                    seen[key] = (next(iter(roots)), now)
+            while len(seen) > self._ARTIFACT_ROOTS_KEPT:
+                seen.popitem(last=False)
+
     def _list_gzip_chunks(
         self,
         shared: _artifact_download.SharedConnection,
@@ -5024,6 +5106,7 @@ class CortexTrainingClient:
         artifact_name: str,
         chunk_pattern: re.Pattern[str],
         *,
+        sub_job_ids: Iterable[str] | None = None,
         report_merges: bool = True,
         cancel: threading.Event | None = None,
     ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
@@ -5034,38 +5117,61 @@ class CortexTrainingClient:
         chunks under both, they are merged by chunk name (which starts with the
         chunk's time), and a chunk name present in both keeps the
         ``_<name>/`` copy, so no output is dropped or repeated.
+
+        With ``sub_job_ids`` naming one of the job's sub-jobs, only it is listed,
+        under ``<root>/<sub_job_id>/`` (see :meth:`_scoped_sub_jobs`), so a LIST
+        returns its files rather than the whole run's, and only it is returned;
+        naming none of them lists nothing. While a recent listing of both found all
+        of that sub-job's chunks of this stream (those ``chunk_pattern`` matches)
+        under one root, only that root is listed, and the other too when that one
+        now holds none of them.
         """
         policy = self._artifact_retry_policy
         artifact_roots = (f"_{artifact_name}", f"checkpoints/_{artifact_name}")
+        scoped = self._scoped_sub_jobs(job_id, sub_job_ids)
+        if scoped == []:
+            return {}, {}
+        # The GPU and training streams share each root's directories, so each stream's root is
+        # remembered apart.
+        stream = chunk_pattern.pattern
+        known = (
+            None
+            if scoped is None
+            else self._known_artifact_root((run_uri, job_id, stream, scoped[0]))
+        )
 
         def listed(artifact_root: str) -> list[str]:
+            location = artifact_root if scoped is None else f"{artifact_root}/{scoped[0]}"
             return _artifact_download.call_with_retry(
                 shared,
                 policy,
-                f"LIST {artifact_root}",
+                f"LIST {location}",
                 lambda connection: self._list_experiment_artifacts(
-                    connection, run_uri, run_name, artifact_root
+                    connection, run_uri, run_name, location, within=artifact_root
                 ),
                 cancel,
             )
 
-        # Both at once, each on its own cursor: a LIST is mostly round-trip latency.
-        later = _artifact_download.Beside(
-            functools.partial(listed, artifact_roots[1]), name="cortex-training-list"
-        )
-        try:
-            first = listed(artifact_roots[0])
-        except BaseException:
-            # The other listing runs on this download's session, which the caller closes or
-            # keeps next: not under it. One still running after a while is left to finish on a
-            # session that is then closed, never kept.
-            if not later.wait(_SIDE_LISTING_WAIT_SECONDS):
-                shared.abandon()
-            raise
-        listings = {artifact_roots[0]: first, artifact_roots[1]: later.result()}
+        if known is None:
+            # Both at once, each on its own cursor: a LIST is mostly round-trip latency.
+            later = _artifact_download.Beside(
+                functools.partial(listed, artifact_roots[1]), name="cortex-training-list"
+            )
+            try:
+                first = listed(artifact_roots[0])
+            except BaseException:
+                # The other listing runs on this download's session, which the caller closes or
+                # keeps next: not under it. One still running after a while is left to finish on a
+                # session that is then closed, never kept.
+                if not later.wait(_SIDE_LISTING_WAIT_SECONDS):
+                    shared.abandon()
+                raise
+            listings = {artifact_roots[0]: first, artifact_roots[1]: later.result()}
+        else:
+            listings = {known: listed(known)}
         by_root: dict[str, dict[str, dict[str, str]]] = {}
-        for artifact_root in artifact_roots:
-            paths = listings[artifact_root]
+
+        def sort_in(artifact_root: str, paths: list[str]) -> None:
             prefix = artifact_root + "/"
             for relative_path in paths:
                 after_root = relative_path.removeprefix(prefix)
@@ -5085,6 +5191,20 @@ class CortexTrainingClient:
                 by_root.setdefault(sub_job_id, {}).setdefault(artifact_root, {})[
                     filename
                 ] = relative_path
+
+        for artifact_root, paths in listings.items():
+            sort_in(artifact_root, paths)
+        if known is not None and scoped[0] not in by_root:
+            # None of its chunks where they were: look under the other root before calling
+            # it empty.
+            other = next(root for root in artifact_roots if root != known)
+            sort_in(other, listed(other))
+            known = None
+        if known is None:
+            # A sub-job listed alone and found under neither root is forgotten: its next listing
+            # lists both at once.
+            noted = by_root if scoped is None else {scoped[0]: by_root.get(scoped[0], {})}
+            self._note_artifact_roots(run_uri, job_id, stream, noted)
 
         chunks: dict[str, list[str]] = {}
         warnings: dict[str, list[str]] = {}
@@ -5268,6 +5388,7 @@ class CortexTrainingClient:
                     job_id,
                     "stdout",
                     _STDOUT_CHUNK_RE,
+                    sub_job_ids=wanted,
                     report_merges=False,
                     cancel=cancel,
                 )
@@ -5332,7 +5453,8 @@ class CortexTrainingClient:
         """Explain each sub-job of an ended job that saved stdout but no metrics."""
         try:
             stdout_chunks, _ = self._list_gzip_chunks(
-                shared, run_uri, run_name, job_id, "stdout", _STDOUT_CHUNK_RE, report_merges=False
+                shared, run_uri, run_name, job_id, "stdout", _STDOUT_CHUNK_RE,
+                sub_job_ids=wanted, report_merges=False,
             )
         except Exception:
             logger.debug("stdout listing for missing-metrics warnings failed", exc_info=True)
@@ -5489,12 +5611,12 @@ class CortexTrainingClient:
         try:
             started = time.monotonic()
             chunks_by_sub_job, warnings_by_sub_job = self._list_gzip_chunks(
-                shared, run_uri, run_name, job_id, artifact_name, chunk_pattern
+                shared, run_uri, run_name, job_id, artifact_name, chunk_pattern, sub_job_ids=wanted
             )
             values["list_ms"] = round((time.monotonic() - started) * 1000, 3)
             # The stall check reads the job status (one REST call, plus a
-            # stdout listing for metrics); it runs while chunks are fetched so
-            # it adds no time to the download.
+            # stdout listing of the same sub-jobs for metrics); it runs while
+            # chunks are fetched so it adds no time to the download.
             stall_check = None
             if stale_after_seconds is not None:
                 stall_check = _artifact_download.Background(
@@ -5528,6 +5650,15 @@ class CortexTrainingClient:
                 missing = sorted(wanted - set(chunks_by_sub_job) - unsaved)
                 if missing:
                     available = sorted(chunks_by_sub_job)
+                    if self._scoped_sub_jobs(job_id, wanted) is not None:
+                        # The listing of one sub-job alone found only its chunks: the error names
+                        # every sub-job with some, from a listing of the whole job.
+                        relisted = time.monotonic()
+                        everyone, _ = self._list_gzip_chunks(
+                            shared, run_uri, run_name, job_id, artifact_name, chunk_pattern, report_merges=False
+                        )
+                        values["list_ms"] = round(values["list_ms"] + (time.monotonic() - relisted) * 1000, 3)
+                        available = sorted(set(everyone) - set(missing))
                     raise NoChunksError(
                         f"no {progress_label} chunks for sub-job(s) "
                         f"{', '.join(missing)}; sub-jobs with {progress_label}: "
@@ -5668,9 +5799,10 @@ class CortexTrainingClient:
         download, keeps the chunks already written for ``resume=True``, and is
         re-raised; raise :class:`DownloadCancelled` to cancel without the call
         being counted as a failure. The return value is unchanged.
-        ``sub_job_ids`` limits the download to those sub-jobs. A chunk that will
-        not decompress is downloaded once more and then skipped; it is listed in
-        that sub-job's ``skipped_chunks`` and ``warnings``. ``strict=True``
+        ``sub_job_ids`` limits the download to those sub-jobs; naming one also
+        limits the listing to its chunks rather than the whole run's. A chunk that
+        will not decompress is downloaded once more and then skipped; it is listed
+        in that sub-job's ``skipped_chunks`` and ``warnings``. ``strict=True``
         raises instead. While the job is running, a sub-job whose newest chunk is
         older than ``stale_after_seconds`` (default 600; ``None`` disables) gets
         a warning that uploads may be stalled; the download still completes.

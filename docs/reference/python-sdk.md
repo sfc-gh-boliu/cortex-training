@@ -93,8 +93,10 @@ moves, one every 6 seconds once it is quiet, and a few a second while it catches
 up. The job list sends one per page of 100 jobs each time it refreshes (every 60
 seconds while it is shown), and a live job's preview or details screen one
 `get_job` every 60 seconds. A live job's Resources or Training metrics tab
-downloads every 30 seconds while shown, and so does its Checkpoints tab's list,
-with one export per checkpoint whose files it reads (once per opening of the
+downloads every 30 seconds while shown (after its first download, only the
+sub-job it shows; a Training metrics tab with more than one sub-job, all of
+them), and so does its Checkpoints tab's list, with one export per
+checkpoint whose files it reads (once per opening of the
 job, up to 50 at a time) and one more per download. Set
 `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY=1` to emit successful outcomes for
 every operation, or `=0` to emit only failures for every operation, the TUI's
@@ -343,9 +345,10 @@ can open one file while the others download, and sub-jobs named in `priority`
 are downloaded first, in that order (the returned list stays in id order).
 These callbacks run on the calling thread; an error raised by any of them stops
 the download and keeps the chunks already written. Raise `cortex_training.DownloadCancelled` to stop
-without the call counting as a failure. `sub_job_ids` limits the download; an
-entry with no chunks raises `cortex_training.NoChunksError`, a `ValueError`. A
-damaged chunk is fetched once more and then skipped and listed in the entry's
+without the call counting as a failure. `sub_job_ids` limits the download (and,
+naming one sub-job, its listing too); an entry with no chunks raises
+`cortex_training.NoChunksError`, a `ValueError`. A damaged chunk is fetched
+once more and then skipped and listed in the entry's
 `skipped_chunks` and `warnings`; `strict=True` raises instead. While the job is
 running, a sub-job whose newest chunk is older than `stale_after_seconds` (or,
 for metrics, one with stdout but no metrics) gets a warning that uploads may be

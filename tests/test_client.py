@@ -5013,7 +5013,7 @@ class TestExecutionLogDownload:
                 self.connection.commands.append(statement)
                 if statement.startswith("LIST "):
                     uri = self._unquote(statement.removeprefix("LIST "))
-                    self.rows = self.connection.list_rows.get(uri, [])
+                    self.rows = self.connection.listed(uri)
                 elif statement.startswith("GET "):
                     source_literal, target_literal = statement.removeprefix("GET ").split(" ", 1)
                     source = self._unquote(source_literal)
@@ -5036,6 +5036,19 @@ class TestExecutionLogDownload:
 
             def close(self):
                 pass
+
+        def listed(self, uri):
+            """What LIST ``uri`` returns. A stage LIST matches by path prefix: the rows
+            seeded for ``uri`` itself, else those of a seeded location above it that
+            lie under ``uri`` (a row's name is its path from ``/versions/``)."""
+            if uri in self.list_rows:
+                return self.list_rows[uri]
+            above = [location for location in self.list_rows if uri.startswith(location) and "/versions/" in location]
+            if not above:
+                return []
+            location = max(above, key=len)
+            stage = location[: location.index("/versions/")]
+            return [row for row in self.list_rows[location] if (stage + row[0]).startswith(uri)]
 
         def cursor(self):
             return self.Cursor(self)

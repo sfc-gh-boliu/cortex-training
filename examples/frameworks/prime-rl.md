@@ -13,9 +13,10 @@ Two example recipes live in the Arctic Platform repository under
 `arctic_platform/integrations/prime_rl/examples/`, rather than under `recipes/`
 here (the same split SkyRL uses):
 
-- `qwen3-1.7b/math-i3.toml` — Qwen3-1.7B on the `i3_math` taskset
+- `qwen3.5-4b/math-i3.toml` — Qwen3.5-4B on the `i3_math` taskset
   (INTELLECT-3-RL math), scored deterministically by math-verify in the rollout
-  runtime (no judge model).
+  runtime (no judge model). A difficulty-filtered learnable mid-band and the fixed
+  `standard` sampler give a steady climbing reward curve (all-reward ~0.33 → ~0.9).
 - `qwen3.5-4b/swe-grade.toml` — Qwen3.5-4B on `r2e-gym` with the `bash` agent
   harness and an agentic grading policy.
 
@@ -67,9 +68,9 @@ export ARCTIC_CORTEX_PAT=$(jq -r .pat "$cfg")
 ```bash
 cd Arctic-Platform
 
-# Math (Qwen3-1.7B, i3_math — stock subprocess runtime, no sandbox):
+# Math (Qwen3.5-4B, i3_math — stock subprocess runtime, no sandbox):
 python -m arctic_platform.integrations.prime_rl.rl \
-  @ arctic_platform/integrations/prime_rl/examples/qwen3-1.7b/math-i3.toml \
+  @ arctic_platform/integrations/prime_rl/examples/qwen3.5-4b/math-i3.toml \
   --env-package i3-math
 
 # SWE (Qwen3.5-4B, r2e-gym — PrimeIntellect sandbox):
@@ -127,21 +128,24 @@ After a short warm-up the model stops emitting malformed tool calls — the
 disqualified fraction falls from ~37% to ~2% — and reward climbs from ~0.40 to
 a ~0.85 plateau and holds there with no collapse.
 
-### Math — Qwen3-1.7B, i3_math
+### Math — Qwen3.5-4B, i3_math
 
 | Step | Reward |
 |---|---|
-| 1 | 0.10 |
-| 10 | 0.20 |
-| 30 | 0.22 |
-| 50 | 0.22 |
-| 70 | 0.26 |
-| 90 | 0.30 |
-| 100 | 0.25 |
+| 1 | 0.21 |
+| 10 | 0.59 |
+| 20 | 0.63 |
+| 40 | 0.78 |
+| 60 | 0.89 |
+| 80 | 0.84 |
+| 100 | 0.85 |
+| 120 | 0.84 |
 
-Reward lifts off the initial ~0.10 to a stable ~0.22–0.27 band. A 1.7B model on
-competition-level math has limited headroom, so the curve is a gentle climb into
-a plateau rather than a steep rise; it is stable with no collapse.
+Reward climbs steadily from ~0.21 to a high ~0.85–0.9 plateau over the first
+~50–60 steps and holds there, with no collapse. The difficulty filter keeps a
+learnable mid-band (so GRPO groups carry reward variance) and the fixed `standard`
+sampler lets that improvement show up as a rising curve — the adaptive
+`difficulty_pool` sampler instead pins reward flat at the frontier by design.
 
 ## More detail
 

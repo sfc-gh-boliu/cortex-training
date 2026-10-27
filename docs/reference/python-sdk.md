@@ -72,10 +72,11 @@ and read timeout, or a `(connect, read)` pair. `from_configs` also accepts
 `telemetry_timeout` (3s) for best-effort client metrics.
 
 The client never creates a database. A request that fails because the
-database or schema in its URL can't be found (HTTP 400, code `517602`) raises
-`DatabaseAccessError` (see [Exceptions](#exceptions)), which says how to create
-it, get access to it, or use another one. A client from `for_job` raises the
-plain `requests.HTTPError` instead. `client.auto_create_database` is deprecated:
+database or schema in its URL can't be found (HTTP 400, code `517602`, message
+`Schema DB.SCHEMA is not found or not authorized`) raises `DatabaseAccessError`
+(see [Exceptions](#exceptions)), which says how to create it, get access to it,
+or use another one. A client from `for_job` raises the plain
+`requests.HTTPError` instead. `client.auto_create_database` is deprecated:
 it is always False. Setting it to True emits a `FutureWarning`; setting it to False
 needs no change.
 
@@ -398,11 +399,10 @@ on a failed/cancelled request and `TimeoutError` at the deadline.
 `DatabaseAccessError` (a subclass of both `requests.exceptions.HTTPError` and
 `RuntimeError`) means the configured database or schema can't be found by the
 current role: it doesn't exist, or the role can't access it. It carries
-`.response` (the HTTP 400), `.kind` (`"database"` or `"schema"`), `.name`,
+`.response` (the HTTP 400), `.kind` (`"schema"`), `.name` (`DATABASE.SCHEMA`),
 `.role` (the session's role, or None when it can't be determined, as for PAT
 clients), and `.statement`, the SQL that would set it up: `CREATE DATABASE IF NOT
-EXISTS ...`, or for a schema other than `PUBLIC`, that statement and
-`CREATE SCHEMA IF NOT EXISTS ...`, separated by `; `.
+EXISTS ...` and `CREATE SCHEMA IF NOT EXISTS ...`, separated by `; `.
 
 ## Details not covered here
 

@@ -312,9 +312,10 @@ _ENDED_JOB_STATES = frozenset(
 # out the service's read-after-create window.
 _RECENTLY_CREATED_SECONDS = 120.0
 _SESSION_EXPIRED_CODES = frozenset({"390111", "390112", "390114"})
-# The Cortex Training API's code, on an HTTP 400, for a database or schema in the
-# URL path that it cannot resolve. The client explains it; it never creates one.
-_DATABASE_NOT_RESOLVED_CODE = "517602"
+# The Cortex Training API's invalid-request code, and its message for a URL
+# path DATABASE.SCHEMA it can't resolve (missing database or schema alike).
+_INVALID_REQUEST_CODE = "517602"
+_SCHEMA_NOT_FOUND_MESSAGE = re.compile(r"^Schema .+ is not found or not authorized")
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {
     _CHUNK_GROUP_RESTART_REQUIRED,
@@ -412,11 +413,13 @@ class ChunkGroupConflictError(ChunkGroupError):
 class DatabaseAccessError(requests.exceptions.HTTPError, RuntimeError):
     """The configured database or schema can't be found by the current role.
 
-    Raised for the API's HTTP 400 with code 517602. The client never creates a
-    database; the message says how to create it, get access, or use another.
-    ``kind`` is ``"database"`` or ``"schema"``, ``name`` the object, ``role``
-    the session's role (None when it can't be determined, as for PAT clients),
-    and ``statement`` the CREATE statement that would set it up.
+    Raised for the API's HTTP 400 with code 517602 and message "Schema ... is
+    not found or not authorized". The client never creates a database; the
+    message says how to create it, get access, or use another.
+    ``kind`` is ``"schema"``, ``name`` the ``DATABASE.SCHEMA``, ``role`` the
+    session's role (None when it can't be determined, as for PAT clients), and
+    ``statement`` the CREATE DATABASE and CREATE SCHEMA statements that would
+    set it up, separated by ``; ``.
     """
 
     def __init__(
@@ -648,6 +651,22 @@ def _response_error_code(response: requests.Response | None) -> str | None:
         if code is not None:
             return str(code)
     return None
+
+
+def _is_schema_not_found(response: requests.Response | None) -> bool:
+    """Whether ``response`` says the URL's schema can't be found."""
+    if response is None:
+        return False
+    try:
+        body = response.json()
+    except Exception:
+        return False
+    for candidate in _iter_error_dicts(body):
+        code = candidate.get("code") or candidate.get("error_code")
+        message = str(candidate.get("message") or "").strip()
+        if str(code) == _INVALID_REQUEST_CODE and _SCHEMA_NOT_FOUND_MESSAGE.match(message):
+            return True
+    return False
 
 
 def _chunk_group_error_detail(response: requests.Response | None) -> dict | None:
@@ -2955,37 +2974,48 @@ class CortexTrainingClient:
             logger.debug("Could not read the session's role.", exc_info=True)
             return None
 
-    def _database_error(self, response: requests.Response) -> DatabaseAccessError:
-        """Explain an HTTP 400 with code 517602: the configured database or schema can't be found."""
+    def _schema_not_found_error(self, response: requests.Response) -> DatabaseAccessError:
+        """Explain an HTTP 400 saying the configured schema can't be found."""
         role = self._current_role()
-        who = f"Role {role}" if role else "Role <ROLE> (couldn't determine your role)"
+        sent_headers = getattr(getattr(response, "request", None), "headers", None) or self._session.headers
+        sent_pat = sent_headers.get("X-Snowflake-Authorization-Token-Type") == "PROGRAMMATIC_ACCESS_TOKEN"
+        if role:
+            who = f"Role {role}"
+        elif sent_pat:
+            who = "Your PAT's role (its role restriction, or your user's DEFAULT_ROLE if it has none)"
+        else:
+            who = "Role <ROLE> (couldn't determine your role)"
         grantee = role or "<ROLE>"
         source = ""
         if self._auth_provider is not None:
             profile = getattr(self._auth_provider, "connection_name", None)
             source = f" (from profile {profile})" if profile else " (from your default Snowflake profile)"
         database, schema = self.database, self.schema
-        if schema.upper() == "PUBLIC":
-            kind, name, statement = "database", database, f"CREATE DATABASE IF NOT EXISTS {database}"
-            lines = [
-                f"{who} can't find database {database}{source}.",
-                f"- If it doesn't exist: run `{statement}` (or ask an admin to).",
-                f"- If it exists: ask an admin to run `GRANT USAGE ON DATABASE {database} TO ROLE {grantee}`.",
-            ]
-        else:
-            kind, name = "schema", f"{database}.{schema}"
-            create_database = f"CREATE DATABASE IF NOT EXISTS {database}"
-            create_schema = f"CREATE SCHEMA IF NOT EXISTS {database}.{schema}"
-            statement = f"{create_database}; {create_schema}"
-            lines = [
-                f"{who} can't find database {database} or its schema {schema}{source}.",
-                f"- If they don't exist: run `{create_database}` and `{create_schema}` (or ask an admin to).",
-                f"- If they exist: ask an admin to run `GRANT USAGE ON DATABASE {database} TO ROLE {grantee}` "
-                f"and `GRANT USAGE ON SCHEMA {database}.{schema} TO ROLE {grantee}`.",
-            ]
+        create_database = f"CREATE DATABASE IF NOT EXISTS {database}"
+        create_schema = f"CREATE SCHEMA IF NOT EXISTS {database}.{schema}"
+        # The server's message is the same whether the database or the schema is missing, or
+        # the role can't use either, so the explanation covers all three.
+        lines = [
+            f"{who} can't find database {database} or its schema {schema}{source}.",
+            f"- If they don't exist: run `{create_database}` and `{create_schema}` (or ask an admin to).",
+            f"- If they exist: ask an admin to run `GRANT USAGE ON DATABASE {database} TO ROLE {grantee}` "
+            f"and `GRANT USAGE ON SCHEMA {database}.{schema} TO ROLE {grantee}`.",
+        ]
+        if not role and sent_pat:
+            lines.insert(
+                1,
+                "- If that's the wrong role: restrict the PAT to a role that has access, or run "
+                "`ALTER USER <USER> SET DEFAULT_ROLE = <ROLE>`. Snowsight shows the token's role under "
+                "Settings > Authentication.",
+            )
         lines.append("- Or use another database: --database NAME / CORTEX_TRAINING_DATABASE.")
         return DatabaseAccessError(
-            "\n".join(lines), response=response, kind=kind, name=name, role=role, statement=statement
+            "\n".join(lines),
+            response=response,
+            kind="schema",
+            name=f"{database}.{schema}",
+            role=role,
+            statement=f"{create_database}; {create_schema}",
         )
 
     def _redact_for_log(self, text: str) -> str:
@@ -3017,9 +3047,10 @@ class CortexTrainingClient:
     ) -> requests.Response:
         """Send one request with retries.
 
-        An HTTP 400 with code 517602 (the configured database or schema can't be
-        found) raises :class:`DatabaseAccessError`. ``explain_database=False``
-        leaves that answer as it is, for routes whose path names no database; a
+        An HTTP 400 saying the configured schema can't be found (code 517602,
+        "Schema ... is not found or not authorized") raises
+        :class:`DatabaseAccessError`. ``explain_database=False`` leaves that
+        answer as it is, for routes whose path names no database; a
         client from :meth:`for_job` always leaves it.
         """
         explain_database = explain_database and self._explain_database_errors
@@ -3151,9 +3182,9 @@ class CortexTrainingClient:
                 if (
                     explain_database
                     and status_code == 400
-                    and _response_error_code(resp) == _DATABASE_NOT_RESOLVED_CODE
+                    and _is_schema_not_found(resp)
                 ):
-                    raise self._database_error(resp)
+                    raise self._schema_not_found_error(resp)
                 try:
                     # requests.Response.raise_for_status() intentionally ignores 3xx.
                     if 300 <= resp.status_code < 400:

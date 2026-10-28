@@ -1073,7 +1073,7 @@ class Hardware(str, Enum):
     """GPU hardware for create job and capacity.
 
     Wire values match the REST ``hardware`` field; see
-    ``docs/reference/rest-api.md`` sections 5.1 and 5.4. Omitting it defaults to
+    ``docs/reference/rest-api.md`` sections 5.1 and 5.5. Omitting it defaults to
     H200 on the server. Unknown values are rejected client-side.
     """
 
@@ -3467,6 +3467,23 @@ class CortexTrainingClient:
         resp = self._send("GET", self._prefix, params=params)
         return resp.json().get("jobs", [])
 
+    @_track_operation("list_models")
+    def list_models(self) -> list:
+        """Return active models configured for new jobs.
+
+        Account-scoped ``GET /api/v2/{endpoint}/models``. The catalog is not
+        database- or schema-specific, so the configured database and schema
+        are not part of the path.
+        """
+        resp = self._send(
+            "GET",
+            f"{self.base_url}/api/v2/{self.endpoint}/models",
+            # The path names no database, so a not-found error here is not
+            # about the configured one.
+            explain_database=False,
+        )
+        return resp.json().get("models", [])
+
     def _list_model_deployment_jobs(self) -> list[dict[str, Any]]:
         """Return the jobs in this schema that are model deployments."""
         return [job for job in self.list_jobs() if _model_deployment_sub_job(job) is not None]
@@ -3856,7 +3873,7 @@ class CortexTrainingClient:
           ceiling headroom capped by what is schedulable. ``0`` does not mean
           blocked: a submit within the ceiling is still accepted and queued.
 
-        See ``docs/reference/rest-api.md`` section 5.4 for the authoritative
+        See ``docs/reference/rest-api.md`` section 5.5 for the authoritative
         field list, and :meth:`get_capacity_breakdown` to split ``in_use_gpus``
         and ``pending_gpus`` by sub-job type or by submitting user.
         """

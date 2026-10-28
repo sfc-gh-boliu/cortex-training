@@ -1000,6 +1000,7 @@ class TestOperationMetrics:
         "wait_for_job",
         "get_job",
         "list_jobs",
+        "list_models",
         "cancel_job",
         "get_capacity",
         "get_capacity_breakdown",
@@ -2407,6 +2408,18 @@ class TestReadAndControl:
         c = _make_client(get_json={"jobs": []})
         c.list_jobs(status="running")
         c._session.get.assert_called_once_with(c._prefix, params={"status": "running"})
+
+    def test_list_models_returns_models_from_models_route(self):
+        models = [
+            {"name": "Qwen/Qwen3-0.6B"},
+            {"name": "Qwen/Qwen3-8B"},
+        ]
+        c = _make_client(get_json={"models": models})
+
+        assert c.list_models() == models
+        c._session.get.assert_called_once_with(
+            f"{c.base_url}/api/v2/{c.endpoint}/models"
+        )
 
     def test_cancel_job_uses_colon_action(self):
         c = _make_client(post_json={})

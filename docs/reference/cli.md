@@ -1241,7 +1241,8 @@ for. `esc` closes that panel first, before it clears a search or goes back.
 Opening a job shows it as cards. The job card is headed by its id, its status
 as a colored pill (`unknown` reads `? UNKNOWN`), and how long it has been
 going (`12m 04s so far`, or `lasted 1h 20m` once it ended), with the keys for
-`l Logs` and `g Resources` under it. Its facts follow: model, type, owner,
+its tabs under it (`l Logs`, `g Resources`, `m Training metrics`,
+`c Checkpoints`). Its facts follow: model, type, owner,
 requested GPUs, creation and update times, and the location when it is not the
 configured one, in two columns from about 90 columns wide and in one below.
 Values stop after three rows; `e` expands every value and the complete sub-job
@@ -1348,9 +1349,8 @@ its record says it is a deployment.
     `temp` (and the hottest GPU) and `GPUs reporting` (`8/8`, against those
     requested); the System view has `CPU util`, `memory` and `nodes
     reporting`. Only metrics the rows have get a tile. Each is coloured by
-    health, and a value that warns or is an error has `!` or `×` at its
-    edge, so it shows without color too. For the mean a tile is as healthy as
-    its least healthy GPU or node: GPU util under 50% warns; GPU memory used from 95% warns; GPU
+    health, and for the mean a tile is as healthy as its least healthy GPU or
+    node: GPU util under 50% warns; GPU memory used from 95% warns; GPU
     temperature from 85 °C warns and from 90 °C is an error; CPU util from 95%
     warns; node memory used from 90% warns and from 97% is an error; power
     isn't judged. `GPUs reporting` warns below the GPUs requested and is an
@@ -1463,8 +1463,9 @@ its record says it is a deployment.
     `gradient_sample_numel`); per call, `rank` (the worker the result came
     from, currently always 0) while every call's is 0: a call from another
     worker shows it. The packing counts (`rl_model_calls`, `sft_model_calls`,
-    `sft_packed_rows`) always show. The header says how many are hidden
-    (`3 hidden (a)`), or `all metrics (a)` while they show.
+    `sft_packed_rows`) always show. The header says which show:
+    `training signals (a)`, or `all metrics (a)` once `a` shows them. A click
+    on it does what `a` does, and a click on the window beside it what `w` does.
   - The header names the sub-job, its newest step, how many calls were saved,
     the age of the newest row and the window, and with two or more
     training sub-jobs its place among them. `Space` shows the next one.
@@ -1799,11 +1800,10 @@ server), and in tmux, whose outer terminal also needs
 `NO_COLOR` set to anything but an empty string ([no-color.org](https://no-color.org))
 draws every color as its gray, and the TUI says so as it starts. `--color always`
 draws color anyway, `--color never` draws gray in any terminal, and
-`--color auto` is the default. No screen depends on color alone: a job's status
-has its glyph, and a KPI tile that warns or is an error has `!` or `×` at its
-edge. Some command runners set `NO_COLOR` and `TERM=dumb` for the commands they
-run (an AI agent's, such as Cursor's): a TUI started there is gray until
-`--color always`.
+`--color auto` is the default. A job's status keeps its glyph in gray, but a
+KPI tile's health is shown by its color alone. Some command runners set
+`NO_COLOR` and `TERM=dumb` for the commands they run (an AI agent's, such as
+Cursor's): a TUI started there is gray until `--color always`.
 
 Each glyph the TUI draws is one cell wide, and none is also an emoji (which some
 terminals draw in color, two cells wide). Borders, tables and charts line up

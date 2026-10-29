@@ -854,8 +854,11 @@ still exits `0`.
 
 The `base_url` is an OpenAI-compatible endpoint. Authenticate with a Snowflake
 programmatic access token (PAT) and pass the deployment ID as `model`.
-Inference is not yet available on all accounts; until it is enabled for yours,
-requests return 404.
+Requests return 503 until the deployment is `READY` (and, retryably, while a
+`READY` deployment is busy or temporarily unavailable), and 404 for an
+unknown, failed, dropped, or not-owned deployment. Inference is not yet
+available on all accounts; until it is enabled for yours, requests return 403
+(see [REST API reference section 14.8](rest-api.md#148-calling-a-deployment)).
 
 ```python
 from openai import OpenAI

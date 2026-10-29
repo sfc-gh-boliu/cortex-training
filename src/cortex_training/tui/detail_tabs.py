@@ -1,17 +1,18 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The job screen's Training metrics tab.
+"""The job screen's Training metrics tab, and the base it shares with the Serving tab
+(:class:`~cortex_training.tui.serving_view.ServingPane`).
 
-The tab is one widget that reads and draws its own data, so the job screen
+Each tab is one widget that reads and draws its own data, so the job screen
 only places it, tells it when it is shown (:meth:`activate`) and when a live
 job's periodic refresh is due (:meth:`refresh_live`). It reads the job as the
-screen knows it through the ``job`` callable it is given, and fetches its rows
-through the screen's ``download``, which writes into the same cache directory
-as the Resources tab, under the same lock.
+screen knows it through the ``job`` callable it is given, and fetches its data
+through the screen's ``download``: Training metrics into the same cache directory
+as the Resources tab, under the same lock; Serving into its own copy of the console.
 
-The pane's keys (``w``, ``a``, ``Space``, ``r``) are its own bindings, which win
-over the screen's while the focus is inside the pane.
+A pane's keys (Training metrics' ``w``, ``a``, ``Space``, ``r``; Serving's ``r``) are
+its own bindings, which win over the screen's while the focus is inside the pane.
 """
 
 from __future__ import annotations
@@ -46,7 +47,8 @@ _WARNING = WARN_TEXT  # a warning's text, as on the Logs tab
 
 
 class _Pane(Vertical):
-    """What both tabs share: posting a worker's answer to the UI thread while the pane is up."""
+    """What the Training metrics and Serving panes share: being shown (and so loaded), and
+    posting a worker's answer to the UI thread while the pane is up."""
 
     def __init__(self, client, job_id: str, *, job: Callable[[], dict], id: str) -> None:
         super().__init__(id=id)
@@ -56,6 +58,11 @@ class _Pane(Vertical):
         self._shown = False  # activated at least once: the first show loads
         self._loading = False
         self._error: str | None = None
+
+    @property
+    def opened(self) -> bool:
+        """Whether the tab was opened at least once (and so has loaded), not whether it is on screen now."""
+        return self._shown
 
     def _post(self, fn, *args) -> None:
         """Worker thread: run ``fn(*args)`` on the UI thread, dropped once the pane is gone."""

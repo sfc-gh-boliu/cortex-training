@@ -299,3 +299,124 @@ def test_config_card_follows_the_highlighted_row():
 
     asyncio.run(run())
 
+
+UUID = "00000000-0000-4000-8000-000000000008"  # a made-up canonical UUID
+
+
+def _deployment_job(status="RUNNING") -> dict:
+    return _job(status, job_id=UUID, idle_timeout_seconds=0, sub_jobs=[{
+        "sub_job_id": f"{UUID}:sampling:0", "job_type": "sampling", "status": status, "model_name": "org/model",
+        "inference_config": {"deployment_class": "EVALUATION", "num_replicas": 2.0}}])
+
+
+def test_a_deployment_s_preview_says_how_to_call_it_and_offers_serving():
+    job = _deployment_job()
+    client = MagicMock()
+    client.model_deployment_base_url = "https://HOST/api/v2/databases/DB/schemas/SCHEMA/cortex-training/inference/v1"
+    client.list_jobs.return_value = [job]
+    client.get_job.return_value = job
+
+    async def run():
+        app = CortexTrainingLogTUI(client, poll_interval=0.01)
+        async with app.run_test(size=(150, 42)) as pilot:
+            app.push_screen(JobSummaryScreen(client, UUID, job=job))
+            for _ in range(50):
+                await pilot.pause(0.02)
+                if isinstance(app.screen, JobSummaryScreen) and "Call as" in "".join(_rows(app, "#preview")):
+                    break
+            preview = "".join(_rows(app, "#preview"))
+            assert "deployment" in preview and "EVALUATION" in preview and f"sf-ct-{UUID}" in preview
+            # The base URL is longer than one value column at this width, so it wraps; squeeze out
+            # the padding between wrapped rows before checking it reads whole.
+            squeezed = "".join(preview.split())
+            assert "Base URL" in preview and "/cortex-training/inference/v1" in squeezed
+            assert "off" in preview  # idle timeout 0: never reclaimed
+            hero_rows = _rows(app, "#hero")
+            assert "READY" in "".join(hero_rows) and "RUNNING" not in "".join(hero_rows)  # deployment status words
+            hero = hero_rows[-1]
+            assert "v Serving" in hero and "l Logs" in hero and "g Resources" in hero and "Checkpoints" not in hero
+            screen = app.screen
+            assert screen.check_action("open", ("serving",)) is True
+            assert not screen.check_action("open", ("checkpoints",))
+            assert not screen.check_action("open", ("training",))
+            app.workers.cancel_all()
+            await pilot.pause(0.1)
+
+    asyncio.run(run())
+
+
+def test_a_training_job_s_preview_has_no_serving_key():
+    job = _job(sub_jobs=[{"sub_job_id": "JOB_ID:training:0", "job_type": "training", "status": "RUNNING"}])
+    client = MagicMock()
+    client.list_jobs.return_value = [job]
+    client.get_job.return_value = job
+
+    async def run():
+        app = CortexTrainingLogTUI(client, poll_interval=0.01)
+        async with app.run_test(size=(150, 42)) as pilot:
+            app.push_screen(JobSummaryScreen(client, "JOB_ID", job=job))
+            for _ in range(50):
+                await pilot.pause(0.02)
+                if isinstance(app.screen, JobSummaryScreen):
+                    break
+            screen = app.screen
+            assert not screen.check_action("open", ("serving",))
+            assert screen.check_action("open", ("checkpoints",)) is True
+            assert "Call as" not in "".join(_rows(app, "#preview"))
+            app.workers.cancel_all()
+            await pilot.pause(0.1)
+
+    asyncio.run(run())
+
+
+def test_a_refresh_rebuilds_the_footer_only_when_its_keys_change():
+    job = _job(sub_jobs=[{"sub_job_id": "JOB_ID:training:0", "job_type": "training", "status": "RUNNING"}])
+    deployment = _job(sub_jobs=[{"sub_job_id": "JOB_ID:sampling:0", "job_type": "sampling", "status": "RUNNING",
+                                 "inference_config": {"deployment_class": "EVALUATION"}}])
+    client = MagicMock()
+    client.model_deployment_base_url = "https://HOST/api/v2/databases/DB/schemas/SCHEMA/cortex-training/inference/v1"
+    client.list_jobs.return_value = [job]
+    client.get_job.return_value = job
+
+    async def run():
+        app = CortexTrainingLogTUI(client, poll_interval=0.01)
+        async with app.run_test(size=(150, 42)) as pilot:
+            app.push_screen(JobSummaryScreen(client, "JOB_ID", job=job))
+            for _ in range(50):
+                await pilot.pause(0.02)
+                if isinstance(app.screen, JobSummaryScreen):
+                    break
+            screen = app.screen
+            app.workers.cancel_all()
+            await pilot.pause(0.1)
+            calls = []
+            screen.refresh_bindings = lambda: calls.append(1)
+            screen._refresh_view()
+            screen._refresh_view()
+            assert calls == []  # Textual rebuilds the footer on every call
+            screen._job = deployment  # opened by id, it turned out to be a deployment
+            screen._refresh_view()
+            assert calls == [1]
+
+    asyncio.run(run())
+
+
+def test_a_job_without_a_status_keeps_its_unknown_pill():
+    job = _job(None, sub_jobs=[{"sub_job_id": "JOB_ID:training:0", "job_type": "training"}])
+    client = MagicMock()
+    client.list_jobs.return_value = [job]
+    client.get_job.return_value = job
+
+    async def run():
+        app = CortexTrainingLogTUI(client, poll_interval=0.01)
+        async with app.run_test(size=(150, 42)) as pilot:
+            app.push_screen(JobSummaryScreen(client, "JOB_ID", job=job))
+            for _ in range(50):
+                await pilot.pause(0.02)
+                if isinstance(app.screen, JobSummaryScreen) and _rows(app, "#hero")[0].strip():
+                    break
+            assert " ? UNKNOWN " in _rows(app, "#hero")[0]  # the pill reads as it did before deployments
+            app.workers.cancel_all()
+            await pilot.pause(0.1)
+
+    asyncio.run(run())

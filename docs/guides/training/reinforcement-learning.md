@@ -18,7 +18,7 @@ install.
 
 [prime-rl](../../../examples/frameworks/prime-rl.md) runs GRPO from its own orchestrator,
 driven by the Arctic Platform launcher, with training and sampling in Cortex
-sub-jobs. Its math (`i3_math`) and SWE (`r2e-gym`) example recipes live in the
+sub-jobs. Its math (`i3_math`) and SWE (`r2e-gym`) examples live in the
 Arctic Platform repository.
 
 To train a model inside an agent you already have, see

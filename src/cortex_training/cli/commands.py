@@ -683,6 +683,27 @@ def build_parser(
     )
     _add_chunk_download_arguments(download_log, "--log-type stdout")
 
+    download_checkpoint = subparsers.add_parser(
+        "download-checkpoint",
+        help="Export and download one listed Cortex Training checkpoint.",
+    )
+    download_checkpoint.add_argument("job_id")
+    download_checkpoint.add_argument("checkpoint_id")
+    download_checkpoint.add_argument(
+        "--output-dir",
+        required=True,
+        help="Directory to receive the export's relative file tree.",
+    )
+    download_checkpoint.add_argument(
+        "--include",
+        action="append",
+        default=[],
+        help=(
+            "Download only filenames matching this shell-style glob. "
+            "Repeatable; omitted means every file."
+        ),
+    )
+
     download_metrics = subparsers.add_parser(
         "download-metrics",
         help="Download and reconstruct GPU and training metrics for a Cortex Training job.",
@@ -1763,6 +1784,37 @@ def _cmd_download_log(
     return 0
 
 
+def _cmd_download_checkpoint(
+    args: argparse.Namespace, client, stdout: TextIO, stderr: TextIO
+) -> int:
+    from cortex_training._checkpoint_download import download_checkpoint
+
+    progress = _artifact_progress_writer(stderr)
+
+    def on_progress(done: int, total: int, files_done: int, file_count: int) -> None:
+        fraction = done / total if total else files_done / file_count
+        filled = int(fraction * 20)
+        bar = "#" * filled + "-" * (20 - filled)
+        progress(
+            f"Checkpoint [{bar}] {fraction:4.0%} "
+            f"{done:,}/{total:,} bytes ({files_done}/{file_count} files)"
+        )
+
+    try:
+        result = download_checkpoint(
+            client,
+            args.job_id,
+            args.checkpoint_id,
+            args.output_dir,
+            args.include,
+            on_progress=on_progress,
+        )
+    finally:
+        progress("\n")
+    _print_json(result, stdout, compact=args.compact)
+    return 0
+
+
 def _cmd_download_metrics(
     args: argparse.Namespace, client, stdout: TextIO, stderr: TextIO
 ) -> int:
@@ -2053,6 +2105,8 @@ def _run(
         return _cmd_weight_sync(args, client, stdout)
     if args.command == "download-log":
         return _cmd_download_log(args, client, stdout, stderr)
+    if args.command == "download-checkpoint":
+        return _cmd_download_checkpoint(args, client, stdout, stderr)
     if args.command == "download-metrics":
         return _cmd_download_metrics(args, client, stdout, stderr)
     if args.command == "model-deployment":
@@ -2107,6 +2161,12 @@ def main(
         return 130
     except KeyboardInterrupt as exc:
         command = getattr(args, "command", None)
+        if command == "download-checkpoint":
+            print(
+                "interrupted; rerun the same command to resume checkpoint downloads",
+                file=stderr,
+            )
+            return 130
         if command not in _CHUNK_DOWNLOAD_COMMANDS:
             raise
         if not _resumable_download(args):

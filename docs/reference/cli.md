@@ -136,6 +136,7 @@ cortex-training --job JOB_ID load CHECKPOINT_ID
 cortex-training --job JOB_ID load CHECKPOINT_ID --source-job-id SOURCE_JOB_ID
 cortex-training --job JOB_ID load CHECKPOINT_ID --target-sub-job-id JOB_ID:training:0
 cortex-training --job JOB_ID load CHECKPOINT_ID --no-poll
+cortex-training download-checkpoint JOB_ID CHECKPOINT_ID --output-dir ./checkpoint
 ```
 
 ### [Logs And Metrics](#job-tui)
@@ -604,6 +605,45 @@ elsewhere, see [Start a Job From Your Own Weights](../guides/training/external-w
 
 `load` polls until the request completes by default. Pass `--no-poll` to return
 the request metadata without waiting for the result.
+
+### Download A Checkpoint
+
+Export a listed checkpoint and download its files locally:
+
+```bash
+cortex-training download-checkpoint JOB_ID CHECKPOINT_ID --output-dir ./checkpoint
+cortex-training download-checkpoint JOB_ID CHECKPOINT_ID --output-dir ./checkpoint \
+  --include '*.safetensors' --include 'config.json'
+```
+
+`--output-dir` is required. Export filenames retain their relative directory
+structure. `--include` is a repeatable, case-sensitive shell-style glob matched
+against the full relative filename; quote patterns to prevent shell expansion.
+Omit it to download every exported file. No matches produce an error.
+
+Downloads always show a byte-based progress bar on stderr, leaving stdout as
+machine-readable JSON. A terminal displays live updates; redirected stderr gets
+only the final progress line (or the last progress line before an error).
+The totals cover only files selected by `--include`, count completed files and
+resumed bytes as they are encountered, and show the number of completed files.
+
+Downloads resume automatically from sibling `.partial` files using HTTP Range
+requests. Rerun the same command after an interruption; no `--resume` flag is
+needed. Completed files whose byte size matches the export are skipped, and a
+file is promoted from `.partial` only after its expected byte size is verified.
+Existing final files with a different size and oversized partial files are
+refused; move them aside before retrying. Size checks are not checksum validation.
+Do not run concurrent downloads into the same output directory.
+
+The command verifies that the checkpoint is listed, validates the export and
+filenames, and refuses paths that escape the output directory. Each transfer
+uses a 30-second connection timeout and a 300-second read-inactivity timeout.
+Presigned HTTPS links are fetched without forwarding Snowflake credentials or
+following redirects. Links never appear in the JSON summary or transfer errors.
+
+The JSON summary contains `job_id`, `checkpoint_id`, `expires_at`, `output_dir`,
+and `files`. Each file has `filename`, `saved_path`, `size_bytes`, and a `status`
+of `downloaded`, `resumed`, or `existing`. The global `--compact` option applies.
 
 ### Start Sampling From A Training Checkpoint
 

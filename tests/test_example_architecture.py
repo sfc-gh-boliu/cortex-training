@@ -464,10 +464,21 @@ def test_dare_applies_its_own_overrides_after_the_sft_file():
 
 def test_an_override_that_moves_the_gpu_count_past_the_deepspeed_batch_is_rejected():
     utils = _import_example("recipes.utils")
-    more_gpus = {"sub_job_configs": [{"job_type": "training", "training_config": {"n_gpus": 8}}]}
+    more_gpus = {
+        "sub_job_configs": [{
+            "job_type": "training",
+            "training_config": {
+                "n_gpus": 16,
+                "ds_config": {
+                    "train_batch_size": 8,
+                    "train_micro_batch_size_per_gpu": 1,
+                    "gradient_accumulation_steps": 1,
+                },
+            },
+        }],
+    }
 
-    # Qwen3-30B-A3B's file spells out a DeepSpeed batch of 4 for its 4 GPUs.
-    with pytest.raises(ValueError, match=r"ds_config train_batch_size 4 must equal .* 8 data-parallel ranks"):
+    with pytest.raises(ValueError, match=r"ds_config train_batch_size 8 must equal .* 16 data-parallel ranks"):
         utils.build_job("training", model="Qwen/Qwen3-30B-A3B", context="standard", overrides=[more_gpus])
 
 
@@ -1519,8 +1530,6 @@ def test_examples_folder_is_renamed_to_recipes():
     assert (REPO_ROOT / "recipes").is_dir()
 
 
-# A catalog job file is picked by model, context, hardware and mode, so nothing
-# outside the model's folder names one by path (tests aside).
 _CATALOG_JOB_FILE = re.compile(r"\b(standard|long)/(h200|b200|b300)-(training|inference)-(lora|full)\.json")
 
 

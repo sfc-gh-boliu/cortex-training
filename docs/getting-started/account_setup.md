@@ -43,15 +43,6 @@ Share these three values with the Snowflake team. They will:
 You cannot proceed until this is complete. Once the team confirms enablement,
 continue to the next step.
 
-If you plan to [start a job from your own weights](../guides/training/external-weights.md),
-the role that uploads them needs the `CREATE STAGE` privilege on the target schema.
-Only the owner of the database (typically `SYSADMIN`) can grant it, so ask your
-account admin to run:
-
-```sql
-GRANT CREATE STAGE ON SCHEMA MY_DB.MY_SCHEMA TO ROLE MY_ROLE;
-```
-
 ## Step 3: Authenticate
 
 Generate a Programmatic Access Token (PAT) and configure your client connection.
@@ -97,15 +88,15 @@ The conversational SFT example fine-tunes Qwen3-8B on a one-example chat dataset
 ("Who trained you?" → "Snowflake AI Research"). Start with a short run:
 
 ```bash
-python -m examples.sft.conversational.train \
-  config=/path/to/your-config.json \
+python -m recipes.sft_quickstart.conversational.train \
   max_steps=10
 ```
 
-The example uses the same connection resolution as the CLI, so a default
-connection in `connections.toml` is picked up automatically. Pass
-`connection=<name>` for a named profile, or `config=` for a
-[JSON connection file](setup.md#json-connection-file).
+The example connects the same way the CLI does: the profile
+`cortex-training login` saved, else your default Snowflake profile. Pass
+`connection=<name>` to use another profile. (A
+[JSON connection file](setup.md#json-connection-file) still works with
+`config=`, but it's deprecated and prints a warning.)
 
 What happens during this run:
 
@@ -125,8 +116,7 @@ in, after it saves the checkpoint. Run it to confirm the model learned the
 expected answer:
 
 ```bash
-python -m examples.inference.generate \
-  config=/path/to/your-config.json \
+python -m recipes.inference.generate \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID \
   temperature=0 \
@@ -152,11 +142,11 @@ cortex-training tui                   # terminal UI for browsing jobs and logs
 You have a working setup. From here:
 
 - **Try different training methods**: pass `lora=true` for
-  [LoRA](../../examples/sft/README.md), `model=` for a different model from the
+  [LoRA](../../recipes/sft_quickstart/README.md), `model=` for a different model from the
   [model catalog](../../model-catalog/README.md), or `lr=`,
   `train_batch_size=` and `max_seq_len=` for different hyperparameters
 - **Try reinforcement learning**: run the
-  [Math GRPO example](../../examples/rl/README.md)
-- **Explore all examples**: browse the [example index](../../examples/README.md)
+  [Math GRPO example](../../recipes/rl_quickstart/README.md)
+- **Explore all examples**: browse the [example index](../../recipes/README.md)
 - **Learn the CLI**: see the [CLI reference](../reference/cli.md) for all
   available commands

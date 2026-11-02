@@ -48,6 +48,7 @@ EXPECTED_FILES = {
     "Qwen/Qwen3-1.7B": _TRAINABLE_STANDARD,
     "Qwen/Qwen3-4B-Instruct-2507": _FULL_STANDARD_LONG,
     "Qwen/Qwen3-8B": _TRAINABLE_STANDARD,
+    "Qwen/Qwen3.5-2B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
     "Qwen/Qwen3.5-4B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
     "Qwen/Qwen3.5-9B": _TRAINABLE_STANDARD + ["long/h200-inference-full", "long/h200-training-full"],
     "Qwen/Qwen3.6-35B-A3B": _TRAINABLE_LONG + _TRAINABLE_STANDARD,
@@ -120,11 +121,11 @@ def _config(body: dict) -> dict:
 
 def test_checked_in_catalog_is_valid():
     assert validate_catalog() == {
-        "models": 21,
-        "files": 98,
-        "training": 48,
-        "inference": 50,
-        "rl": 45,
+        "models": 22,
+        "files": 106,
+        "training": 52,
+        "inference": 54,
+        "rl": 49,
         "distillation": 1,
     }
 
@@ -142,6 +143,7 @@ def test_catalog_models_include_license_links():
         "Qwen/Qwen3-0.6B": "Apache 2.0",
         "Qwen/Qwen3-1.7B": "Apache 2.0",
         "Qwen/Qwen3-8B": "Apache 2.0",
+        "Qwen/Qwen3.5-2B": "Apache 2.0",
         "Qwen/Qwen3.5-4B": "Apache 2.0",
         "Qwen/Qwen3.5-9B": "Apache 2.0",
         "Qwen/Qwen3.6-35B-A3B": "Apache 2.0",
@@ -238,6 +240,10 @@ def test_files_keep_their_source_sequence_lengths():
         ("Qwen/Qwen3-1.7B", "standard", "training"): 32768,
         ("Qwen/Qwen3-8B", "standard", "inference"): 32768,
         ("Qwen/Qwen3-8B", "standard", "training"): 32768,
+        ("Qwen/Qwen3.5-2B", "long", "inference"): 262144,
+        ("Qwen/Qwen3.5-2B", "long", "training"): 262144,
+        ("Qwen/Qwen3.5-2B", "standard", "inference"): 32768,
+        ("Qwen/Qwen3.5-2B", "standard", "training"): 32768,
         ("Qwen/Qwen3.5-4B", "long", "inference"): 262144,
         ("Qwen/Qwen3.5-4B", "long", "training"): 262144,
         ("Qwen/Qwen3.5-4B", "standard", "inference"): 32768,
@@ -317,7 +323,7 @@ def test_inference_job_args_picks_the_models_own_standard_tier():
     # Tiers are per model, not a fixed 32,768 cutoff. Qwen3-4B-Instruct's standard
     # inference window is 65,536, so a 65,536 checkpoint must resolve to that model's
     # standard inference file, not its 262,144-token long one.
-    from examples.utils import inference_job_args
+    from recipes.utils import inference_job_args
 
     body = {
         "hardware": "H200",
@@ -357,6 +363,22 @@ def test_qwen3_8b_files_carry_the_example_defaults():
     assert (lora["n_gpus"], lora["optimizer"]["lr"]) == (4, 1e-04)
     assert (inference["n_gpus"], inference["vllm_config"]["tensor_parallel_size"]) == (2, 1)
     assert inference["peft_config"] == lora["peft_config"]
+
+
+def test_qwen3_0_6b_standard_fits_on_one_gpu():
+    for mode in ("full", "lora"):
+        training = _config(_body("Qwen/Qwen3-0.6B", f"standard/h200-training-{mode}"))
+        inference = _config(_body("Qwen/Qwen3-0.6B", f"standard/h200-inference-{mode}"))
+        assert (training["n_gpus"], training["train_batch_size"], training["max_seq_len"]) == (1, 1, 32768)
+        assert training["ds_config"]["train_batch_size"] == 1
+        assert (inference["n_gpus"], inference["max_seq_len"], inference["vllm_config"]["tensor_parallel_size"]) == (1, 32768, 1)
+
+
+def test_gemma4_31b_training_uses_sdpa():
+    # Full-attention layers have head_dim 512, past FlashAttention 3's 256.
+    for key in ("standard/h200-training-full", "long/h200-training-full"):
+        training = _config(_body("google/gemma-4-31B-it", key))
+        assert training["attn_implementation"] == "sdpa"
 
 
 @pytest.mark.parametrize(
@@ -406,6 +428,7 @@ def test_lora_inference_files_match_their_training_adapter():
         "Qwen/Qwen3-0.6B",
         "Qwen/Qwen3-1.7B",
         "Qwen/Qwen3-8B",
+        "Qwen/Qwen3.5-2B",
         "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B",
         "Qwen/Qwen3.6-35B-A3B",
@@ -522,7 +545,7 @@ def _yaml_models(path: Path) -> dict[str, dict]:
 
 def _renderer_resolves(model_id: str) -> bool:
     """Whether the examples' renderer picker resolves for ``model_id`` at the default thinking mode."""
-    from examples.utils import recommended_renderer_name
+    from recipes.utils import recommended_renderer_name
 
     try:
         recommended_renderer_name(model_id, enable_thinking=False)
@@ -590,7 +613,7 @@ def test_docs_example_lists_are_gated_by_renderer_resolution():
 def test_docs_examples_name_example_metadata_ids():
     ids = {
         line.removeprefix("id: ").strip()
-        for path in (REPO_ROOT / "examples").rglob("example.yaml")
+        for path in (REPO_ROOT / "recipes").rglob("example.yaml")
         for line in path.read_text().splitlines()
         if line.startswith("id: ")
     }
@@ -635,7 +658,7 @@ def _invalid(catalog_dir: Path, match: str) -> str:
 
 
 def test_copied_catalog_is_valid(catalog):
-    assert validate_catalog(catalog)["models"] == 21
+    assert validate_catalog(catalog)["models"] == 22
 
 
 def test_distillation_jobs_build_with_make_distillation_config(catalog):
@@ -643,9 +666,9 @@ def test_distillation_jobs_build_with_make_distillation_config(catalog):
 
 
 def test_distillation_check_fails_when_a_default_model_is_absent(catalog):
-    shutil.rmtree(catalog / "qwen3-8b")
+    shutil.rmtree(catalog / "qwen3.8-27b")
 
-    _invalid(catalog, r"default distillation model\(s\) missing from the catalog: Qwen/Qwen3-8B")
+    _invalid(catalog, r"default distillation model\(s\) missing from the catalog: Qwen/Qwen3.8-27B")
 
 
 @pytest.mark.parametrize(
@@ -968,7 +991,7 @@ def test_full_context_training_probe_uses_exact_declared_limit():
         full_context=True,
     )
 
-    assert len(spec["payload"]["input_ids"]) == 8
+    assert len(spec["payload"]["input_ids"]) == 1
     assert len(spec["payload"]["input_ids"][0]) == 32768
     assert set(spec["payload"]["input_ids"][0]) == {1}
 
@@ -985,6 +1008,8 @@ def test_qwen38_sft_uses_chunked_logprob_loss(job, context):
     assert training["sp_size"] == 8
     if context == "long" and job == "training-full":
         assert (training["n_gpus"], training["train_batch_size"]) == (32, 4)
+    elif job == "training-full":
+        assert (training["n_gpus"], training["train_batch_size"]) == (16, 2)
     else:
         assert (training["n_gpus"], training["train_batch_size"]) == (8, 1)
     assert training["fused_lm_head_token_chunk_size"] == 8192
@@ -1029,7 +1054,7 @@ def test_rl_forward_backward_probe_uses_packing_aware_grpo_contract():
     spec = build_forward_backward_probe_spec(request, "rl-full")
     payload = spec["payload"]
 
-    assert len(payload["input_ids"]) == 8
+    assert len(payload["input_ids"]) == 1
     assert payload["include_attention_mask"] is True
     assert payload["labels"] == "none"
     assert spec["processing"] == {
@@ -1039,7 +1064,7 @@ def test_rl_forward_backward_probe_uses_packing_aware_grpo_contract():
             "eps_clip": 0.2,
             "loss_agg_mode": "token-mean",
             "entropy_coeff": 0.0,
-            "global_batch_size": 8,
+            "global_batch_size": 1,
         },
     }
     assert spec["context"]["advantages"]["dtype"] == "float32"
